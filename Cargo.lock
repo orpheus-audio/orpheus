@@ -824,8 +824,11 @@ version = "0.0.1"
 name = "orpheus-engine"
 version = "0.0.1"
 dependencies = [
+ "getrandom",
+ "orpheus-clock",
  "orpheus-core",
  "rtrb",
+ "serde",
 ]
 
 [[package]]
@@ -859,6 +862,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "orpheus-clock",
  "orpheus-core",
  "orpheus-engine",
  "orpheus-pipewire",

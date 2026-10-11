@@ -9,7 +9,9 @@ keywords = ["audio", "aes67", "nmos", "multiroom"]
 categories = ["multimedia::audio", "network-programming"]
 
 [features]
-default = ["getrandom"]
+default = ["alloc", "getrandom"]
+# Heap-backed parts such as the jitter buffer.
+alloc = []
 # Enables `DeviceId::generate()` using the OS random source.
 getrandom = ["dep:getrandom"]
 

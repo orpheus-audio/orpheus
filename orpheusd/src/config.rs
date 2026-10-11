@@ -15,6 +15,7 @@ pub struct Config {
     pub name: Option<String>,
     pub api: ApiConfig,
     pub audio: AudioConfig,
+    pub receiver: ReceiverConfig,
     pub loopback: LoopbackConfig,
 }
 
@@ -39,6 +40,34 @@ pub struct AudioConfig {
     /// Frames per processing cycle to ask the audio system for. Smaller is
     /// lower latency but more CPU wakeups; `None` keeps the system default.
     pub quantum: Option<u32>,
+}
+
+/// Default UDP port for RTP, as is common for AES67.
+pub const RTP_PORT: u16 = 5004;
+
+/// Plays the RTP stream sent to this node.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReceiverConfig {
+    pub enabled: bool,
+    /// UDP port to receive RTP on.
+    pub port: u16,
+    /// Playout delay after the sender's timestamp. Covers network delay and
+    /// the clock error between the nodes (NTP until PTP is in place).
+    pub link_offset_ms: u32,
+    /// `node.name` of the output to play on; default output if unset.
+    pub target: Option<String>,
+}
+
+impl Default for ReceiverConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: RTP_PORT,
+            link_offset_ms: 10,
+            target: None,
+        }
+    }
 }
 
 /// Test route: a virtual sink "Orpheus loopback" that plays back locally.
@@ -109,5 +138,15 @@ mod tests {
         assert!(c.loopback.enabled);
         assert_eq!(c.loopback.latency_ms, 20);
         assert!(!Config::default().loopback.enabled);
+    }
+
+    #[test]
+    fn receiver_section() {
+        let c = Config::default();
+        assert!(c.receiver.enabled);
+        assert_eq!(c.receiver.port, 5004);
+        let c: Config = toml::from_str("[receiver]\nlink_offset_ms = 3").unwrap();
+        assert_eq!(c.receiver.link_offset_ms, 3);
+        assert_eq!(c.receiver.port, 5004);
     }
 }

@@ -1,0 +1,330 @@
+//! Receiver: plays the RTP stream arriving on a UDP port.
+//!
+//! An RX thread stores incoming packets in a jitter buffer and, on the
+//! media-clock grid, takes out the audio stamped `link_offset` earlier than
+//! the current media-clock time. That audio goes through a port to a
+//! playback stream. Every node shares the media clock, so audio from one
+//! sender plays at the same time everywhere; the link offset must cover
+//! packetization, network delay and the error between the nodes' clocks.
+//!
+//! The receiver follows one stream (SSRC) at a time and switches to another
+//! once the current one has been quiet for [`SWITCH_AFTER_MS`].
+
+use std::io;
+use std::net::{SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
+
+use orpheus_clock::Clock;
+use orpheus_core::AudioFormat;
+use orpheus_core::jitter::{Insert, JitterBuffer};
+use orpheus_core::rtp::{self, Encoding, SequenceStats};
+use orpheus_core::timebase::{MediaClock, extend};
+
+use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
+use crate::grid::{Grid, Tick};
+use crate::port::{CapturePort, PortStats, StatsSnapshot, port_pair};
+
+/// Buffer between the RX thread and the playback stream. The RX thread
+/// delivers 1 ms at a time, so this only covers its scheduling jitter.
+const BUFFER_MS: u32 = 4;
+
+pub const SWITCH_AFTER_MS: u64 = 1000;
+
+const NO_MARGIN: i64 = i64::MAX;
+const NO_SSRC: u64 = u64::MAX;
+
+#[derive(Debug, Clone)]
+pub struct ReceiverConfig {
+    /// Machine name of the playback stream.
+    pub name: String,
+    pub description: String,
+    pub format: AudioFormat,
+    pub encoding: Encoding,
+    pub listen: SocketAddr,
+    /// Playout delay after the media-clock time in the RTP timestamp.
+    pub link_offset_ms: u32,
+    pub quantum: Option<u32>,
+    /// Output node to play on; `None` follows the default output.
+    pub target: Option<String>,
+}
+
+#[derive(Debug)]
+struct Counters {
+    packets: AtomicU64,
+    malformed: AtomicU64,
+    late: AtomicU64,
+    early: AtomicU64,
+    lost: AtomicU64,
+    realigns: AtomicU64,
+    ssrc: AtomicU64,
+    margin_us: AtomicI64,
+}
+
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReceiverStatus {
+    pub listen: SocketAddr,
+    pub link_offset_ms: u32,
+    /// The stream being played, if any.
+    pub ssrc: Option<u32>,
+    pub packets: u64,
+    /// Not RTP or not the expected format.
+    pub malformed: u64,
+    /// Arrived after their playout time.
+    pub late: u64,
+    /// Arrived too far ahead of their playout time to buffer.
+    pub early: u64,
+    /// Never arrived (by sequence number) in the current stream.
+    pub lost: u64,
+    /// The RX thread was stalled or the clock jumped.
+    pub realigns: u64,
+    /// Smallest time between arrival and playout over the last second, in
+    /// microseconds. Negative means late; it should stay well above zero.
+    pub margin_us: Option<i64>,
+    /// The buffer between the RX thread and the playback stream.
+    pub buffer: StatsSnapshot,
+}
+
+pub(crate) struct Receiver {
+    listen: SocketAddr,
+    link_offset_ms: u32,
+    counters: Arc<Counters>,
+    buffer: Arc<PortStats>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    _playback: StreamHandle,
+}
+
+impl Receiver {
+    pub fn start(
+        backend: &mut dyn AudioBackend,
+        clock: Arc<dyn Clock>,
+        cfg: &ReceiverConfig,
+    ) -> Result<Self, BackendError> {
+        let format = cfg.format;
+        let socket = UdpSocket::bind(cfg.listen)?;
+        let listen = socket.local_addr()?;
+        let (capture, playback, buffer) =
+            port_pair(format.channels, format.frames_in_ms(BUFFER_MS));
+        let playback = backend.create_playback(
+            &StreamSpec {
+                name: cfg.name.clone(),
+                description: cfg.description.clone(),
+                format,
+                target: cfg.target.clone(),
+                group: None,
+                quantum: cfg.quantum,
+                process_latency: 0,
+            },
+            playback,
+        )?;
+
+        let counters = Arc::new(Counters {
+            packets: AtomicU64::new(0),
+            malformed: AtomicU64::new(0),
+            late: AtomicU64::new(0),
+            early: AtomicU64::new(0),
+            lost: AtomicU64::new(0),
+            realigns: AtomicU64::new(0),
+            ssrc: AtomicU64::new(NO_SSRC),
+            margin_us: AtomicI64::new(NO_MARGIN),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let offset = format.frames_in_ms(cfg.link_offset_ms) as u64;
+        let rx = Rx {
+            port: capture,
+            socket,
+            clock,
+            format,
+            encoding: cfg.encoding,
+            media: MediaClock::new(format.rate),
+            offset,
+            // Room for packets up to the link offset ahead, and then some.
+            jitter: JitterBuffer::new(
+                format.channels as usize,
+                2 * offset as usize + format.frames_in_ms(100),
+            ),
+            seqs: SequenceStats::default(),
+            ssrc: None,
+            last_heard: 0,
+            window: MarginWindow::default(),
+            counters: counters.clone(),
+        };
+        let thread = thread::Builder::new().name("orpheus-rx".into()).spawn({
+            let stop = stop.clone();
+            move || rx.run(&stop)
+        })?;
+        Ok(Self {
+            listen,
+            link_offset_ms: cfg.link_offset_ms,
+            counters,
+            buffer,
+            stop,
+            thread: Some(thread),
+            _playback: playback,
+        })
+    }
+
+    pub fn status(&self) -> ReceiverStatus {
+        let c = &self.counters;
+        let ssrc = c.ssrc.load(Relaxed);
+        let margin = c.margin_us.load(Relaxed);
+        ReceiverStatus {
+            listen: self.listen,
+            link_offset_ms: self.link_offset_ms,
+            ssrc: (ssrc != NO_SSRC).then_some(ssrc as u32),
+            packets: c.packets.load(Relaxed),
+            malformed: c.malformed.load(Relaxed),
+            late: c.late.load(Relaxed),
+            early: c.early.load(Relaxed),
+            lost: c.lost.load(Relaxed),
+            realigns: c.realigns.load(Relaxed),
+            margin_us: (margin != NO_MARGIN).then_some(margin),
+            buffer: self.buffer.snapshot(),
+        }
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Minimum arrival margin over one-second windows.
+#[derive(Default)]
+struct MarginWindow {
+    start_ns: u64,
+    min_ns: Option<i64>,
+}
+
+struct Rx {
+    port: CapturePort,
+    socket: UdpSocket,
+    clock: Arc<dyn Clock>,
+    format: AudioFormat,
+    encoding: Encoding,
+    media: MediaClock,
+    /// Link offset in frames.
+    offset: u64,
+    jitter: JitterBuffer,
+    seqs: SequenceStats,
+    ssrc: Option<u32>,
+    last_heard: u64,
+    window: MarginWindow,
+    counters: Arc<Counters>,
+}
+
+impl Rx {
+    fn run(mut self, stop: &AtomicBool) {
+        let ptime = self.format.frames_in_ms(1);
+        let mut block = vec![0.0f32; ptime * self.format.channels as usize];
+        let mut packet = vec![0u8; 65_536];
+        let mut samples = vec![0.0f32; packet.len() / self.encoding.bytes_per_sample()];
+        let mut grid = Grid::new(self.media, ptime as u64, self.clock.now_ns());
+
+        while !stop.load(Relaxed) {
+            // The block for media-clock frame `next` is handed on once that
+            // frame is due, and holds the audio stamped `offset` earlier.
+            let now = self.clock.now_ns();
+            match grid.poll(now, 0) {
+                Tick::Wait(d) => {
+                    self.receive(&mut packet, &mut samples, grid.next(), d);
+                    continue;
+                }
+                Tick::Realigned => {
+                    self.counters.realigns.fetch_add(1, Relaxed);
+                    continue;
+                }
+                Tick::Due => {}
+            }
+            let ts = grid.next().wrapping_sub(self.offset) as u32;
+            self.jitter.read(ts, &mut block);
+            self.port.push(&block);
+            grid.advance();
+            self.publish_margin(now);
+        }
+    }
+
+    /// Waits up to `timeout` for one packet and stores it.
+    fn receive(&mut self, packet: &mut [u8], samples: &mut [f32], next: u64, timeout: Duration) {
+        // A zero timeout would mean "block forever".
+        let timeout = timeout.max(Duration::from_micros(1));
+        if self.socket.set_read_timeout(Some(timeout)).is_err() {
+            return;
+        }
+        let len = match self.socket.recv(packet) {
+            Ok(len) => len,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return;
+            }
+            Err(_) => {
+                // E.g. ICMP errors surfacing; don't spin on them.
+                thread::sleep(timeout);
+                return;
+            }
+        };
+        let now = self.clock.now_ns();
+        let c = &self.counters;
+        let Ok((header, payload)) = rtp::parse(&packet[..len]) else {
+            c.malformed.fetch_add(1, Relaxed);
+            return;
+        };
+        let ch = self.format.channels as usize;
+        let n = self.encoding.decode(payload, samples);
+        if n == 0 || !n.is_multiple_of(ch) || n * self.encoding.bytes_per_sample() != payload.len()
+        {
+            c.malformed.fetch_add(1, Relaxed);
+            return;
+        }
+
+        if self.ssrc != Some(header.ssrc) {
+            let quiet = now.saturating_sub(self.last_heard) > SWITCH_AFTER_MS * 1_000_000;
+            if self.ssrc.is_some() && !quiet {
+                return; // Someone else is playing; first come, first served.
+            }
+            self.ssrc = Some(header.ssrc);
+            self.seqs = SequenceStats::default();
+            self.jitter.reset();
+            c.ssrc.store(header.ssrc as u64, Relaxed);
+        }
+        self.last_heard = now;
+        self.seqs.record(header.sequence);
+        c.packets.fetch_add(1, Relaxed);
+        c.lost.store(self.seqs.lost(), Relaxed);
+
+        let playout = extend(header.timestamp, next - self.offset) + self.offset;
+        let margin = self.media.ns_at(playout) as i64 - now as i64;
+        self.window.min_ns = Some(self.window.min_ns.map_or(margin, |m| m.min(margin)));
+
+        match self.jitter.insert(header.timestamp, &samples[..n]) {
+            Insert::Stored => {}
+            Insert::Late => {
+                c.late.fetch_add(1, Relaxed);
+            }
+            Insert::Early => {
+                c.early.fetch_add(1, Relaxed);
+            }
+        }
+    }
+
+    fn publish_margin(&mut self, now: u64) {
+        if now.saturating_sub(self.window.start_ns) < 1_000_000_000 {
+            return;
+        }
+        let margin = self.window.min_ns.take().map_or(NO_MARGIN, |m| m / 1000);
+        self.counters.margin_us.store(margin, Relaxed);
+        self.window.start_ns = now;
+    }
+}

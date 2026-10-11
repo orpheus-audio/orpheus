@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "PTP clock abstraction for Orpheus"
+description = "Media clocks (system clock, later PTP) for Orpheus"
 publish = false
 
 [dependencies]

@@ -1,10 +1,12 @@
 //! Measures the latency of a PipeWire audio path in graph samples.
 //!
 //! Plays short impulses into `<play-target>` and records the monitor of
-//! `<monitor-sink>`. Both streams live in the same graph, so the graph clock
-//! (`pw_time.ticks`) is a common time base: latency = ticks at detection -
-//! ticks at emission. The result covers the software path up to the monitor
-//! of the final sink, not the device's hardware buffer.
+//! `<monitor-sink>`. Latency = time at detection - time at emission, both
+//! taken from the start time of the stream's cycle (`pw_time.now`,
+//! `CLOCK_MONOTONIC`) plus the impulse's position in the buffer. That time
+//! base also works when the two ends run on different drivers, e.g. across
+//! an Orpheus network route. The result covers the software path up to the
+//! monitor of the final sink, not the device's hardware buffer.
 //!
 //! ```text
 //! cargo run -p orpheus-pipewire --example latency_probe -- orpheus.loopback my_sink 40
@@ -25,7 +27,8 @@ const PERIOD: u64 = RATE as u64 / 2;
 const THRESHOLD: f32 = 0.1;
 
 struct Shared {
-    /// Graph time of the last emitted impulse, `u64::MAX` before the first.
+    /// Monotonic time (ns) of the last emitted impulse, `u64::MAX` before
+    /// the first.
     emitted_at: AtomicU64,
     /// Measured latencies in frames. A probe, so a try_lock in RT is fine.
     results: std::sync::Mutex<Vec<i64>>,
@@ -73,7 +76,7 @@ fn main() {
     });
 
     // Generator: one impulse every PERIOD samples of graph time, placed at the
-    // first frame of a cycle so its graph time is exactly `ticks`.
+    // first frame of a cycle so it is emitted exactly at the cycle start.
     let gen_stream = pw::stream::StreamRc::new(
         core.clone(),
         "orpheus-probe-gen",
@@ -90,7 +93,7 @@ fn main() {
     let _gen_listener = gen_stream
         .add_local_listener_with_user_data(shared.clone())
         .process(move |stream, shared| {
-            let ticks = stream.time().map(|t| t.ticks()).unwrap_or(0);
+            let (ticks, now) = stream.time().map_or((0, 0), |t| (t.ticks(), t.now()));
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -108,7 +111,7 @@ fn main() {
             if ticks > 0 && ticks >= next_emit.get() {
                 samples[0] = 0.5;
                 samples[1] = 0.5;
-                shared.emitted_at.store(ticks, Relaxed);
+                shared.emitted_at.store(now as u64, Relaxed);
                 next_emit.set(ticks + PERIOD);
             }
             let chunk = data.chunk_mut();
@@ -136,7 +139,7 @@ fn main() {
     let _rec_listener = rec_stream
         .add_local_listener_with_user_data(shared.clone())
         .process(|stream, shared| {
-            let ticks = stream.time().map(|t| t.ticks()).unwrap_or(0);
+            let now = stream.time().map_or(0, |t| t.now());
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -151,9 +154,10 @@ fn main() {
                 return;
             }
             if let Some(i) = samples.iter().position(|s| s.abs() > THRESHOLD) {
-                let at = ticks + (i / CHANNELS) as u64;
+                let at = now + ((i / CHANNELS) as u64 * 1_000_000_000 / RATE as u64) as i64;
+                let frames = (at - emitted as i64) * RATE as i64 / 1_000_000_000;
                 if let Ok(mut r) = shared.results.try_lock() {
-                    r.push(at as i64 - emitted as i64);
+                    r.push(frames);
                 }
             }
         })

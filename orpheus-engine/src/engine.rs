@@ -1,11 +1,15 @@
 //! The engine: owns the backend and the audio routes built on top of it.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use orpheus_clock::Clock;
 use orpheus_core::AudioFormat;
 
 use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
-use crate::port::{PortStats, port_pair};
+use crate::port::{PortStats, StatsSnapshot, port_pair};
+use crate::receiver::{Receiver, ReceiverConfig, ReceiverStatus};
+use crate::sender::{Sender, SenderConfig, SenderStatus};
 
 /// A local test route: a virtual sink whose audio is played straight back on
 /// the local output. Exercises the backend, its realtime callbacks and the
@@ -27,23 +31,43 @@ struct Loopback {
     // it goes first.
     _sink: StreamHandle,
     _playback: StreamHandle,
+    stats: Arc<PortStats>,
+}
+
+pub type SenderId = u32;
+
+/// A snapshot of everything the engine runs.
+#[derive(Debug, Clone, Default)]
+pub struct EngineStatus {
+    pub loopback: Option<StatsSnapshot>,
+    pub senders: Vec<(SenderId, SenderStatus)>,
+    pub receiver: Option<ReceiverStatus>,
 }
 
 pub struct Engine {
-    backend: Box<dyn AudioBackend>,
+    // Routes go before the backend they live in.
+    senders: BTreeMap<SenderId, Sender>,
+    next_sender: SenderId,
+    receiver: Option<Receiver>,
     loopback: Option<Loopback>,
+    clock: Arc<dyn Clock>,
+    backend: Box<dyn AudioBackend>,
 }
 
 impl Engine {
-    pub fn new(backend: Box<dyn AudioBackend>) -> Self {
+    pub fn new(backend: Box<dyn AudioBackend>, clock: Arc<dyn Clock>) -> Self {
         Self {
-            backend,
+            senders: BTreeMap::new(),
+            next_sender: 0,
+            receiver: None,
             loopback: None,
+            clock,
+            backend,
         }
     }
 
     /// Starts the loopback route, replacing a running one.
-    pub fn start_loopback(&mut self, cfg: &LoopbackConfig) -> Result<Arc<PortStats>, BackendError> {
+    pub fn start_loopback(&mut self, cfg: &LoopbackConfig) -> Result<(), BackendError> {
         self.loopback = None;
         let target = cfg.format.frames_in_ms(cfg.latency_ms);
         let (capture, playback, stats) = port_pair(cfg.format.channels, target);
@@ -75,7 +99,50 @@ impl Engine {
         self.loopback = Some(Loopback {
             _sink: sink,
             _playback: playback,
+            stats,
         });
-        Ok(stats)
+        Ok(())
+    }
+
+    /// Starts receiving, replacing a running receiver.
+    pub fn start_receiver(&mut self, cfg: &ReceiverConfig) -> Result<(), BackendError> {
+        self.receiver = None;
+        self.receiver = Some(Receiver::start(
+            self.backend.as_mut(),
+            self.clock.clone(),
+            cfg,
+        )?);
+        Ok(())
+    }
+
+    /// The ID the next sender will get, for naming it.
+    pub fn next_sender_id(&self) -> SenderId {
+        self.next_sender
+    }
+
+    /// Starts a sender and returns its ID.
+    pub fn add_sender(&mut self, cfg: &SenderConfig) -> Result<SenderId, BackendError> {
+        let sender = Sender::start(self.backend.as_mut(), self.clock.clone(), cfg)?;
+        let id = self.next_sender;
+        self.next_sender += 1;
+        self.senders.insert(id, sender);
+        Ok(id)
+    }
+
+    /// Stops a sender; returns whether it existed.
+    pub fn remove_sender(&mut self, id: SenderId) -> bool {
+        self.senders.remove(&id).is_some()
+    }
+
+    pub fn status(&self) -> EngineStatus {
+        EngineStatus {
+            loopback: self.loopback.as_ref().map(|l| l.stats.snapshot()),
+            senders: self
+                .senders
+                .iter()
+                .map(|(id, s)| (*id, s.status()))
+                .collect(),
+            receiver: self.receiver.as_ref().map(Receiver::status),
+        }
     }
 }

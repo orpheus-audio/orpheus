@@ -10,3 +10,10 @@ publish = false
 [dependencies]
 orpheus-core.workspace = true
 rtrb = "0.4"
+orpheus-clock = { path = "../orpheus-clock" }
+getrandom = "0.3"
+serde = { workspace = true, optional = true }
+
+[features]
+# `Serialize` for the status types.
+serde = ["dep:serde"]
