@@ -1,0 +1,10 @@
+[package]
+name = "orpheus-discovery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "mDNS/DNS-SD discovery for Orpheus nodes"
+publish = false
+
+[dependencies]

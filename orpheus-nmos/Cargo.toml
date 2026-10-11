@@ -1,0 +1,10 @@
+[package]
+name = "orpheus-nmos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NMOS IS-04/IS-05 resource models and API routers for Orpheus"
+publish = false
+
+[dependencies]

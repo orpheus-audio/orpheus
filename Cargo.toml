@@ -1,9 +1,22 @@
 [workspace]
 resolver = "3"
-members = ["orpheus-core"]
+members = [
+    "orpheus-core",
+    "orpheus-nmos",
+    "orpheus-clock",
+    "orpheus-discovery",
+    "orpheus-engine",
+    "orpheus-pipewire",
+    "orpheusd",
+    "orpheusctl",
+]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/orpheus-audio/orpheus"
+
+[workspace.dependencies]
+orpheus-core = { path = "orpheus-core", version = "0.0.1" }
+serde = { version = "1", features = ["derive"] }

@@ -1,0 +1,13 @@
+# systemd user unit. Install to ~/.config/systemd/user/ (or /usr/lib/systemd/user/
+# when packaged), then: systemctl --user enable --now orpheusd
+[Unit]
+Description=Orpheus audio-over-IP node
+Wants=pipewire.service
+After=pipewire.service network-online.target
+
+[Service]
+ExecStart=/usr/bin/orpheusd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

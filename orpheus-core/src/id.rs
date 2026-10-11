@@ -150,15 +150,24 @@ mod tests {
     fn lenient_parsing() {
         let id: DeviceId = "K7QM3XRA".parse().unwrap();
         assert_eq!("k7qm-3xra".parse(), Ok(id));
-        assert_eq!("O0IL".repeat(2).parse::<DeviceId>().unwrap().to_string(), "00110011");
+        assert_eq!(
+            "O0IL".repeat(2).parse::<DeviceId>().unwrap().to_string(),
+            "00110011"
+        );
     }
 
     #[test]
     fn rejects_bad_input() {
         assert_eq!("K7QM3XR".parse::<DeviceId>(), Err(ParseError::Length(7)));
         assert_eq!("K7QM3XRAB".parse::<DeviceId>(), Err(ParseError::Length(9)));
-        assert_eq!("K7QM3XRU".parse::<DeviceId>(), Err(ParseError::InvalidChar('U')));
-        assert_eq!("K7QM 3XRA".parse::<DeviceId>(), Err(ParseError::InvalidChar(' ')));
+        assert_eq!(
+            "K7QM3XRU".parse::<DeviceId>(),
+            Err(ParseError::InvalidChar('U'))
+        );
+        assert_eq!(
+            "K7QM 3XRA".parse::<DeviceId>(),
+            Err(ParseError::InvalidChar(' '))
+        );
     }
 
     #[cfg(feature = "getrandom")]
