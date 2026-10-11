@@ -1,0 +1,17 @@
+[package]
+name = "orpheus-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types for Orpheus, a decentralized home audio-over-IP system"
+keywords = ["audio", "aes67", "nmos", "multiroom"]
+categories = ["multimedia::audio", "network-programming"]
+
+[features]
+default = ["getrandom"]
+# Enables `DeviceId::generate()` using the OS random source.
+getrandom = ["dep:getrandom"]
+
+[dependencies]
+getrandom = { version = "0.3", optional = true }
