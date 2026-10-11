@@ -18,6 +18,15 @@ pub struct StreamSpec {
     pub format: AudioFormat,
     /// Node to connect to instead of the system default (playback only).
     pub target: Option<String>,
+    /// Streams with the same group run on one clock in one graph cycle, so
+    /// audio passed between them never drifts.
+    pub group: Option<String>,
+    /// Frames per processing cycle to ask the audio system for; `None` keeps
+    /// the system default.
+    pub quantum: Option<u32>,
+    /// Latency the stream adds on top of the audio system, in frames.
+    /// Reported so that players can delay video to match.
+    pub process_latency: u32,
 }
 
 /// A platform audio system (PipeWire, later WASAPI, Core Audio).

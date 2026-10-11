@@ -7,7 +7,7 @@
 //! between PipeWire buffers and the engine's ports.
 
 use std::any::Any;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -19,7 +19,8 @@ use orpheus_engine::{
 };
 use pipewire::{self as pw, properties::properties, spa};
 use spa::param::audio::{AudioFormat as SpaFormat, AudioInfoRaw, MAX_CHANNELS};
-use spa::pod::{Object, Pod, Value, serialize::PodSerializer};
+use spa::pod::deserialize::PodDeserializer;
+use spa::pod::{Object, Pod, Property, Value, serialize::PodSerializer};
 use spa::sys as spa_sys;
 
 /// Native-endian `f32`, so buffers can be reinterpreted without conversion.
@@ -126,11 +127,61 @@ impl Drop for PipeWireBackend {
     }
 }
 
-/// A stream plus its listener. The listener is declared first so it is
-/// unregistered before the stream is destroyed.
+/// A stream plus its listener. Dropping it disconnects the stream first, so
+/// the realtime thread is out of the callbacks before the listener goes.
 struct Live {
     _listener: Box<dyn Any>,
-    _stream: pw::stream::StreamRc,
+    stream: pw::stream::StreamRc,
+    /// Set for a group's triggered playback stream.
+    group: Option<String>,
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        let _ = self.stream.disconnect();
+    }
+}
+
+/// Triggered playback streams by group, for the group's sink to find.
+type Groups = HashMap<String, Group>;
+
+struct Group {
+    playback: pw::stream::StreamRc,
+    latency: Rc<LatencyLink>,
+}
+
+/// Passes the latency downstream of a group's playback stream on to the
+/// group's sink, plus the sink's own latency. The sink has no links downstream
+/// of it, so PipeWire cannot tell applications how late their audio is heard
+/// otherwise.
+#[derive(Default)]
+struct LatencyLink {
+    /// Last `Latency` param the playback stream received.
+    param: RefCell<Option<Vec<u8>>>,
+    sink: RefCell<Option<pw::stream::StreamWeak>>,
+    /// The sink's own latency in frames.
+    sink_latency: Cell<u32>,
+}
+
+impl LatencyLink {
+    fn forward(&self) {
+        let Some(sink) = self.sink.borrow().as_ref().and_then(|s| s.upgrade()) else {
+            return;
+        };
+        let param = latency_pod(self.param.borrow().as_deref(), self.sink_latency.get());
+        if let Some(pod) = param.as_deref().and_then(Pod::from_bytes)
+            && let Err(e) = sink.update_params(&mut [pod])
+        {
+            tracing::warn!(error = %e, "forwarding latency");
+        }
+    }
+}
+
+/// User data of a sink's process callback.
+struct SinkData {
+    port: CapturePort,
+    /// Playback stream of the same group, run right after each sink cycle.
+    trigger: Option<pw::stream::StreamRc>,
 }
 
 /// Body of the PipeWire thread.
@@ -158,9 +209,11 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
         .register();
 
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
+    let groups: Rc<RefCell<Groups>> = Rc::default();
     let _receiver = rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let streams = streams.clone();
+        let groups = groups.clone();
         move |cmd| match cmd {
             Command::Create {
                 id,
@@ -168,13 +221,16 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
                 kind,
                 reply,
             } => {
-                let result = create_stream(&core, &spec, kind);
+                let result = create_stream(&core, &spec, kind, &mut groups.borrow_mut());
                 let _ = reply.send(result.map(|live| {
                     streams.borrow_mut().insert(id, live);
                 }));
             }
             Command::Destroy(id) => {
-                streams.borrow_mut().remove(&id);
+                let live = streams.borrow_mut().remove(&id);
+                if let Some(group) = live.as_ref().and_then(|l| l.group.as_ref()) {
+                    groups.borrow_mut().remove(group);
+                }
             }
             Command::Quit => mainloop.quit(),
         }
@@ -183,9 +239,19 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
     let _ = ready.send(Ok(()));
     mainloop.run();
     streams.borrow_mut().clear();
+    groups.borrow_mut().clear();
 }
 
-fn create_stream(core: &pw::core::CoreRc, spec: &StreamSpec, kind: Kind) -> Result<Live, String> {
+/// Creates a stream. A playback stream in a group is not scheduled on its own
+/// but triggered by the group's sink after each of its cycles, so audio passes
+/// from the sink to the playback within one cycle. Create the playback stream
+/// before the sink.
+fn create_stream(
+    core: &pw::core::CoreRc,
+    spec: &StreamSpec,
+    kind: Kind,
+    groups: &mut Groups,
+) -> Result<Live, String> {
     let channels = spec.format.channels.to_string();
     let mut props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -195,6 +261,15 @@ fn create_stream(core: &pw::core::CoreRc, spec: &StreamSpec, kind: Kind) -> Resu
     };
     if let Some(target) = &spec.target {
         props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
+    }
+    if let Some(group) = &spec.group {
+        props.insert(*pw::keys::NODE_GROUP, group.as_str());
+        // Keeps the session manager from linking group members to each other.
+        props.insert(*pw::keys::NODE_LINK_GROUP, group.as_str());
+    }
+    if let Some(quantum) = spec.quantum {
+        let latency = format!("{quantum}/{}", spec.format.rate);
+        props.insert(*pw::keys::NODE_LATENCY, latency.as_str());
     }
 
     let (direction, flags) = match &kind {
@@ -212,10 +287,11 @@ fn create_stream(core: &pw::core::CoreRc, spec: &StreamSpec, kind: Kind) -> Resu
         Kind::Playback(_) => {
             props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
             props.insert(*pw::keys::MEDIA_ROLE, "Music");
-            (
-                spa::utils::Direction::Output,
-                pw::stream::StreamFlags::AUTOCONNECT,
-            )
+            let mut flags = pw::stream::StreamFlags::AUTOCONNECT;
+            if spec.group.is_some() {
+                flags |= pw::stream::StreamFlags::TRIGGER;
+            }
+            (spa::utils::Direction::Output, flags)
         }
     };
     let flags = flags | pw::stream::StreamFlags::MAP_BUFFERS | pw::stream::StreamFlags::RT_PROCESS;
@@ -223,10 +299,15 @@ fn create_stream(core: &pw::core::CoreRc, spec: &StreamSpec, kind: Kind) -> Resu
     let stream =
         pw::stream::StreamRc::new(core.clone(), &spec.name, props).map_err(|e| e.to_string())?;
     let name = spec.name.clone();
+    let group = spec.group.as_ref().and_then(|g| groups.get(g));
+    let latency_link = Rc::new(LatencyLink::default());
     let listener: Box<dyn Any> = match kind {
         Kind::Sink(port) => Box::new(
             stream
-                .add_local_listener_with_user_data(port)
+                .add_local_listener_with_user_data(SinkData {
+                    port,
+                    trigger: group.map(|g| g.playback.clone()),
+                })
                 .state_changed(log_state(name))
                 .process(process_sink)
                 .register()
@@ -236,6 +317,17 @@ fn create_stream(core: &pw::core::CoreRc, spec: &StreamSpec, kind: Kind) -> Resu
             stream
                 .add_local_listener_with_user_data(port)
                 .state_changed(log_state(name))
+                .param_changed({
+                    let link = latency_link.clone();
+                    move |_, _, id, param| {
+                        if id == spa_sys::SPA_PARAM_Latency
+                            && let Some(param) = param
+                        {
+                            *link.param.borrow_mut() = Some(param.as_bytes().to_vec());
+                            link.forward();
+                        }
+                    }
+                })
                 .process(process_playback)
                 .register()
                 .map_err(|e| e.to_string())?,
@@ -243,13 +335,43 @@ fn create_stream(core: &pw::core::CoreRc, spec: &StreamSpec, kind: Kind) -> Resu
     };
 
     let format = format_pod(spec.format)?;
-    let mut params = [Pod::from_bytes(&format).ok_or("invalid format pod")?];
+    let mut params = vec![Pod::from_bytes(&format).ok_or("invalid format pod")?];
+    let latency = latency_pod(None, spec.process_latency);
+    if direction == spa::utils::Direction::Input {
+        params.push(
+            latency
+                .as_deref()
+                .and_then(Pod::from_bytes)
+                .ok_or("invalid latency pod")?,
+        );
+    }
     stream
         .connect(direction, None, flags, &mut params)
         .map_err(|e| e.to_string())?;
+    if let Some(g) = group
+        && direction == spa::utils::Direction::Input
+    {
+        g.latency.sink_latency.set(spec.process_latency);
+        *g.latency.sink.borrow_mut() = Some(stream.downgrade());
+        g.latency.forward();
+    }
+    let group = match &spec.group {
+        Some(g) if direction == spa::utils::Direction::Output => {
+            groups.insert(
+                g.clone(),
+                Group {
+                    playback: stream.clone(),
+                    latency: latency_link,
+                },
+            );
+            Some(g.clone())
+        }
+        _ => None,
+    };
     Ok(Live {
         _listener: listener,
-        _stream: stream,
+        stream,
+        group,
     })
 }
 
@@ -268,10 +390,16 @@ fn log_state<D>(
 }
 
 /// Realtime: copies what applications played into the sink into the port.
-fn process_sink(stream: &pw::stream::Stream, port: &mut CapturePort) {
-    let Some(mut buffer) = stream.dequeue_buffer() else {
-        return;
-    };
+fn process_sink(stream: &pw::stream::Stream, data: &mut SinkData) {
+    if let Some(mut buffer) = stream.dequeue_buffer() {
+        copy_in(&mut buffer, &mut data.port);
+    }
+    if let Some(playback) = &data.trigger {
+        let _ = playback.trigger_process();
+    }
+}
+
+fn copy_in(buffer: &mut pw::buffer::Buffer, port: &mut CapturePort) {
     let Some(data) = buffer.datas_mut().first_mut() else {
         return;
     };
@@ -340,6 +468,47 @@ fn format_pod(format: AudioFormat) -> Result<Vec<u8>, String> {
     PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &value)
         .map(|(cursor, _)| cursor.into_inner())
         .map_err(|e| format!("serializing format: {e:?}"))
+}
+
+/// Serializes the `Latency` param a sink reports upstream: `downstream` (a
+/// `Latency` param received further down, if any) plus `frames`.
+fn latency_pod(downstream: Option<&[u8]>, frames: u32) -> Option<Vec<u8>> {
+    use spa_sys::*;
+    let mut value = downstream
+        .and_then(|b| PodDeserializer::deserialize_any_from(b).ok())
+        .map(|(_, v)| v)
+        .unwrap_or_else(|| {
+            let props = vec![
+                Property::new(
+                    SPA_PARAM_LATENCY_direction,
+                    Value::Id(spa::utils::Id(SPA_DIRECTION_INPUT)),
+                ),
+                Property::new(SPA_PARAM_LATENCY_minQuantum, Value::Float(0.0)),
+                Property::new(SPA_PARAM_LATENCY_maxQuantum, Value::Float(0.0)),
+                Property::new(SPA_PARAM_LATENCY_minRate, Value::Int(0)),
+                Property::new(SPA_PARAM_LATENCY_maxRate, Value::Int(0)),
+                Property::new(SPA_PARAM_LATENCY_minNs, Value::Long(0)),
+                Property::new(SPA_PARAM_LATENCY_maxNs, Value::Long(0)),
+            ];
+            Value::Object(Object {
+                type_: SPA_TYPE_OBJECT_ParamLatency,
+                id: SPA_PARAM_Latency,
+                properties: props,
+            })
+        });
+    let Value::Object(obj) = &mut value else {
+        return None;
+    };
+    for prop in &mut obj.properties {
+        let is_rate =
+            prop.key == SPA_PARAM_LATENCY_minRate || prop.key == SPA_PARAM_LATENCY_maxRate;
+        if let (true, Value::Int(rate)) = (is_rate, &mut prop.value) {
+            *rate = rate.saturating_add(frames as i32);
+        }
+    }
+    PodSerializer::serialize(std::io::Cursor::new(Vec::new()), &value)
+        .ok()
+        .map(|(cursor, _)| cursor.into_inner())
 }
 
 /// Mono, stereo, or numbered AUX channels for anything else.

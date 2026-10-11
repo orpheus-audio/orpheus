@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
                 description: "Orpheus loopback".into(),
                 format: AudioFormat::AES67,
                 latency_ms: config.loopback.latency_ms,
+                quantum: config.audio.quantum,
                 target: config.loopback.target.clone(),
             })
             .map_err(|e| anyhow!(e))

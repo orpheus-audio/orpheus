@@ -14,6 +14,7 @@ pub struct Config {
     /// Announced name; defaults to the hostname.
     pub name: Option<String>,
     pub api: ApiConfig,
+    pub audio: AudioConfig,
     pub loopback: LoopbackConfig,
 }
 
@@ -30,6 +31,14 @@ impl Default for ApiConfig {
             listen: SocketAddr::from(([0, 0, 0, 0], 7480)),
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AudioConfig {
+    /// Frames per processing cycle to ask the audio system for. Smaller is
+    /// lower latency but more CPU wakeups; `None` keeps the system default.
+    pub quantum: Option<u32>,
 }
 
 /// Test route: a virtual sink "Orpheus loopback" that plays back locally.

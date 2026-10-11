@@ -6,10 +6,13 @@
 //! [`PlaybackPort`] side is drained by whoever consumes it. Both methods are
 //! realtime-safe: no allocation, no locks, no syscalls.
 //!
-//! The playback side owns the latency policy: it waits until the ring holds
-//! `target` frames before it starts playing ("priming"), primes again after an
-//! underrun, and drops audio when the ring has grown far beyond `target`, so
-//! the latency stays bounded when the producer runs ahead.
+//! The playback side owns the latency policy: after each read, `target`
+//! frames stay in the ring, so audio is delayed by exactly `target` frames
+//! when both sides run in the same cycle. Before it starts playing it waits
+//! until the ring holds `target` frames plus one read and drops anything
+//! beyond that ("priming"). It primes again after an underrun, and drops audio
+//! when the ring has grown far beyond `target`, so the latency stays bounded
+//! when the producer runs ahead.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -133,24 +136,24 @@ impl PlaybackPort {
             .level_frames
             .store((avail / self.channels) as u64, Relaxed);
 
+        // Starting (again): play once one read and the target fit, from
+        // exactly `target` behind the newest audio.
         if self.priming {
-            if avail < self.target.max(self.channels) {
+            let need = self.target + want.max(self.channels);
+            if avail < need {
                 out.fill(0.0);
                 return;
             }
             self.priming = false;
+            avail -= self.skip(avail - need);
         }
 
         // The producer ran ahead (e.g. we were not scheduled for a while):
         // drop the oldest audio to get back to the target latency.
         let slack = self.target.max(want);
-        if avail > self.target + slack {
-            let excess = avail - self.target;
-            if let Ok(chunk) = self.consumer.read_chunk(excess) {
-                chunk.commit_all();
-                avail = self.target;
-                self.stats.resyncs.fetch_add(1, Relaxed);
-            }
+        if avail > self.target + want + slack {
+            avail -= self.skip(avail - self.target - want);
+            self.stats.resyncs.fetch_add(1, Relaxed);
         }
 
         let n = want.min(avail);
@@ -168,6 +171,18 @@ impl PlaybackPort {
             self.priming = true;
         }
     }
+
+    /// Drops the oldest `samples` (whole frames) and returns how many it
+    /// dropped.
+    fn skip(&mut self, samples: usize) -> usize {
+        match self.consumer.read_chunk(samples) {
+            Ok(chunk) => {
+                chunk.commit_all();
+                samples
+            }
+            Err(_) => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,27 +196,48 @@ mod tests {
     #[test]
     fn primes_before_playing() {
         let (mut cap, mut play, stats) = port_pair(2, 4);
-        let mut out = [1.0; 4];
-        cap.push(&ramp(0.0, 6)); // 3 frames < target 4
+        let mut out = [1.0; 4]; // 2 frames
+        cap.push(&ramp(0.0, 10)); // 5 frames < target 4 + read 2
         play.fill(&mut out);
         assert_eq!(out, [0.0; 4]);
-        cap.push(&ramp(6.0, 2)); // 4 frames
+        cap.push(&ramp(10.0, 2)); // 6 frames
         play.fill(&mut out);
         assert_eq!(out, [0.0, 1.0, 2.0, 3.0]);
         assert_eq!(stats.snapshot().underruns, 0);
+        assert_eq!(play.consumer.slots(), 8, "target stays buffered");
+    }
+
+    #[test]
+    fn priming_drops_to_exact_delay() {
+        // Same-cycle producer and consumer: each cycle pushes then reads 3.
+        let (mut cap, mut play, _) = port_pair(1, 5);
+        let mut out = [0.0; 3];
+        let mut played = Vec::new();
+        for cycle in 0..6 {
+            cap.push(&ramp(cycle as f32 * 3.0, 3));
+            play.fill(&mut out);
+            played.extend_from_slice(&out);
+        }
+        // Sample t is heard at t + 5 once playing.
+        let first = played.iter().position(|&s| s != 0.0).unwrap();
+        assert_eq!(played[first] as usize + 5, first);
+        assert!(played[first..].windows(2).all(|w| w[1] == w[0] + 1.0));
     }
 
     #[test]
     fn underrun_pads_with_silence_and_reprimes() {
         let (mut cap, mut play, stats) = port_pair(1, 2);
-        cap.push(&[1.0, 2.0, 3.0]);
         let mut out = [9.0; 4];
+        cap.push(&ramp(1.0, 6));
+        play.fill(&mut out); // primed: 4 read, 2 kept
+        assert_eq!(out, [1.0, 2.0, 3.0, 4.0]);
+        cap.push(&[7.0]);
         play.fill(&mut out);
-        assert_eq!(out, [1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(out, [5.0, 6.0, 7.0, 0.0]);
         assert_eq!(stats.snapshot().underruns, 1);
 
-        // One sample is below the target of 2, so we stay silent.
-        cap.push(&[4.0]);
+        // Below target + one read, so we stay silent.
+        cap.push(&[8.0]);
         play.fill(&mut out);
         assert_eq!(out, [0.0; 4]);
         assert_eq!(stats.snapshot().underruns, 1, "priming is not an underrun");
@@ -220,17 +256,21 @@ mod tests {
     #[test]
     fn excess_is_dropped_to_target() {
         let (mut cap, mut play, stats) = port_pair(1, 2);
-        cap.push(&ramp(0.0, 10));
         let mut out = [0.0; 2];
+        cap.push(&ramp(0.0, 4));
         play.fill(&mut out);
-        // 10 buffered > target 2 + slack 2: keep the newest 2 and play them.
-        assert_eq!(out, [8.0, 9.0]);
+        assert_eq!(out, [0.0, 1.0]);
+        cap.push(&ramp(4.0, 10));
+        play.fill(&mut out);
+        // 12 buffered > target 2 + read 2 + slack 2: keep the newest 4,
+        // play 2 of them.
+        assert_eq!(out, [10.0, 11.0]);
         assert_eq!(stats.snapshot().resyncs, 1);
     }
 
     #[test]
     fn partial_frames_are_ignored() {
-        let (mut cap, mut play, _) = port_pair(2, 1);
+        let (mut cap, mut play, _) = port_pair(2, 0);
         cap.push(&[1.0, 2.0, 3.0]); // trailing sample dropped
         let mut out = [9.0; 3];
         play.fill(&mut out);
