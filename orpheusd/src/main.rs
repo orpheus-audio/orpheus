@@ -6,7 +6,10 @@ mod home;
 
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use orpheus_core::AudioFormat;
+use orpheus_engine::{Engine, LoopbackConfig};
+use orpheus_pipewire::PipeWireBackend;
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -22,11 +25,30 @@ async fn main() -> Result<()> {
     let home = Home::from_env()?;
     let config = Config::load(&home.config_path())?;
     let id = home.load_or_create_id()?;
-    let node = Arc::new(api::NodeInfo {
-        id,
-        name: config.name(),
-    });
-    tracing::info!(%id, name = %node.name, home = %home.root().display(), "starting");
+    let name = config.name();
+    tracing::info!(%id, %name, home = %home.root().display(), "starting");
+
+    // M1: the engine only exists for the local loopback test route.
+    let mut engine = None;
+    let mut loopback = None;
+    if config.loopback.enabled {
+        let backend = PipeWireBackend::connect().map_err(|e| anyhow!(e))?;
+        let mut e = Engine::new(Box::new(backend));
+        let stats = e
+            .start_loopback(&LoopbackConfig {
+                name: "orpheus.loopback".into(),
+                description: "Orpheus loopback".into(),
+                format: AudioFormat::AES67,
+                latency_ms: config.loopback.latency_ms,
+                target: config.loopback.target.clone(),
+            })
+            .map_err(|e| anyhow!(e))
+            .context("starting loopback")?;
+        tracing::info!(latency_ms = config.loopback.latency_ms, "loopback running");
+        loopback = Some(stats);
+        engine = Some(e);
+    }
+    let node = Arc::new(api::NodeInfo { id, name, loopback });
 
     let listener = tokio::net::TcpListener::bind(config.api.listen)
         .await
@@ -36,6 +58,7 @@ async fn main() -> Result<()> {
     axum::serve(listener, api::router(node))
         .with_graceful_shutdown(shutdown())
         .await?;
+    drop(engine);
     tracing::info!("stopped");
     Ok(())
 }

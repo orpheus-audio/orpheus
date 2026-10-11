@@ -8,3 +8,8 @@ description = "PipeWire audio backend for Orpheus"
 publish = false
 
 [dependencies]
+orpheus-core.workspace = true
+orpheus-engine = { path = "../orpheus-engine" }
+bytemuck = "1"
+pipewire = { version = "0.10", features = ["v0_3_49"] }
+tracing = "0.1"

@@ -8,3 +8,5 @@ description = "Platform-independent media engine for Orpheus"
 publish = false
 
 [dependencies]
+orpheus-core.workspace = true
+rtrb = "0.4"

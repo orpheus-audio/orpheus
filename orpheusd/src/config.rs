@@ -14,6 +14,7 @@ pub struct Config {
     /// Announced name; defaults to the hostname.
     pub name: Option<String>,
     pub api: ApiConfig,
+    pub loopback: LoopbackConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -27,6 +28,27 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             listen: SocketAddr::from(([0, 0, 0, 0], 7480)),
+        }
+    }
+}
+
+/// Test route: a virtual sink "Orpheus loopback" that plays back locally.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LoopbackConfig {
+    pub enabled: bool,
+    /// Buffer between the sink and the playback stream.
+    pub latency_ms: u32,
+    /// `node.name` of the output to play on; default output if unset.
+    pub target: Option<String>,
+}
+
+impl Default for LoopbackConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            latency_ms: 20,
+            target: None,
         }
     }
 }
@@ -70,5 +92,13 @@ mod tests {
     #[test]
     fn unknown_keys_are_rejected() {
         assert!(toml::from_str::<Config>("nmae = \"typo\"").is_err());
+    }
+
+    #[test]
+    fn loopback_section() {
+        let c: Config = toml::from_str("[loopback]\nenabled = true").unwrap();
+        assert!(c.loopback.enabled);
+        assert_eq!(c.loopback.latency_ms, 20);
+        assert!(!Config::default().loopback.enabled);
     }
 }

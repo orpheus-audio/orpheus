@@ -25,6 +25,15 @@ struct Status {
     id: String,
     name: String,
     version: String,
+    loopback: Option<StreamStatus>,
+}
+
+#[derive(Deserialize)]
+struct StreamStatus {
+    underruns: u64,
+    overruns: u64,
+    resyncs: u64,
+    level_frames: u64,
 }
 
 fn main() -> Result<()> {
@@ -38,6 +47,12 @@ fn main() -> Result<()> {
                 .and_then(|mut r| r.body_mut().read_json())
                 .with_context(|| format!("querying {url}"))?;
             println!("{}  {}  (orpheusd {})", s.id, s.name, s.version);
+            if let Some(l) = s.loopback {
+                println!(
+                    "loopback: {} frames buffered, {} underruns, {} overruns, {} resyncs",
+                    l.level_frames, l.underruns, l.overruns, l.resyncs
+                );
+            }
         }
     }
     Ok(())
