@@ -30,6 +30,7 @@ pub struct PortStats {
 
 /// A point-in-time copy of [`PortStats`].
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StatsSnapshot {
     /// The playback side ran dry while playing.

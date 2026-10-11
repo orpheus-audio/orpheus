@@ -52,8 +52,10 @@ struct Counters {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SenderStatus {
+    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "192.168.1.20:5004"))]
     pub peer: SocketAddr,
     pub packets: u64,
     pub send_errors: u64,

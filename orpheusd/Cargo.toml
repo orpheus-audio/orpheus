@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 orpheus-core.workspace = true
-orpheus-engine = { path = "../orpheus-engine", features = ["serde"] }
+orpheus-engine = { path = "../orpheus-engine", features = ["openapi"] }
 orpheus-clock = { path = "../orpheus-clock" }
 orpheus-pipewire = { path = "../orpheus-pipewire" }
 serde.workspace = true
@@ -19,6 +19,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+utoipa = { version = "6", features = ["axum_extras", "preserve_order"] }
+utoipa-axum = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

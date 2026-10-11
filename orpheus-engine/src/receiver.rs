@@ -64,8 +64,10 @@ struct Counters {
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiverStatus {
+    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "0.0.0.0:5004"))]
     pub listen: SocketAddr,
     pub link_offset_ms: u32,
     /// The stream being played, if any.
