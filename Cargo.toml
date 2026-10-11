@@ -1,0 +1,9 @@
+[package]
+name = "orpheus-core"
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0-or-later"
+description = "Core types for Orpheus, a decentralized home audio-over-IP system"
+repository = "https://github.com/orpheus-audio/orpheus"
+keywords = ["audio", "aes67", "nmos", "multiroom"]
+categories = ["multimedia::audio", "network-programming"]
