@@ -9,6 +9,8 @@ publish = false
 
 [dependencies]
 libc = "0.2"
+# 0.8 because statime 0.4 takes an RNG implementing rand 0.8's `Rng`; upgrade
+# together with statime.
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 serde = { workspace = true, optional = true }
 statime = { version = "0.4", default-features = false, features = ["std"] }
