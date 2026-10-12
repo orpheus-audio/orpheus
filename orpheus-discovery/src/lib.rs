@@ -5,8 +5,9 @@
 //! that are not Orpheus nodes show up too, without an Orpheus ID.
 //!
 //! TXT keys: the IS-04 ones (`api_proto`, `api_ver`, `api_auth` and the
-//! `ver_*` resource counters), plus `x-orpheus-id`, `x-orpheus-name` and
-//! `x-orpheus-ver` (the orpheusd version).
+//! `ver_*` resource counters), plus `x-orpheus-id` and `x-orpheus-ver`
+//! (the orpheusd version). The name is the instance name, so TXT stays
+//! ASCII, which some NMOS tools expect.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -15,6 +16,7 @@ use std::time::Duration;
 
 use mdns_sd::{DaemonEvent, IfKind, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo};
 use orpheus_core::DeviceId;
+use orpheus_nmos::Counters;
 
 pub use mdns_sd::Error;
 
@@ -44,7 +46,7 @@ pub struct Node {
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
     #[cfg_attr(feature = "openapi", schema(example = "B73AQ0P0"))]
     pub id: Option<String>,
-    /// Announced name.
+    /// Announced name; `Name (2)` if another node had the name first.
     pub name: String,
     /// orpheusd version; absent for other NMOS nodes.
     #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
@@ -64,6 +66,7 @@ pub struct Node {
 /// Announces this node and keeps a list of the others. Says goodbye on drop.
 pub struct Discovery {
     daemon: ServiceDaemon,
+    me: Announcement,
     /// Our instance's full name; changes if mDNS renames it after a conflict.
     fullname: Arc<Mutex<String>>,
     registry: Arc<Mutex<Registry>>,
@@ -76,32 +79,7 @@ impl Discovery {
         // loopback only ever finds ourselves.
         daemon.disable_interface(vec![IfKind::LoopbackV4, IfKind::LoopbackV6])?;
 
-        let id = me.id.to_string();
-        let ver = me.version.as_str();
-        let txt: &[(&str, &str)] = &[
-            ("api_proto", "http"),
-            ("api_ver", "v1.3"),
-            ("api_auth", "false"),
-            ("ver_slf", "0"),
-            ("ver_src", "0"),
-            ("ver_flw", "0"),
-            ("ver_dvc", "0"),
-            ("ver_snd", "0"),
-            ("ver_rcv", "0"),
-            ("x-orpheus-id", &id),
-            ("x-orpheus-name", &me.name),
-            ("x-orpheus-ver", ver),
-        ];
-        let host = format!("orpheus-{}.local.", id.to_lowercase());
-        let info = ServiceInfo::new(
-            SERVICE_TYPE,
-            instance_name(&me.name),
-            &host,
-            (),
-            me.port,
-            txt,
-        )?
-        .enable_addr_auto();
+        let info = service_info(me, instance_name(&me.name), Counters::default())?;
         let fullname = Arc::new(Mutex::new(info.get_fullname().to_owned()));
         daemon.register(info)?;
 
@@ -126,7 +104,7 @@ impl Discovery {
             })
             .expect("spawning mDNS monitor thread");
 
-        let registry = Arc::new(Mutex::new(Registry::new(id)));
+        let registry = Arc::new(Mutex::new(Registry::new(me.id.to_string())));
         let events = daemon.browse(SERVICE_TYPE)?;
         let reg = registry.clone();
         std::thread::Builder::new()
@@ -148,9 +126,18 @@ impl Discovery {
 
         Ok(Self {
             daemon,
+            me: me.clone(),
             fullname,
             registry,
         })
+    }
+
+    /// Announces new resource change counters, so that NMOS controllers
+    /// know to fetch the resources again.
+    pub fn set_counters(&self, counters: Counters) -> Result<(), Error> {
+        let name = instance(&self.fullname.lock().unwrap());
+        self.daemon
+            .register(service_info(&self.me, &name, counters)?)
     }
 
     /// Other nodes, online first, then by name.
@@ -169,6 +156,26 @@ impl Drop for Discovery {
             let _ = done.recv_timeout(Duration::from_secs(1));
         }
     }
+}
+
+fn service_info(me: &Announcement, instance: &str, c: Counters) -> Result<ServiceInfo, Error> {
+    let id = me.id.to_string();
+    let ver = |n: u8| n.to_string();
+    let txt: &[(&str, String)] = &[
+        ("api_proto", "http".into()),
+        ("api_ver", "v1.3".into()),
+        ("api_auth", "false".into()),
+        ("ver_slf", ver(c.slf)),
+        ("ver_src", ver(c.src)),
+        ("ver_flw", ver(c.flw)),
+        ("ver_dvc", ver(c.dvc)),
+        ("ver_snd", ver(c.snd)),
+        ("ver_rcv", ver(c.rcv)),
+        ("x-orpheus-id", id.clone()),
+        ("x-orpheus-ver", me.version.clone()),
+    ];
+    let host = format!("orpheus-{}.local.", id.to_lowercase());
+    Ok(ServiceInfo::new(SERVICE_TYPE, instance, &host, (), me.port, txt)?.enable_addr_auto())
 }
 
 /// The DNS-SD instance name: the node name, cut to fit one DNS label.
@@ -192,9 +199,7 @@ fn node(s: &ResolvedService) -> Node {
         .and_then(|id| id.parse::<DeviceId>().ok())
         .map(|id| id.to_string());
     Node {
-        name: txt("x-orpheus-name")
-            .filter(|_| id.is_some())
-            .unwrap_or_else(|| instance(&s.fullname)),
+        name: instance(&s.fullname),
         id,
         version: txt("x-orpheus-ver"),
         host: s.host.clone(),

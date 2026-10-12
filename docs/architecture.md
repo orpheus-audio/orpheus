@@ -43,7 +43,7 @@ Linux.
 | `orpheusd` | The node daemon: config, home directory, HTTP API. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
 | `orpheus-discovery` | Announces the node over mDNS and keeps the list of other nodes. |
-| `orpheus-nmos` | Placeholder for the NMOS APIs. |
+| `orpheus-nmos` | NMOS IS-04 resource types, resource IDs and versions. |
 
 ## Audio path
 
@@ -126,6 +126,19 @@ The TX, RX and PTP threads run at normal priority for now.
 L24 (24-bit big-endian PCM), 48 kHz, 2 channels, 1 ms per packet, RTP payload
 type 97. This is the AES67 baseline. It is fixed for now; with SDP it will be
 negotiated per stream.
+
+## NMOS
+
+A node is one NMOS device. Its receiver and senders are NMOS resources:
+each sender is a source, a flow and a sender. `orpheusd` rebuilds the
+resources from the engine once a second and whenever the API is asked; a
+resource gets a new version when its content changes. The node then
+announces a new `ver_*` counter in its mDNS TXT record, which tells NMOS
+controllers and other nodes to fetch the resources again.
+
+Resource IDs are UUIDv5 from the node ID and the resource's path
+(`node`, `device`, `receiver/0`, `sender/3`, …). Sender numbers restart at 0
+when `orpheusd` restarts, so a sender's ID may later name another stream.
 
 ## Identity
 

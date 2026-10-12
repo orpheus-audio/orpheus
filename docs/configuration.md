@@ -153,7 +153,7 @@ generic = "audio-speakers"
 
 The `orpheus-*` icons ship with Orpheus, see
 [`orpheusd/dist/icons`](../orpheusd/dist/icons/README.md); the others come
-from the icon theme. Until discovery exists, every network sink is `generic`.
+from the icon theme. For now, every network sink is `generic`.
 
 ### `[loopback]`
 

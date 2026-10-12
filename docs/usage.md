@@ -130,7 +130,8 @@ there is no route to the peer.
 
 ## HTTP API
 
-The API lives under `/x-orpheus/v1`. The NMOS APIs will be added next to it.
+Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
+(see [NMOS](#nmos)).
 
 | Method and path | Effect |
 |---|---|
@@ -160,7 +161,27 @@ avahi-browse -rt _nmos-node._tcp
 ```
 
 If two nodes have the same name, the second announces itself as
-`Name (2)`; `orpheusctl nodes` still shows the configured name.
+`Name (2)`, and `orpheusctl nodes` shows it that way.
+
+## NMOS
+
+Each node serves the NMOS IS-04 Node API v1.3 at `/x-nmos/node/v1.3/`, so NMOS
+controllers can see it. It describes the node as one device with:
+
+- one **receiver**, the node's RTP receiver;
+- per sender started with `connect`, a **source**, a **flow** (L24, 48 kHz,
+  stereo) and a **sender**.
+
+```sh
+curl -s localhost:7480/x-nmos/node/v1.3/self | jq
+curl -s localhost:7480/x-nmos/node/v1.3/senders | jq '.[].label'
+```
+
+Resource IDs are derived from the node ID, so they stay the same across
+restarts. The receiver carries the tag `urn:x-orpheus:form-factor` with the
+output type (always `generic` for now). Nodes don't register with an NMOS
+registry; they only use peer-to-peer discovery. Connecting through NMOS
+(IS-05) is not there yet.
 
 The API has no authentication yet. Restrict `[api] listen` to `127.0.0.1` if
 the network is not trusted.

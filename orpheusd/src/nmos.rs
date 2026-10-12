@@ -1,0 +1,379 @@
+//! The IS-04 Node API (`/x-nmos/node/v1.3/…`) and the glue from the
+//! engine's state to NMOS resources.
+//!
+//! The resources are rebuilt from the engine every second and on every
+//! request; the [`Store`] keeps their versions and counts changes, which
+//! discovery announces.
+
+use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, put};
+use axum::{Json, Router};
+use orpheus_clock::Timescale;
+use orpheus_core::{AudioFormat, OutputType};
+use orpheus_nmos::is04::{self, *};
+use orpheus_nmos::{Snapshot, Uuid, resource_id};
+
+use crate::api::Node;
+
+const CLOCK: &str = "clk0";
+
+pub fn router() -> Router<Arc<Node>> {
+    let list = |items: &'static [&'static str]| get(move || async move { Json(items) });
+    Router::new()
+        .route("/x-nmos", list(&["node/"]))
+        .route("/x-nmos/node", list(&["v1.3/"]))
+        .route(
+            "/x-nmos/node/v1.3",
+            list(&[
+                "self/",
+                "sources/",
+                "flows/",
+                "devices/",
+                "senders/",
+                "receivers/",
+            ]),
+        )
+        .route("/x-nmos/node/v1.3/self", get(node_self))
+        .route("/x-nmos/node/v1.3/{kind}", get(resources))
+        .route("/x-nmos/node/v1.3/{kind}/{id}", get(resource))
+        .route("/x-nmos/node/v1.3/receivers/{id}/target", put(target))
+}
+
+/// Keeps the resources and the announced change counters current.
+pub async fn refresh_loop(node: Arc<Node>) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tick.tick().await;
+        let node = node.clone();
+        let _ = tokio::task::spawn_blocking(move || refresh(&node)).await;
+    }
+}
+
+/// Rebuilds the resources; if any changed, announces the new counters.
+pub fn refresh(node: &Node) -> Snapshot {
+    let fresh = snapshot(node);
+    let now = Version::from_tai_nanos(Timescale::tai().now());
+    let mut store = node.nmos.lock().unwrap();
+    let changed = store.update(fresh, now);
+    if changed {
+        tracing::debug!(counters = ?store.counters(), "NMOS resources changed");
+    }
+    if changed
+        && let Some(d) = &node.discovery
+        && let Err(e) = d.set_counters(store.counters())
+    {
+        tracing::warn!(error = %e, "announcing resource changes");
+    }
+    store.snapshot().expect("just updated").clone()
+}
+
+/// An NMOS error response.
+fn error(code: StatusCode, msg: String) -> Response {
+    let body = serde_json::json!({ "code": code.as_u16(), "error": msg, "debug": null });
+    (code, Json(body)).into_response()
+}
+
+async fn node_self(State(node): State<Arc<Node>>) -> Json<is04::Node> {
+    Json(refresh(&node).node)
+}
+
+/// All resources of one type, or the one with `id`.
+fn respond<T: Resource>(items: Vec<T>, kind: &str, id: Option<&str>) -> Response {
+    let Some(id) = id else {
+        return Json(items).into_response();
+    };
+    let wanted = id.parse::<Uuid>().ok();
+    match items.into_iter().find(|r| Some(r.base().id) == wanted) {
+        Some(r) => Json(r).into_response(),
+        None => error(StatusCode::NOT_FOUND, format!("no {kind} {id}")),
+    }
+}
+
+fn by_kind(node: &Node, kind: &str, id: Option<&str>) -> Response {
+    let s = refresh(node);
+    match kind {
+        "devices" => respond(s.devices, kind, id),
+        "sources" => respond(s.sources, kind, id),
+        "flows" => respond(s.flows, kind, id),
+        "senders" => respond(s.senders, kind, id),
+        "receivers" => respond(s.receivers, kind, id),
+        _ => error(StatusCode::NOT_FOUND, format!("no resource type {kind}")),
+    }
+}
+
+async fn resources(State(node): State<Arc<Node>>, Path(kind): Path<String>) -> Response {
+    by_kind(&node, &kind, None)
+}
+
+async fn resource(
+    State(node): State<Arc<Node>>,
+    Path((kind, id)): Path<(String, String)>,
+) -> Response {
+    by_kind(&node, &kind, Some(&id))
+}
+
+/// IS-04's own connection management, deprecated in favour of IS-05.
+async fn target(State(node): State<Arc<Node>>, Path(id): Path<String>) -> Response {
+    let known = refresh(&node)
+        .receivers
+        .iter()
+        .any(|r| r.base.id.to_string() == id);
+    if known {
+        error(
+            StatusCode::NOT_IMPLEMENTED,
+            "use IS-05 to connect receivers".into(),
+        )
+    } else {
+        error(StatusCode::NOT_FOUND, format!("no receivers {id}"))
+    }
+}
+
+/// The node's resources as they are now, with versions unset.
+fn snapshot(node: &Node) -> Snapshot {
+    let dev = node.id;
+    let node_id = resource_id(dev, "node");
+    let device_id = resource_id(dev, "device");
+    let interfaces = interfaces();
+    let names: Vec<String> = interfaces.iter().map(|i| i.name.clone()).collect();
+    let endpoints = endpoints(node.listen);
+    let href = endpoints
+        .first()
+        .map(|e| match e.host.parse::<IpAddr>() {
+            Ok(IpAddr::V6(ip)) => format!("http://[{ip}]:{}/", e.port),
+            _ => format!("http://{}:{}/", e.host, e.port),
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "http://{}.local:{}/",
+                crate::config::hostname(),
+                node.listen.port()
+            )
+        });
+
+    let clock = match node.ptp.as_ref().map(|p| p.status()) {
+        Some(p) => Clock::Ptp {
+            name: CLOCK.into(),
+            traceable: false,
+            version: "IEEE1588-2008",
+            gmid: gmid(&p.grandmaster),
+            locked: p.settled,
+        },
+        None => Clock::Internal { name: CLOCK.into() },
+    };
+
+    let engine = node
+        .engine
+        .as_ref()
+        .map(|e| e.lock().unwrap().status())
+        .unwrap_or_default();
+    let format = AudioFormat::AES67;
+    let mut snap = Snapshot {
+        node: is04::Node {
+            base: Base {
+                description: "Orpheus node".into(),
+                ..Base::new(node_id, &node.name)
+            },
+            href,
+            hostname: Some(crate::config::hostname()),
+            api: Api {
+                versions: vec![API_VERSION.into()],
+                endpoints,
+            },
+            caps: Empty {},
+            services: vec![],
+            clocks: vec![clock],
+            interfaces: interfaces
+                .into_iter()
+                .map(|i| Interface {
+                    chassis_id: None,
+                    port_id: mac(i.mac),
+                    name: i.name,
+                })
+                .collect(),
+        },
+        devices: vec![],
+        sources: vec![],
+        flows: vec![],
+        senders: vec![],
+        receivers: vec![],
+    };
+
+    if engine.receiver.is_some() {
+        let mut base = Base::new(resource_id(dev, "receiver/0"), &node.name);
+        base.tags.insert(
+            TAG_FORM_FACTOR.into(),
+            vec![OutputType::Generic.as_str().into()],
+        );
+        snap.receivers.push(Receiver {
+            base,
+            format: FORMAT_AUDIO,
+            caps: ReceiverCaps {
+                media_types: vec!["audio/L24"],
+            },
+            device_id,
+            transport: TRANSPORT_RTP_UCAST,
+            interface_bindings: names.clone(),
+            subscription: ReceiverSubscription {
+                sender_id: None,
+                active: true,
+            },
+        });
+    }
+
+    for (n, s) in &engine.senders {
+        let source_id = resource_id(dev, &format!("source/{n}"));
+        let flow_id = resource_id(dev, &format!("flow/{n}"));
+        let base = |id| Base {
+            description: format!("to {}", s.peer),
+            ..Base::new(id, &s.name)
+        };
+        let channels = format.channels as usize;
+        snap.sources.push(Source {
+            base: base(source_id),
+            format: FORMAT_AUDIO,
+            caps: Empty {},
+            device_id,
+            parents: vec![],
+            clock_name: Some(CLOCK.into()),
+            channels: (0..channels)
+                .map(|i| Channel {
+                    label: channel_symbol(channels, i)
+                        .map_or_else(|| format!("Channel {}", i + 1), str::to_owned),
+                    symbol: channel_symbol(channels, i),
+                })
+                .collect(),
+        });
+        snap.flows.push(Flow {
+            base: base(flow_id),
+            format: FORMAT_AUDIO,
+            source_id,
+            device_id,
+            parents: vec![],
+            media_type: "audio/L24",
+            sample_rate: Rational {
+                numerator: format.rate,
+                denominator: 1,
+            },
+            bit_depth: 24,
+        });
+        snap.senders.push(Sender {
+            base: base(resource_id(dev, &format!("sender/{n}"))),
+            flow_id: Some(flow_id),
+            transport: TRANSPORT_RTP_UCAST,
+            device_id,
+            manifest_href: None,
+            interface_bindings: route_interface(s.peer).map_or_else(|| names.clone(), |i| vec![i]),
+            subscription: SenderSubscription {
+                receiver_id: None,
+                active: true,
+            },
+        });
+    }
+
+    snap.devices.push(Device {
+        base: Base {
+            description: "Orpheus".into(),
+            ..Base::new(device_id, &node.name)
+        },
+        kind: DEVICE_GENERIC,
+        node_id,
+        senders: snap.senders.iter().map(|s| s.base.id).collect(),
+        receivers: snap.receivers.iter().map(|r| r.base.id).collect(),
+        controls: vec![],
+    });
+    snap
+}
+
+/// `728e2c.fffe.867f85` → `72-8e-2c-ff-fe-86-7f-85`.
+fn gmid(identity: &str) -> String {
+    let hex: Vec<char> = identity.chars().filter(char::is_ascii_hexdigit).collect();
+    let pairs: Vec<String> = hex
+        .chunks(2)
+        .map(|c| c.iter().collect::<String>().to_lowercase())
+        .collect();
+    pairs.join("-")
+}
+
+struct NetInterface {
+    name: String,
+    mac: [u8; 6],
+    addrs: Vec<IpAddr>,
+}
+
+/// Network interfaces with a MAC address (no loopback, no tunnels), by
+/// name.
+fn interfaces() -> Vec<NetInterface> {
+    let mut found: Vec<NetInterface> = timestamped_socket::interface::interfaces()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, data)| {
+            let mac = data.mac().filter(|m| *m != [0; 6])?;
+            Some(NetInterface {
+                name: name.to_string(),
+                mac,
+                addrs: data.ips().collect(),
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.name.cmp(&b.name));
+    found
+}
+
+/// Where the API can be reached: the listen address, or if it listens on
+/// all addresses, every interface's, IPv4 first. Link-local IPv6 is left
+/// out, since it is useless without the interface.
+fn endpoints(listen: SocketAddr) -> Vec<Endpoint> {
+    let port = listen.port();
+    let ips: Vec<IpAddr> = if listen.ip().is_unspecified() {
+        let mut ips: Vec<IpAddr> = interfaces()
+            .into_iter()
+            .flat_map(|i| i.addrs)
+            .filter(|ip| match ip {
+                IpAddr::V4(_) => true,
+                IpAddr::V6(v6) => !v6.is_unicast_link_local(),
+            })
+            .collect();
+        ips.sort_by_key(IpAddr::is_ipv6);
+        ips
+    } else {
+        vec![listen.ip()]
+    };
+    ips.into_iter()
+        .map(|ip| Endpoint {
+            host: ip.to_string(),
+            port,
+            protocol: "http",
+        })
+        .collect()
+}
+
+/// The interface the kernel would send to `peer` from.
+fn route_interface(peer: SocketAddr) -> Option<String> {
+    let bind: SocketAddr = match peer {
+        SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
+        SocketAddr::V6(_) => ([0u16; 8], 0).into(),
+    };
+    let socket = UdpSocket::bind(bind).ok()?;
+    socket.connect(peer).ok()?;
+    let local = socket.local_addr().ok()?.ip();
+    interfaces()
+        .into_iter()
+        .find(|i| i.addrs.contains(&local))
+        .map(|i| i.name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grandmaster_ids() {
+        assert_eq!(gmid("728e2c.fffe.867f85"), "72-8e-2c-ff-fe-86-7f-85");
+    }
+}

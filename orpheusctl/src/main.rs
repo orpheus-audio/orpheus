@@ -120,6 +120,9 @@ struct Receiver {
 #[derive(Clone, Deserialize)]
 struct Sender {
     id: u32,
+    /// Missing from older nodes.
+    #[serde(default)]
+    name: String,
     peer: String,
     packets: u64,
     send_errors: u64,
@@ -574,8 +577,10 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
         return;
     }
     heading(o, p, "Senders", None);
-    let header = ["ID", "PEER", "PACKETS", "BUFFER", "ASRC", "PROBLEMS"];
-    let rows: Vec<[String; 6]> = senders
+    let header = [
+        "ID", "NAME", "PEER", "PACKETS", "BUFFER", "ASRC", "PROBLEMS",
+    ];
+    let rows: Vec<[String; 7]> = senders
         .iter()
         .map(|t| {
             let mut counts = vec![
@@ -585,6 +590,7 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             counts.extend(buffer_counts(&t.buffer));
             [
                 t.id.to_string(),
+                t.name.clone(),
                 t.peer.clone(),
                 c.packets(t.packets),
                 format!("{} frames", t.buffer.level_frames),
@@ -593,7 +599,7 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             ]
         })
         .collect();
-    let right = [false, false, true, true, true, false];
+    let right = [false, false, false, true, true, true, false];
     table(o, p, header, right, &rows);
 }
 
@@ -677,7 +683,7 @@ mod tests {
             "early": 0, "lost": 1, "realigns": 0, "margin_us": 8710,
             "asrc_ppm": -3.2, "buffer": {"underruns": 0, "overruns": 0,
             "resyncs": 0, "level_frames": 1140}},
-        "senders": [{"id": 0, "peer": "192.168.1.20:5004", "packets": 120000,
+        "senders": [{"id": 0, "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
             "send_errors": 0, "realigns": 0, "asrc_ppm": 8.9,
             "buffer": {"underruns": 2, "overruns": 0, "resyncs": 0,
             "level_frames": 1120}}]
@@ -710,8 +716,8 @@ Receiver       ● receiving ssrc 5e1f02aa
   problems     1 lost, 3 late
 
 Senders
-  ID  PEER               PACKETS       BUFFER      ASRC  PROBLEMS
-  0   192.168.1.20:5004   120000  1120 frames  +8.9 ppm  2 underruns
+  ID  NAME     PEER               PACKETS       BUFFER      ASRC  PROBLEMS
+  0   Kitchen  192.168.1.20:5004   120000  1120 frames  +8.9 ppm  2 underruns
 ";
         assert_eq!(out, expected, "\n{out}");
     }
@@ -737,7 +743,9 @@ Senders
         );
         // A sender that appeared since the last sample counts from now.
         assert!(
-            out.contains("  1   192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"),
+            out.contains(
+                "  1   Kitchen  192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"
+            ),
             "{out}"
         );
     }

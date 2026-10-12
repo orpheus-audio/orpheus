@@ -3,11 +3,14 @@
 mod api;
 mod config;
 mod home;
+mod nmos;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
+use axum::ServiceExt;
+use axum::extract::Request;
 use orpheus_clock::ptp::{PtpClock, PtpConfig};
 use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
@@ -17,6 +20,9 @@ use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
 use orpheus_pipewire::{Icons, PipeWireBackend};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::signal::unix::{SignalKind, signal};
+use tower::Layer;
+use tower_http::cors::CorsLayer;
+use tower_http::normalize_path::NormalizePathLayer;
 use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::Writer;
@@ -61,13 +67,13 @@ async fn main() -> Result<()> {
     };
     let listener = listen_tcp(config.api.listen)
         .with_context(|| format!("binding API to {}", config.api.listen))?;
-    let port = listener.local_addr()?.port();
-    tracing::info!(addr = %listener.local_addr()?, "API listening");
+    let listen = listener.local_addr()?;
+    tracing::info!(addr = %listen, "API listening");
 
     let discovery = Discovery::start(&Announcement {
         id,
         name: name.clone(),
-        port,
+        port: listen.port(),
         version: env!("CARGO_PKG_VERSION").into(),
     })
     .inspect_err(|e| tracing::warn!(error = %e, "mDNS unavailable; no discovery"))
@@ -75,15 +81,23 @@ async fn main() -> Result<()> {
     let node = Arc::new(api::Node {
         id,
         name,
+        listen,
         engine: engine.map(Mutex::new),
         ptp,
         discovery,
+        nmos: Mutex::new(orpheus_nmos::Store::new()),
         quantum: config.audio.quantum,
     });
 
-    axum::serve(listener, api::router(node.clone()))
+    let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));
+    // NMOS clients may add a trailing slash and call from browsers.
+    let app =
+        NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
+    axum::serve(listener, ServiceExt::<Request>::into_make_service(app))
         .with_graceful_shutdown(shutdown())
         .await?;
+    refresh.abort();
+    let _ = refresh.await;
     drop(node);
     tracing::info!("stopped");
     Ok(())
@@ -253,6 +267,27 @@ fn start_engine(
         tracing::info!(%listen, link_offset_ms = rx.link_offset_ms, "receiver running");
     }
     Ok(engine)
+}
+
+/// Any origin may call the API, as NMOS asks, so that browser-based
+/// controllers work.
+fn cors() -> CorsLayer {
+    use axum::http::Method;
+    use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+    // Listed rather than `*`, which NMOS tools don't accept.
+    CorsLayer::new()
+        .allow_origin(tower_http::cors::Any)
+        .allow_methods([
+            Method::GET,
+            Method::PUT,
+            Method::POST,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+            Method::HEAD,
+        ])
+        .allow_headers([CONTENT_TYPE, ACCEPT, AUTHORIZATION])
+        .expose_headers(tower_http::cors::Any)
 }
 
 /// Resolves on SIGINT or SIGTERM (systemd stop).

@@ -10,7 +10,7 @@
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
-| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS done |
+| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04 done |
 | M5 | Memory and policy: pinned peers, aliases, route restore on reconnect, per-sender gains; mixing policies and ducking; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
@@ -61,6 +61,12 @@ and Bluetooth inputs.
 
 - The HTTP API has no authentication.
 - Nodes are discovered, but peers are still addressed by host name or IP.
+- NMOS: peer-to-peer discovery only; nodes don't register with an NMOS
+  registry. Interfaces don't name the switch port they are attached to
+  (`attached_network_device`), and receivers have no BCP-004 capabilities
+  yet.
+- The output type of a node's own output is not detected yet; its receiver
+  announces `generic`.
 
 ## Future work
 
@@ -176,7 +182,7 @@ network delay, and no jitter or loss. Expected problems on real networks:
   `hicolor` fallback theme and look like Adwaita in every theme. The table is
   configurable in `[icons]`; the type itself and the form-factor are not.
 
-  Until discovery exists, every network sink is `generic`.
+  For now, every network sink is `generic`.
 
   Later (M4/M5), stored in the state directory like aliases: a local type
   override per sink, and as an advanced option a raw icon name per sink.

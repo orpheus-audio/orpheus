@@ -56,6 +56,24 @@ the timestamps: software TX timestamps are taken in the driver, after the
 qdisc, so netem on a node's own veth is invisible to PTP. Put a bridge in a
 third namespace between the nodes and add netem to the bridge ports.
 
+## NMOS conformance
+
+The [AMWA NMOS Testing Tool](https://github.com/AMWA-TV/nmos-testing) checks
+the NMOS APIs. Clone it outside the synced folders, install its
+`requirements.txt` into a virtual environment, start a node with a sender
+(the suites need resources to test), and run, for example:
+
+```sh
+python3 nmos-test.py suite IS-04-01 --host 10.99.0.2 --port 7480 \
+  --version v1.3 --output is-04-01.json
+```
+
+On first start the tool clones the NMOS specifications from GitHub, so a
+namespace without internet needs one run outside first. With IS-04-01 all
+Node API tests pass. The registration tests fail, as expected, because nodes
+don't register with a registry. The tool decodes TXT records as ASCII, which
+is why the name is not in the TXT record.
+
 ## OpenAPI
 
 ```sh

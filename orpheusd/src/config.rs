@@ -150,12 +150,15 @@ impl Config {
 
     /// The configured name, or the hostname if none is set.
     pub fn name(&self) -> String {
-        self.name.clone().unwrap_or_else(|| {
-            fs::read_to_string("/proc/sys/kernel/hostname")
-                .map(|s| s.trim().to_owned())
-                .unwrap_or_else(|_| "orpheus".to_owned())
-        })
+        self.name.clone().unwrap_or_else(hostname)
     }
+}
+
+/// The machine's host name.
+pub fn hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_owned())
+        .unwrap_or_else(|_| "orpheus".to_owned())
 }
 
 #[cfg(test)]

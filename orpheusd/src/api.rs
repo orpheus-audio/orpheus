@@ -1,4 +1,4 @@
-//! HTTP API: `/x-orpheus/v1/…`. IS-04 and IS-05 get mounted here later.
+//! HTTP API: `/x-orpheus/v1/…`, plus the NMOS APIs from [`crate::nmos`].
 //!
 //! The handlers carry their OpenAPI description (`#[utoipa::path]`); the
 //! spec is served at `/x-orpheus/v1/openapi.json` and printed by
@@ -26,12 +26,16 @@ use crate::config::RTP_PORT;
 pub struct Node {
     pub id: DeviceId,
     pub name: String,
+    /// Where the API listens.
+    pub listen: SocketAddr,
     /// `None` if the audio system was not reachable.
     pub engine: Option<Mutex<Engine>>,
     /// `None` if the node runs on the system clock.
     pub ptp: Option<Arc<PtpClock>>,
     /// `None` if mDNS could not start.
     pub discovery: Option<Discovery>,
+    /// NMOS resources and their versions.
+    pub nmos: Mutex<orpheus_nmos::Store>,
     pub quantum: Option<u32>,
 }
 
@@ -136,6 +140,7 @@ pub fn router(node: Arc<Node>) -> Router {
     let (router, api) = parts();
     let spec = api.to_pretty_json().expect("serializing OpenAPI spec");
     router
+        .merge(crate::nmos::router())
         .route(
             &format!("{BASE}/openapi.json"),
             get(move || async move { ([(header::CONTENT_TYPE, "application/json")], spec) }),

@@ -1,0 +1,262 @@
+//! IS-04 v1.3 resources, as the Node API serves them.
+
+use std::collections::BTreeMap;
+
+use serde::{Serialize, Serializer};
+use uuid::Uuid;
+
+pub const API_VERSION: &str = "v1.3";
+pub const FORMAT_AUDIO: &str = "urn:x-nmos:format:audio";
+pub const TRANSPORT_RTP_UCAST: &str = "urn:x-nmos:transport:rtp.ucast";
+pub const DEVICE_GENERIC: &str = "urn:x-nmos:device:generic";
+/// The output type of a receiver's output (`speaker`, `hifi`, …).
+pub const TAG_FORM_FACTOR: &str = "urn:x-orpheus:form-factor";
+
+pub type Tags = BTreeMap<String, Vec<String>>;
+
+/// When a resource last changed: TAI seconds and nanoseconds, written
+/// `secs:nanos`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Version(u64);
+
+impl Version {
+    pub const fn from_tai_nanos(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
+    /// The next possible version, for changes within the same nanosecond.
+    pub const fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
+impl std::fmt::Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.0 / 1_000_000_000, self.0 % 1_000_000_000)
+    }
+}
+
+impl Serialize for Version {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+/// The fields every resource has.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Base {
+    pub id: Uuid,
+    pub version: Version,
+    pub label: String,
+    pub description: String,
+    pub tags: Tags,
+}
+
+impl Base {
+    pub fn new(id: Uuid, label: impl Into<String>) -> Self {
+        Self {
+            id,
+            version: Version::default(),
+            label: label.into(),
+            description: String::new(),
+            tags: Tags::new(),
+        }
+    }
+}
+
+/// A resource with a [`Base`].
+pub trait Resource: Serialize {
+    fn base(&self) -> &Base;
+    fn base_mut(&mut self) -> &mut Base;
+}
+
+macro_rules! resource {
+    ($($t:ty),*) => {$(
+        impl Resource for $t {
+            fn base(&self) -> &Base {
+                &self.base
+            }
+            fn base_mut(&mut self) -> &mut Base {
+                &mut self.base
+            }
+        }
+    )*};
+}
+resource!(Node, Device, Source, Flow, Sender, Receiver);
+
+/// An empty JSON object, for `caps` without capabilities.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Empty {}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Node {
+    #[serde(flatten)]
+    pub base: Base,
+    /// Base URL of the node's HTTP APIs, ending in `/`.
+    pub href: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    pub api: Api,
+    pub caps: Empty,
+    pub services: Vec<Empty>,
+    pub clocks: Vec<Clock>,
+    pub interfaces: Vec<Interface>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Api {
+    pub versions: Vec<String>,
+    pub endpoints: Vec<Endpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Endpoint {
+    pub host: String,
+    pub port: u16,
+    pub protocol: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "ref_type", rename_all = "lowercase")]
+pub enum Clock {
+    /// A free-running clock: the system clock.
+    Internal { name: String },
+    Ptp {
+        name: String,
+        /// Traceable to TAI, e.g. through GPS.
+        traceable: bool,
+        version: &'static str,
+        /// Grandmaster identity, `00-11-22-ff-fe-33-44-55`.
+        gmid: String,
+        /// Synchronized to the grandmaster.
+        locked: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Interface {
+    /// Identifies the switch at the other end (LLDP); unknown here.
+    pub chassis_id: Option<String>,
+    /// The interface's MAC address, `00-11-22-33-44-55`.
+    pub port_id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Device {
+    #[serde(flatten)]
+    pub base: Base,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+    pub node_id: Uuid,
+    /// Deprecated in v1.3 but still required.
+    pub senders: Vec<Uuid>,
+    /// Deprecated in v1.3 but still required.
+    pub receivers: Vec<Uuid>,
+    pub controls: Vec<Control>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Control {
+    pub href: String,
+    #[serde(rename = "type")]
+    pub kind: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Source {
+    #[serde(flatten)]
+    pub base: Base,
+    pub format: &'static str,
+    pub caps: Empty,
+    pub device_id: Uuid,
+    pub parents: Vec<Uuid>,
+    /// The node clock the source is timed by.
+    pub clock_name: Option<String>,
+    pub channels: Vec<Channel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Channel {
+    pub label: String,
+    /// `L`, `R`, … from the NMOS channel symbols.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Flow {
+    #[serde(flatten)]
+    pub base: Base,
+    pub format: &'static str,
+    pub source_id: Uuid,
+    pub device_id: Uuid,
+    pub parents: Vec<Uuid>,
+    pub media_type: &'static str,
+    pub sample_rate: Rational,
+    pub bit_depth: u8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Rational {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Sender {
+    #[serde(flatten)]
+    pub base: Base,
+    pub flow_id: Option<Uuid>,
+    pub transport: &'static str,
+    pub device_id: Uuid,
+    /// Where the SDP file is; `None` until there is one.
+    pub manifest_href: Option<String>,
+    pub interface_bindings: Vec<String>,
+    pub subscription: SenderSubscription,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SenderSubscription {
+    pub receiver_id: Option<Uuid>,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Receiver {
+    #[serde(flatten)]
+    pub base: Base,
+    pub format: &'static str,
+    pub caps: ReceiverCaps,
+    pub device_id: Uuid,
+    pub transport: &'static str,
+    pub interface_bindings: Vec<String>,
+    pub subscription: ReceiverSubscription,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReceiverCaps {
+    pub media_types: Vec<&'static str>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ReceiverSubscription {
+    pub sender_id: Option<Uuid>,
+    pub active: bool,
+}
+
+/// NMOS channel symbol for channel `index` of `channels`.
+pub const fn channel_symbol(channels: usize, index: usize) -> Option<&'static str> {
+    match (channels, index) {
+        (1, 0) => Some("M1"),
+        (2, 0) => Some("L"),
+        (2, 1) => Some("R"),
+        _ => None,
+    }
+}
+
+/// A MAC address in NMOS form: lowercase, `-` separated.
+pub fn mac(bytes: [u8; 6]) -> String {
+    let parts: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    parts.join("-")
+}

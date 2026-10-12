@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 orpheus-core.workspace = true
+orpheus-nmos = { path = "../orpheus-nmos" }
 mdns-sd = "0.21"
 tracing = "0.1"
 serde = { workspace = true, optional = true }

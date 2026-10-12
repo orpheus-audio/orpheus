@@ -57,8 +57,10 @@ struct Counters {
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SenderStatus {
+    /// Name of the sink, as shown to the user.
+    pub name: String,
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "192.168.1.20:5004"))]
     pub peer: SocketAddr,
     pub packets: u64,
@@ -72,6 +74,7 @@ pub struct SenderStatus {
 }
 
 pub(crate) struct Sender {
+    name: String,
     peer: SocketAddr,
     counters: Arc<Counters>,
     buffer: Arc<PortStats>,
@@ -135,6 +138,7 @@ impl Sender {
             move || tx.run(&stop)
         })?;
         Ok(Self {
+            name: cfg.description.clone(),
             peer: cfg.peer,
             counters,
             buffer,
@@ -146,6 +150,7 @@ impl Sender {
 
     pub fn status(&self) -> SenderStatus {
         SenderStatus {
+            name: self.name.clone(),
             peer: self.peer,
             packets: self.counters.packets.load(Relaxed),
             send_errors: self.counters.send_errors.load(Relaxed),

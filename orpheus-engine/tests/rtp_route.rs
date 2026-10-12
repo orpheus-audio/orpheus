@@ -138,7 +138,7 @@ fn drift_is_absorbed() {
 
     let status = engine.status();
     let rx = status.receiver.unwrap();
-    let tx = status.senders[0].1;
+    let tx = &status.senders[0].1;
     eprintln!("tx {tx:?}\nrx {rx:?}");
     // Both sides converge on the skew: the sender takes less from its port
     // than 1 ms per packet, the receiver puts more into its port.
