@@ -13,7 +13,7 @@ use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
 use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
-use orpheus_pipewire::PipeWireBackend;
+use orpheus_pipewire::{Icons, PipeWireBackend};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{Event, Level, Subscriber};
@@ -47,7 +47,11 @@ async fn main() -> Result<()> {
     );
 
     let (clock, ptp) = start_clock(&config);
-    let engine = match PipeWireBackend::connect() {
+    let mut icons = Icons::default();
+    for (&kind, name) in &config.icons {
+        icons.set(kind, name.as_str());
+    }
+    let engine = match PipeWireBackend::connect(icons) {
         Ok(backend) => Some(start_engine(backend, clock, &config)?),
         Err(e) => {
             tracing::warn!(error = %e, "no audio system; running without audio");

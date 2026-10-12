@@ -1,5 +1,6 @@
 //! `~/.orpheus/config.toml`. The file is optional; every field has a default.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -7,6 +8,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use orpheus_clock::ptp::PtpTransport;
+use orpheus_core::OutputType;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -19,6 +21,9 @@ pub struct Config {
     pub receiver: ReceiverConfig,
     pub ptp: PtpConfig,
     pub loopback: LoopbackConfig,
+    /// Icon names for other nodes' outputs, by output type, replacing the
+    /// defaults (Linux: XDG icon names).
+    pub icons: BTreeMap<OutputType, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,6 +203,14 @@ mod tests {
         assert_eq!(c.ptp.transport, PtpTransport::Auto);
         let c: Config = toml::from_str("[ptp]\ntransport = \"ipv6\"").unwrap();
         assert_eq!(c.ptp.transport, PtpTransport::Ipv6);
+    }
+
+    #[test]
+    fn icons_section() {
+        let c: Config = toml::from_str("[icons]\nhifi = \"audio-card\"").unwrap();
+        assert_eq!(c.icons[&OutputType::Hifi], "audio-card");
+        assert_eq!(c.icons.len(), 1);
+        assert!(toml::from_str::<Config>("[icons]\ncar = \"x\"").is_err());
     }
 
     #[test]

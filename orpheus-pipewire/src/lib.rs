@@ -8,12 +8,12 @@
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread::{self, JoinHandle};
 
-use orpheus_core::AudioFormat;
+use orpheus_core::{AudioFormat, OutputType};
 use orpheus_engine::{
     AudioBackend, BackendError, CapturePort, PlaybackPort, StreamHandle, StreamSpec,
 };
@@ -31,10 +31,73 @@ const SAMPLE_FORMAT: SpaFormat = if cfg!(target_endian = "little") {
 };
 const SAMPLE_SIZE: usize = size_of::<f32>();
 
+/// XDG icon names for the outputs of other nodes, by output type.
+///
+/// The defaults are standard names that icon themes have, and three
+/// `orpheus-*` icons that ship in `orpheusd/dist/icons` for the `hicolor`
+/// fallback theme. Their prefix keeps themes from replacing them with
+/// unrelated icons of the same name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Icons(BTreeMap<OutputType, String>);
+
+impl Default for Icons {
+    fn default() -> Self {
+        Self(
+            OutputType::ALL
+                .into_iter()
+                .map(|t| (t, default_icon(t).to_owned()))
+                .collect(),
+        )
+    }
+}
+
+impl Icons {
+    /// Uses `name` for outputs of type `kind`.
+    pub fn set(&mut self, kind: OutputType, name: impl Into<String>) {
+        self.0.insert(kind, name.into());
+    }
+
+    pub fn get(&self, kind: OutputType) -> &str {
+        self.0.get(&kind).map_or(default_icon(kind), String::as_str)
+    }
+}
+
+const fn default_icon(kind: OutputType) -> &'static str {
+    match kind {
+        OutputType::Speaker => "orpheus-speaker",
+        OutputType::Headphones => "audio-headphones",
+        OutputType::Headset => "audio-headset",
+        OutputType::Tv => "video-display",
+        OutputType::Hifi => "orpheus-hifi",
+        OutputType::Computer => "computer",
+        OutputType::Portable => "multimedia-player",
+        OutputType::Phone => "phone",
+        OutputType::Generic => "orpheus-network-speaker",
+    }
+}
+
+/// PipeWire's `device.form-factor` for an output type, which desktops also
+/// use to pick icons and behaviour.
+const fn form_factor(kind: OutputType) -> Option<&'static str> {
+    match kind {
+        OutputType::Speaker => Some("speaker"),
+        OutputType::Headphones => Some("headphone"),
+        OutputType::Headset => Some("headset"),
+        OutputType::Tv => Some("tv"),
+        OutputType::Hifi => Some("hifi"),
+        OutputType::Computer => Some("computer"),
+        OutputType::Portable => Some("portable"),
+        OutputType::Phone => Some("handset"),
+        OutputType::Generic => None,
+    }
+}
+
 enum Command {
     Create {
         id: u64,
-        spec: StreamSpec,
+        spec: Box<StreamSpec>,
+        /// Icon name for `spec.remote`.
+        icon: Option<String>,
         kind: Kind,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
@@ -53,11 +116,13 @@ pub struct PipeWireBackend {
     tx: pw::channel::Sender<Command>,
     thread: Option<JoinHandle<()>>,
     next_id: u64,
+    icons: Icons,
 }
 
 impl PipeWireBackend {
-    /// Connects to the PipeWire daemon of the current user session.
-    pub fn connect() -> Result<Self, BackendError> {
+    /// Connects to the PipeWire daemon of the current user session. Streams
+    /// to and from other nodes get their icons from `icons`.
+    pub fn connect(icons: Icons) -> Result<Self, BackendError> {
         let (tx, rx) = pw::channel::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
@@ -68,6 +133,7 @@ impl PipeWireBackend {
                 tx,
                 thread: Some(thread),
                 next_id: 0,
+                icons,
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -84,7 +150,8 @@ impl PipeWireBackend {
         self.tx
             .send(Command::Create {
                 id,
-                spec: spec.clone(),
+                spec: Box::new(spec.clone()),
+                icon: spec.remote.map(|t| self.icons.get(t).to_owned()),
                 kind,
                 reply,
             })
@@ -218,10 +285,17 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
             Command::Create {
                 id,
                 spec,
+                icon,
                 kind,
                 reply,
             } => {
-                let result = create_stream(&core, &spec, kind, &mut groups.borrow_mut());
+                let result = create_stream(
+                    &core,
+                    &spec,
+                    icon.as_deref(),
+                    kind,
+                    &mut groups.borrow_mut(),
+                );
                 let _ = reply.send(result.map(|live| {
                     streams.borrow_mut().insert(id, live);
                 }));
@@ -249,6 +323,7 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
 fn create_stream(
     core: &pw::core::CoreRc,
     spec: &StreamSpec,
+    icon: Option<&str>,
     kind: Kind,
     groups: &mut Groups,
 ) -> Result<Live, String> {
@@ -275,6 +350,12 @@ fn create_stream(
     let (direction, flags) = match &kind {
         Kind::Sink(_) => {
             props.insert(*pw::keys::MEDIA_CLASS, "Audio/Sink");
+            if let Some(icon) = icon {
+                props.insert(*pw::keys::DEVICE_ICON_NAME, icon);
+            }
+            if let Some(form_factor) = spec.remote.and_then(form_factor) {
+                props.insert(*pw::keys::DEVICE_FORM_FACTOR, form_factor);
+            }
             // Never become the default output; that would loop playback back
             // into ourselves.
             props.insert(*pw::keys::PRIORITY_SESSION, "0");
@@ -287,6 +368,9 @@ fn create_stream(
         Kind::Playback(_) => {
             props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
             props.insert(*pw::keys::MEDIA_ROLE, "Music");
+            if let Some(icon) = icon {
+                props.insert(*pw::keys::MEDIA_ICON_NAME, icon);
+            }
             let mut flags = pw::stream::StreamFlags::AUTOCONNECT;
             if spec.group.is_some() {
                 flags |= pw::stream::StreamFlags::TRIGGER;
@@ -527,4 +611,20 @@ fn channel_positions(channels: usize) -> [u32; MAX_CHANNELS] {
         }
     }
     pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn icons() {
+        let mut icons = Icons::default();
+        assert_eq!(icons.get(OutputType::Generic), "orpheus-network-speaker");
+        assert_eq!(icons.get(OutputType::Headphones), "audio-headphones");
+        icons.set(OutputType::Hifi, "audio-card");
+        assert_eq!(icons.get(OutputType::Hifi), "audio-card");
+        assert_eq!(form_factor(OutputType::Phone), Some("handset"));
+        assert_eq!(form_factor(OutputType::Generic), None);
+    }
 }

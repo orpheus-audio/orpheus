@@ -9,8 +9,10 @@ pub mod format;
 pub mod id;
 #[cfg(feature = "alloc")]
 pub mod jitter;
+pub mod output;
 pub mod rtp;
 pub mod timebase;
 
 pub use format::AudioFormat;
 pub use id::DeviceId;
+pub use output::OutputType;

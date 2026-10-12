@@ -20,10 +20,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use orpheus_clock::Clock;
-use orpheus_core::AudioFormat;
 use orpheus_core::jitter::{Insert, JitterBuffer};
 use orpheus_core::rtp::{self, Encoding, SequenceStats};
 use orpheus_core::timebase::{MediaClock, extend};
+use orpheus_core::{AudioFormat, OutputType};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::asrc::{Asrc, Fixed};
@@ -143,6 +143,7 @@ impl Receiver {
                 format,
                 target: cfg.target.clone(),
                 group: None,
+                remote: Some(OutputType::Generic),
                 quantum: cfg.quantum,
                 process_latency: 0,
             },

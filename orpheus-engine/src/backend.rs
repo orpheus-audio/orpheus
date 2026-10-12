@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use orpheus_core::AudioFormat;
+use orpheus_core::{AudioFormat, OutputType};
 
 use crate::port::{CapturePort, PlaybackPort};
 
@@ -13,8 +13,11 @@ pub type BackendError = Box<dyn Error + Send + Sync>;
 pub struct StreamSpec {
     /// Stable machine name, e.g. `orpheus.loopback`.
     pub name: String,
-    /// Name shown to the user, e.g. "Orpheus → Kitchen".
+    /// Name shown to the user, e.g. "Kitchen".
     pub description: String,
+    /// For streams to or from another node: the kind of output on the other
+    /// end, which backends show, e.g. as an icon. `None` for local streams.
+    pub remote: Option<OutputType>,
     pub format: AudioFormat,
     /// Node to connect to instead of the system default (playback only).
     pub target: Option<String>,

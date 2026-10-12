@@ -14,6 +14,9 @@ default = ["alloc", "getrandom"]
 alloc = []
 # Enables `DeviceId::generate()` using the OS random source.
 getrandom = ["dep:getrandom"]
+# Serialization of the shared types, e.g. `OutputType` in config files.
+serde = ["dep:serde"]
 
 [dependencies]
 getrandom = { version = "0.4", optional = true }
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }

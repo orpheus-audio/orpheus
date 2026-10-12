@@ -101,7 +101,7 @@ struct NewSender {
     /// defaults to 5004.
     #[schema(example = "192.168.1.20")]
     peer: String,
-    /// Shown in the sink name, "Orpheus → name"; defaults to the peer.
+    /// Name of the sink; defaults to the peer.
     name: Option<String>,
 }
 
@@ -170,7 +170,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
     })
 }
 
-/// Sends this node's audio to a peer: creates a sink "Orpheus → name" and
+/// Sends this node's audio to a peer: creates a sink named after it and
 /// streams what is played into it to the peer's receiver.
 #[utoipa::path(
     post,
@@ -194,7 +194,7 @@ async fn add_sender(
         let mut engine = lock_engine(&node)?;
         let cfg = SenderConfig {
             name: format!("orpheus.send.{}", engine.next_sender_id()),
-            description: format!("Orpheus → {label}"),
+            description: label,
             format: AudioFormat::AES67,
             encoding: Encoding::L24,
             peer,

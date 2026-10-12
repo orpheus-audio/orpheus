@@ -15,9 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::thread::{self, JoinHandle};
 
 use orpheus_clock::Clock;
-use orpheus_core::AudioFormat;
 use orpheus_core::rtp::{Encoding, HEADER_LEN, Header};
 use orpheus_core::timebase::MediaClock;
+use orpheus_core::{AudioFormat, OutputType};
 
 use crate::asrc::{Asrc, Fixed};
 use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
@@ -110,6 +110,7 @@ impl Sender {
                 format,
                 target: None,
                 group: None,
+                remote: Some(OutputType::Generic),
                 quantum: cfg.quantum,
                 process_latency: (target + asrc.delay()) as u32,
             },

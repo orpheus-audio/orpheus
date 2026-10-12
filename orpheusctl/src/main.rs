@@ -18,7 +18,7 @@ struct Cli {
 enum Command {
     /// Show the node's ID, name, version and streams.
     Status,
-    /// Send the node's audio to a peer: creates a sink "Orpheus → <name>"
+    /// Send the node's audio to a peer: creates a sink "<name>"
     /// whose audio is streamed to the peer.
     Connect {
         /// Peer: host name or address, optionally with :port (default 5004);

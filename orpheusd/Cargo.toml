@@ -8,7 +8,7 @@ description = "Orpheus node daemon for Linux"
 publish = false
 
 [dependencies]
-orpheus-core.workspace = true
+orpheus-core = { workspace = true, features = ["serde"] }
 orpheus-engine = { path = "../orpheus-engine", features = ["openapi"] }
 orpheus-clock = { path = "../orpheus-clock", features = ["openapi"] }
 orpheus-pipewire = { path = "../orpheus-pipewire" }
