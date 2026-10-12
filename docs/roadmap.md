@@ -9,7 +9,7 @@
 | M2 | RTP unicast between two nodes on the system clock; jitter buffer and loss handling | done |
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
-| — | Tuning the PTP servo | next |
+| — | Tuning the PTP servo | done, except on real hardware |
 | M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | planned |
 | M5 | Memory and policy: pinned peers, aliases, route restore on reconnect, per-sender gains; mixing policies and ducking; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
@@ -44,10 +44,13 @@ and Bluetooth inputs.
 **Clock**
 
 - Software timestamps only. Hardware timestamping is future work, see below.
-- A cold start takes 30 to 60 s to settle and sometimes overshoots once. The
-  servo is not tuned yet.
-- The settle criteria are heuristics: offset below 100 µs and frequency change
-  below 2 ppm for three announce intervals, at least 15 s after the last step.
+- The servo was tuned between network namespaces on one machine, with
+  artificial jitter and clock drift. Real crystals, NICs and switches may
+  need different settings; see [below](#servo-tuning-on-real-hardware).
+- The settle criterion is a heuristic: the filter's own offset estimate below
+  100 µs for three announce intervals. The filter cannot see its own lag, so
+  under fast drift a node can report settled while it is up to a few hundred
+  µs behind.
 - One interface and one transport per node, end-to-end delay only. The AES67
   message rates are fixed. `[ptp]` can only be set in the config file.
 - The PTP clock sits on the system clock, so an NTP step disturbs it.
@@ -82,6 +85,26 @@ Plan:
 - It needs a card with a PHC: Intel i210, i225 and i226, many onboard Intel
   NICs, the Raspberry Pi CM4. `ethtool -T <interface>` shows whether a card
   has one. Common USB Ethernet adapters don't.
+
+### Servo tuning on real hardware
+
+The servo settings come from runs on one machine (see
+[clock](clock.md#ptp)). Things to check once two machines are available:
+
+- **Settle time and jitter** with real software timestamps (interrupt
+  coalescing, CPU power saving), which are heavier-tailed than the simulated
+  jitter.
+- **Drift.** statime starts by assuming a very stable crystal
+  (`initial_wander` 1e-16) and adapts slowly. A clock whose frequency changes
+  by 0.1 ppm/s (a fast warm-up) then lags by about 80 µs, at 0.5 ppm/s by
+  about 500 µs. A higher `initial_wander` follows drift better but triples
+  the error under heavy-tailed jitter. Both are harmless for audio (a 10 ms
+  link offset), so the default stays.
+- **Measuring sync.** Two machines share no clock, so the true error can't be
+  read off as on one machine. The honest test is acoustic: loop one node's
+  line out into the other's line in and compare clicks played by both.
+- The step bug is worth reporting to statime upstream, as is its initial
+  measurement noise of `steer_time`² seconds².
 
 ### Robustness outside the development setup
 

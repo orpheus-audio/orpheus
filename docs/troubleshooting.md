@@ -54,8 +54,8 @@ The log line `PTP unavailable; using the system clock` gives the reason.
   status shows `/ipv4` or `/ipv6`).
 - **Wrong interface.** On a machine with Ethernet and Wi-Fi, the default
   route may be on the wrong one. Set `[ptp] interface`.
-- **It's still settling.** A cold start takes 30 to 60 s, sometimes with one
-  overshoot. Wait a minute before drawing conclusions.
+- **It's still settling.** A node settles about 10 s after it hears the
+  grandmaster; if all nodes start at once, the election adds about 10 s.
 - **Wi-Fi.** PTP over Wi-Fi is unreliable. Access points send multicast at a
   low rate, and with power saving they hold it back for 100 to 300 ms. Use
   Ethernet; a Wi-Fi profile is planned.

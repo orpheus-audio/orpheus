@@ -42,15 +42,26 @@ the virtual clock:
   until it catches up. `orpheusctl status` shows this rate as `ppm` (parts
   per million; 1 ppm is 1 µs per second, or 3.6 ms per hour).
 
-**Settling.** The clock counts as settled when all of these hold:
+**Servo.** Two changes to statime's defaults make a cold start fast:
 
-- the offset has stayed below `settle_threshold_us` (100 µs) for three
-  announce intervals in a row (6 s),
-- the frequency estimate changed by less than 2 ppm per interval,
-- the last step was at least 15 s ago.
+- After a step, measurements are dropped for 0.5 s and the filter starts
+  afresh. statime keeps its estimate of the measurement noise across a step,
+  and a pair of measurements from both sides of the step, off by the whole
+  step, made it distrust everything for about 30 s and then overshoot.
+- The filter estimates the measurement noise after two measurement pairs
+  instead of four, and corrects offsets within about 1 s instead of 2.
 
-The grandmaster always counts as settled. Settling currently takes 30 to
-60 s after a cold start, because the filter is not tuned yet.
+Measured between two nodes on one machine (network namespaces, 50 µs of
+added jitter, clock skews up to ±200 ppm), a node that joins a running
+network follows the grandmaster to within 100 µs about 3 s after it hears
+it (at most 8 s), and stays within a few µs. Real networks and crystals will
+be somewhat worse; see the [roadmap](roadmap.md).
+
+**Settling.** The clock counts as settled once its offset has stayed below
+`settle_threshold_us` (100 µs) for three announce intervals in a row (6 s).
+This takes about 10 s after a node joins a running network. The grandmaster
+always counts as settled. If all nodes start at once, electing the
+grandmaster adds about 10 s.
 
 **Timestamps.** Packet times come from the kernel's software timestamps.
 Their error is roughly 15 to 30 µs, well within the default link offset of

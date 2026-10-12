@@ -48,6 +48,14 @@ that one machine can play two nodes whose clocks disagree. The real kernel
 clock is shared, so this tests the servo and ASRC, not real crystal drift or
 network jitter. Use two machines for that.
 
+Because the kernel clock is shared, the true clock error is known on one
+machine: a node's PTP time minus the unskewed system time (when the
+grandmaster runs unskewed). That is how the servo was tuned. Network jitter
+can be simulated with `tc qdisc ... netem delay 50us 50us`, but only between
+the timestamps: software TX timestamps are taken in the driver, after the
+qdisc, so netem on a node's own veth is invisible to PTP. Put a bridge in a
+third namespace between the nodes and add netem to the bridge ports.
+
 ## OpenAPI
 
 ```sh

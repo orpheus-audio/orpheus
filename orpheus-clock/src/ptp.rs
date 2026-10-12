@@ -11,9 +11,10 @@
 //! (on the TAI timescale) that statime's Kalman filter adjusts. Offsets
 //! above the step threshold are stepped, which happens on a cold start;
 //! smaller ones are slewed by running the virtual clock slightly fast or
-//! slow. The clock counts as settled once, for a few announce intervals in a
-//! row, it has been within the settle threshold of the grandmaster with a
-//! steady frequency, or when this node is the grandmaster.
+//! slow. After a step the filter starts afresh (see [`Servo`]). The clock
+//! counts as settled once, for a few announce intervals in a row, it has
+//! been within the settle threshold of the grandmaster, or when this node is
+//! the grandmaster.
 //!
 //! PTP runs over UDP on IPv4 (as AES67 and Dante expect) or IPv6; nodes on
 //! different transports do not see each other. By default a node uses IPv4
@@ -36,11 +37,11 @@ use statime::config::{
     AcceptAnyMaster, ClockIdentity, DelayMechanism, InstanceConfig, LeapIndicator, PortConfig,
     PtpMinorVersion, SdoId, TimePropertiesDS, TimeSource,
 };
-use statime::filters::{KalmanConfiguration, KalmanFilter};
+use statime::filters::{Filter, FilterEstimate, FilterUpdate, KalmanConfiguration, KalmanFilter};
 use statime::observability::port::PortState;
 use statime::port::{
-    InBmca, MAX_DATA_LEN, NoForwardedTLVs, Port, PortAction, PortActionIterator, TimestampContext,
-    is_message_buffer_compatible,
+    InBmca, MAX_DATA_LEN, Measurement, NoForwardedTLVs, Port, PortAction, PortActionIterator,
+    TimestampContext, is_message_buffer_compatible,
 };
 use statime::time::{Duration, Interval, Time};
 use statime::{OverlayClock, PtpInstance, PtpInstanceState};
@@ -67,19 +68,9 @@ const PDELAY_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x6b);
 /// counts as settled.
 const SETTLE_ROUNDS: u32 = 3;
 
-/// Time after a step before the clock can count as settled; the filter's
-/// estimates are unreliable right after one.
-const SETTLE_AFTER_STEP_NS: u64 = 15_000_000_000;
-
-/// Largest change of the frequency estimate between two announce intervals
-/// that still counts as settled. The offset estimate alone can look good
-/// while the filter is still finding the frequency.
-const SETTLE_FREQ_PPM: f64 = 2.0;
-
-/// Steps requested this soon after the previous one are ignored: they come
-/// from measurements taken before it (statime then steps back and forth on a
-/// cold start).
-const STEP_HOLDOFF_NS: u64 = 1_000_000_000;
+/// Measurements this soon after a step are dropped: they may have been
+/// taken before it.
+const STEP_HOLDOFF_NS: i64 = 500_000_000;
 
 /// TAI − UTC announced when this node is the grandmaster.
 const UTC_OFFSET_S: i16 = 37;
@@ -222,8 +213,6 @@ struct Shared {
     clock: Mutex<OverlayClock<Base>>,
     status: Mutex<PtpStatus>,
     steps: AtomicU64,
-    /// Base-clock time of the last step, 0 before the first.
-    last_step_ns: AtomicU64,
     frequency_ppm: AtomicU64,
 }
 
@@ -256,13 +245,6 @@ impl statime::Clock for PortClock {
 
     fn step_clock(&mut self, offset: Duration) -> Result<Time, io::Error> {
         let mut clock = self.0.clock.lock().unwrap();
-        let now = clock.underlying().0.now();
-        let last = self.0.last_step_ns.load(Relaxed);
-        if last != 0 && now.saturating_sub(last) < STEP_HOLDOFF_NS {
-            tracing::debug!(offset_us = offset.nanos_lossy() / 1e3, "PTP step ignored");
-            return Ok(statime::Clock::now(&*clock));
-        }
-        self.0.last_step_ns.store(now, Relaxed);
         self.0.steps.fetch_add(1, Relaxed);
         tracing::info!(offset_us = offset.nanos_lossy() / 1e3, "PTP clock stepped");
         clock.step_clock(offset)
@@ -327,7 +309,6 @@ impl PtpClock {
                 settled: false,
             }),
             steps: AtomicU64::new(0),
-            last_step_ns: AtomicU64::new(0),
             frequency_ppm: AtomicU64::new(0f64.to_bits()),
         });
 
@@ -397,7 +378,89 @@ impl Drop for PtpClock {
 }
 
 type BmcaPort<'a> =
-    Port<'a, InBmca, AcceptAnyMaster, StdRng, PortClock, KalmanFilter, RefCell<PtpInstanceState>>;
+    Port<'a, InBmca, AcceptAnyMaster, StdRng, PortClock, Servo, RefCell<PtpInstanceState>>;
+
+/// statime's Kalman filter, started afresh after every step.
+///
+/// statime keeps its estimate of the measurement noise across a step, and on
+/// a cold start that estimate takes in a pair of measurements from both
+/// sides of the step, off by the whole step. The filter then distrusts every
+/// measurement until the pair ages out about 30 s later, and overshoots.
+struct Servo {
+    config: KalmanConfiguration,
+    filter: KalmanFilter,
+    /// Time of the last step; measurements shortly after it are dropped.
+    stepped_at: Option<Time>,
+}
+
+impl Filter for Servo {
+    type Config = KalmanConfiguration;
+
+    fn new(config: KalmanConfiguration) -> Self {
+        Self {
+            filter: KalmanFilter::new(config),
+            config,
+            stepped_at: None,
+        }
+    }
+
+    fn measurement<C: statime::Clock>(&mut self, m: Measurement, clock: &mut C) -> FilterUpdate {
+        if let Some(at) = self.stepped_at {
+            if (clock.now() - at).nanos_lossy() < STEP_HOLDOFF_NS as f64 {
+                return FilterUpdate::default();
+            }
+            self.stepped_at = None;
+            self.filter = KalmanFilter::new(self.config);
+        }
+        let mut watch = StepWatch {
+            clock,
+            stepped_at: None,
+        };
+        let update = self.filter.measurement(m, &mut watch);
+        self.stepped_at = watch.stepped_at;
+        update
+    }
+
+    fn update<C: statime::Clock>(&mut self, clock: &mut C) -> FilterUpdate {
+        self.filter.update(clock)
+    }
+
+    fn demobilize<C: statime::Clock>(self, clock: &mut C) {
+        self.filter.demobilize(clock);
+    }
+
+    fn current_estimates(&self) -> FilterEstimate {
+        self.filter.current_estimates()
+    }
+}
+
+/// Passes clock calls through and notes when the clock was stepped.
+struct StepWatch<'a, C> {
+    clock: &'a mut C,
+    stepped_at: Option<Time>,
+}
+
+impl<C: statime::Clock> statime::Clock for StepWatch<'_, C> {
+    type Error = C::Error;
+
+    fn now(&self) -> Time {
+        self.clock.now()
+    }
+
+    fn step_clock(&mut self, offset: Duration) -> Result<Time, C::Error> {
+        let time = self.clock.step_clock(offset)?;
+        self.stepped_at = Some(time);
+        Ok(time)
+    }
+
+    fn set_frequency(&mut self, ppm: f64) -> Result<Time, C::Error> {
+        self.clock.set_frequency(ppm)
+    }
+
+    fn set_properties(&mut self, properties: &TimePropertiesDS) -> Result<(), C::Error> {
+        self.clock.set_properties(properties)
+    }
+}
 
 /// Deadlines of the port's timers; `None` when not armed.
 #[derive(Default)]
@@ -516,7 +579,7 @@ async fn run<A: Transport>(setup: PortSetup) {
             return;
         }
     };
-    let instance = PtpInstance::<KalmanFilter>::new(
+    let instance = PtpInstance::<Servo>::new(
         InstanceConfig {
             clock_identity: identity,
             priority_1: cfg.priority1,
@@ -537,6 +600,14 @@ async fn run<A: Transport>(setup: PortSetup) {
     let clock = PortClock(shared.clone());
     let filter = KalmanConfiguration {
         step_threshold: Duration::from_nanos(cfg.step_threshold_us as i64 * 1000),
+        // Correct offsets within about a second instead of two.
+        steer_time: Duration::from_seconds(1.0),
+        // Estimate the measurement noise from two measurement pairs instead
+        // of four. Until then statime assumes a noise of `steer_time` and
+        // learns almost nothing, while a clock that is 200 ppm off drifts by
+        // up to a millisecond. Both together halve the time to settle on a
+        // cold start; see docs/clock.md.
+        difference_estimation_boundary: 2,
         ..Default::default()
     };
     // AES67 media profile defaults.
@@ -695,12 +766,11 @@ async fn handle_actions<A: Transport>(
 #[derive(Default)]
 struct Settle {
     rounds: u32,
-    frequency_ppm: f64,
 }
 
 /// Updates the status after a BMCA round.
 fn publish(
-    instance: &PtpInstance<KalmanFilter>,
+    instance: &PtpInstance<Servo>,
     port: &BmcaPort<'_>,
     shared: &Shared,
     cfg: &PtpConfig,
@@ -715,13 +785,8 @@ fn publish(
         .as_ref()
         .map(|e| e.offset_from_master.nanos_lossy() as i64);
     let frequency_ppm = f64::from_bits(shared.frequency_ppm.load(Relaxed));
-    let within = offset_ns
-        .is_some_and(|o| o.unsigned_abs() < cfg.settle_threshold_us as u64 * 1000)
-        && (frequency_ppm - settle.frequency_ppm).abs() < SETTLE_FREQ_PPM;
-    settle.frequency_ppm = frequency_ppm;
-    let last_step = shared.last_step_ns.load(Relaxed);
-    let since_step = cfg.timescale.now().saturating_sub(last_step);
-    let within = within && (last_step == 0 || since_step >= SETTLE_AFTER_STEP_NS);
+    let within =
+        offset_ns.is_some_and(|o| o.unsigned_abs() < cfg.settle_threshold_us as u64 * 1000);
     settle.rounds = if state == PtpState::Slave && within {
         settle.rounds + 1
     } else {
@@ -877,7 +942,6 @@ mod tests {
                 settled: false,
             }),
             steps: AtomicU64::new(0),
-            last_step_ns: AtomicU64::new(0),
             frequency_ppm: AtomicU64::new(0),
         });
         let mut clock = PortClock(shared.clone());
@@ -889,9 +953,6 @@ mod tests {
         let system = crate::SystemClock::new();
         let diff = |ptp: &PtpClock| ptp.now_ns() as i64 - system.now_ns() as i64;
         assert!(diff(&ptp).abs() < 1_000_000);
-        statime::Clock::step_clock(&mut clock, Duration::from_nanos(500_000_000)).unwrap();
-        assert!((diff(&ptp) - 500_000_000).abs() < 1_000_000);
-        // A stale second step right after is ignored.
         statime::Clock::step_clock(&mut clock, Duration::from_nanos(500_000_000)).unwrap();
         assert!((diff(&ptp) - 500_000_000).abs() < 1_000_000);
         statime::Clock::set_frequency(&mut clock, 100.0).unwrap();
@@ -907,5 +968,61 @@ mod tests {
         };
         let mapped: u64 = clock.time_of(ts).nanos().to_num();
         assert!((mapped as i64 - ptp.now_ns() as i64).abs() < 1_000_000);
+    }
+
+    /// A clock that only moves when told to.
+    struct TestClock {
+        now: Time,
+        steps: u32,
+    }
+
+    impl statime::Clock for TestClock {
+        type Error = io::Error;
+
+        fn now(&self) -> Time {
+            self.now
+        }
+
+        fn step_clock(&mut self, offset: Duration) -> Result<Time, io::Error> {
+            self.now += offset;
+            self.steps += 1;
+            Ok(self.now)
+        }
+
+        fn set_frequency(&mut self, _: f64) -> Result<Time, io::Error> {
+            Ok(self.now)
+        }
+
+        fn set_properties(&mut self, _: &TimePropertiesDS) -> Result<(), io::Error> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn servo_ignores_measurements_from_before_a_step() {
+        let mut clock = TestClock {
+            now: Time::from_secs(1000),
+            steps: 0,
+        };
+        let mut servo = Servo::new(KalmanConfiguration::default());
+        let sync = |clock: &TestClock, offset: Duration| Measurement {
+            event_time: clock.now,
+            raw_sync_offset: Some(offset),
+            ..Default::default()
+        };
+        // Cold start, 200 ms off: one step.
+        servo.measurement(sync(&clock, Duration::from_millis(200)), &mut clock);
+        assert_eq!(clock.steps, 1);
+        // A measurement taken before the step arrives after it. statime's
+        // filter alone would step back.
+        clock.now += Duration::from_millis(100);
+        servo.measurement(sync(&clock, Duration::from_millis(200)), &mut clock);
+        assert_eq!(clock.steps, 1);
+        // Later measurements go to a fresh filter.
+        clock.now += Duration::from_secs(1);
+        servo.measurement(sync(&clock, Duration::from_micros(2)), &mut clock);
+        assert_eq!(clock.steps, 1);
+        let offset = servo.current_estimates().offset_from_master;
+        assert!(offset.abs() < Duration::from_micros(10), "{offset:?}");
     }
 }
