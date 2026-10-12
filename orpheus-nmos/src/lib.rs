@@ -3,9 +3,11 @@
 //! Resource IDs are UUIDv5 from the device ID, so they stay the same across
 //! restarts. The [`Store`] gives each resource a new version whenever its
 //! content changes and counts changes per resource type, which IS-04
-//! peer-to-peer discovery announces in the `ver_*` TXT keys.
+//! peer-to-peer discovery announces in the `ver_*` TXT keys. [`sdp`] writes
+//! the SDP files senders link to.
 
 pub mod is04;
+pub mod sdp;
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};

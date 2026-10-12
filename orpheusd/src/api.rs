@@ -127,6 +127,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(status))
         .routes(routes!(add_sender))
         .routes(routes!(remove_sender))
+        .routes(routes!(sender_sdp))
         .routes(routes!(nodes))
         .split_for_parts()
 }
@@ -252,6 +253,29 @@ async fn remove_sender(
     }
 }
 
+/// The SDP file of a sender's stream, for AES67 and NMOS receivers. The
+/// sender's NMOS resource links to it as `manifest_href`.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/senders/{id}/sdp",
+    tag = "senders",
+    params(("id" = u32, Path, description = "Sender ID from the status")),
+    responses(
+        (status = OK, description = "The SDP file", body = String, content_type = "application/sdp"),
+        (status = NOT_FOUND, description = "No such sender", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn sender_sdp(
+    State(node): State<Arc<Node>>,
+    Path(id): Path<SenderId>,
+) -> Result<([(header::HeaderName, &'static str); 1], String), ApiError> {
+    tokio::task::spawn_blocking(move || crate::nmos::sdp(&node, id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map(|sdp| ([(header::CONTENT_TYPE, "application/sdp")], sdp))
+        .ok_or((StatusCode::NOT_FOUND, format!("no sender {id}")))
+}
+
 /// The other nodes found over mDNS: Orpheus nodes and other NMOS nodes.
 /// Nodes that left stay listed as offline.
 #[utoipa::path(
@@ -353,6 +377,7 @@ mod tests {
                 "/x-orpheus/v1/nodes",
                 "/x-orpheus/v1/senders",
                 "/x-orpheus/v1/senders/{id}",
+                "/x-orpheus/v1/senders/{id}/sdp",
                 "/x-orpheus/v1/status",
             ]
         );

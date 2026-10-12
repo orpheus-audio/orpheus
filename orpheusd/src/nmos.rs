@@ -15,13 +15,20 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use orpheus_clock::Timescale;
+use orpheus_core::rtp::Encoding;
 use orpheus_core::{AudioFormat, OutputType};
+use orpheus_engine::SenderId;
+use orpheus_engine::sender::PAYLOAD_TYPE;
 use orpheus_nmos::is04::{self, *};
+use orpheus_nmos::sdp::{self, RefClock};
 use orpheus_nmos::{Snapshot, Uuid, resource_id};
 
 use crate::api::Node;
 
 const CLOCK: &str = "clk0";
+/// What every sender sends, as `api::add_sender` sets it up.
+const FORMAT: AudioFormat = AudioFormat::AES67;
+const ENCODING: Encoding = Encoding::L24;
 
 pub fn router() -> Router<Arc<Node>> {
     let list = |items: &'static [&'static str]| get(move || async move { Json(items) });
@@ -172,14 +179,18 @@ fn snapshot(node: &Node) -> Snapshot {
         .as_ref()
         .map(|e| e.lock().unwrap().status())
         .unwrap_or_default();
-    let format = AudioFormat::AES67;
+    let format = FORMAT;
+    let media_type: &'static str = match ENCODING {
+        Encoding::L16 => "audio/L16",
+        Encoding::L24 => "audio/L24",
+    };
     let mut snap = Snapshot {
         node: is04::Node {
             base: Base {
                 description: "Orpheus node".into(),
                 ..Base::new(node_id, &node.name)
             },
-            href,
+            href: href.clone(),
             hostname: Some(crate::config::hostname()),
             api: Api {
                 versions: vec![API_VERSION.into()],
@@ -214,7 +225,7 @@ fn snapshot(node: &Node) -> Snapshot {
             base,
             format: FORMAT_AUDIO,
             caps: ReceiverCaps {
-                media_types: vec!["audio/L24"],
+                media_types: vec![media_type],
             },
             device_id,
             transport: TRANSPORT_RTP_UCAST,
@@ -255,20 +266,22 @@ fn snapshot(node: &Node) -> Snapshot {
             source_id,
             device_id,
             parents: vec![],
-            media_type: "audio/L24",
+            media_type,
             sample_rate: Rational {
                 numerator: format.rate,
                 denominator: 1,
             },
-            bit_depth: 24,
+            bit_depth: 8 * ENCODING.bytes_per_sample() as u8,
         });
         snap.senders.push(Sender {
             base: base(resource_id(dev, &format!("sender/{n}"))),
             flow_id: Some(flow_id),
             transport: TRANSPORT_RTP_UCAST,
             device_id,
-            manifest_href: None,
-            interface_bindings: route_interface(s.peer).map_or_else(|| names.clone(), |i| vec![i]),
+            manifest_href: Some(format!("{href}x-orpheus/v1/senders/{n}/sdp")),
+            interface_bindings: route(s.peer)
+                .and_then(|(_, i)| i)
+                .map_or_else(|| names.clone(), |i| vec![i.name]),
             subscription: SenderSubscription {
                 receiver_id: None,
                 active: true,
@@ -288,6 +301,49 @@ fn snapshot(node: &Node) -> Snapshot {
         controls: vec![],
     });
     snap
+}
+
+/// The SDP file of sender `id`, or `None` if there is no such sender.
+pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
+    let snap = refresh(node);
+    let engine = node.engine.as_ref()?.lock().unwrap().status();
+    let (_, status) = engine.senders.iter().find(|(n, _)| *n == id)?;
+    let uuid = resource_id(node.id, &format!("sender/{id}"));
+    let sender = snap.senders.iter().find(|s| s.base.id == uuid)?;
+    let (source, interface) = route(status.peer).unwrap_or((
+        match status.peer {
+            SocketAddr::V4(_) => [0, 0, 0, 0].into(),
+            SocketAddr::V6(_) => [0u16; 8].into(),
+        },
+        None,
+    ));
+    let clock = match node.ptp.as_ref().map(|p| p.status()) {
+        Some(p) => RefClock::Ptp {
+            gmid: gmid(&p.grandmaster),
+            domain: p.domain,
+        },
+        None => RefClock::LocalMac(mac(interface
+            .or_else(|| interfaces().into_iter().next())
+            .map_or([0; 6], |i| i.mac))),
+    };
+    let first = u64::from_be_bytes(uuid.as_bytes()[..8].try_into().unwrap());
+    let session = sdp::Session {
+        // NTP-style numbers fit 63 bits.
+        id: first >> 1,
+        // The clock lives in the node resource.
+        version: sender.base.version.max(snap.node.base.version).tai_nanos(),
+        name: &sender.base.label,
+        source,
+        destination: status.peer,
+        payload_type: PAYLOAD_TYPE,
+        encoding: ENCODING,
+        format: FORMAT,
+        ptime_ms: 1,
+        clock,
+        // RTP timestamps count media-clock frames since the epoch.
+        media_clock_offset: 0,
+    };
+    Some(session.render())
 }
 
 /// `728e2c.fffe.867f85` → `72-8e-2c-ff-fe-86-7f-85`.
@@ -353,8 +409,8 @@ fn endpoints(listen: SocketAddr) -> Vec<Endpoint> {
         .collect()
 }
 
-/// The interface the kernel would send to `peer` from.
-fn route_interface(peer: SocketAddr) -> Option<String> {
+/// The address and interface the kernel would send to `peer` from.
+fn route(peer: SocketAddr) -> Option<(IpAddr, Option<NetInterface>)> {
     let bind: SocketAddr = match peer {
         SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
         SocketAddr::V6(_) => ([0u16; 8], 0).into(),
@@ -362,10 +418,8 @@ fn route_interface(peer: SocketAddr) -> Option<String> {
     let socket = UdpSocket::bind(bind).ok()?;
     socket.connect(peer).ok()?;
     let local = socket.local_addr().ok()?.ip();
-    interfaces()
-        .into_iter()
-        .find(|i| i.addrs.contains(&local))
-        .map(|i| i.name)
+    let interface = interfaces().into_iter().find(|i| i.addrs.contains(&local));
+    Some((local, interface))
 }
 
 #[cfg(test)]

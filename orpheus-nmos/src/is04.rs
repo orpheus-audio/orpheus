@@ -24,6 +24,10 @@ impl Version {
         Self(nanos)
     }
 
+    pub const fn tai_nanos(self) -> u64 {
+        self.0
+    }
+
     /// The next possible version, for changes within the same nanosecond.
     pub const fn next(self) -> Self {
         Self(self.0 + 1)

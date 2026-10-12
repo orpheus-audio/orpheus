@@ -138,6 +138,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows). |
 | `POST /x-orpheus/v1/senders` | Starts a sender. Body: `{"peer": "192.168.1.20", "name": "Kitchen"}`; `name` is optional. Returns `201` with `{"id": 0}`. |
 | `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender. Returns `204`, or `404` if there is no such sender. |
+| `GET /x-orpheus/v1/senders/{id}/sdp` | The sender's stream as an SDP file (`application/sdp`). |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows). Returns `503` if mDNS could not start. |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
 
@@ -176,6 +177,17 @@ controllers can see it. It describes the node as one device with:
 curl -s localhost:7480/x-nmos/node/v1.3/self | jq
 curl -s localhost:7480/x-nmos/node/v1.3/senders | jq '.[].label'
 ```
+
+Each sender's `manifest_href` points to its SDP file, which describes the
+stream the way AES67 and SMPTE ST 2110-30 receivers expect: destination,
+L24/48000/2, payload type 97, 1 ms packets, the PTP grandmaster and domain
+(`ts-refclk`) and `mediaclk:direct=0`:
+
+```sh
+curl -s localhost:7480/x-orpheus/v1/senders/0/sdp
+```
+
+Without PTP the SDP names the sender's own clock (`ts-refclk:localmac=…`).
 
 Resource IDs are derived from the node ID, so they stay the same across
 restarts. The receiver carries the tag `urn:x-orpheus:form-factor` with the

@@ -82,6 +82,14 @@ pub enum Encoding {
 }
 
 impl Encoding {
+    /// The RTP encoding name, as in `audio/L24`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::L16 => "L16",
+            Self::L24 => "L24",
+        }
+    }
+
     pub const fn bytes_per_sample(self) -> usize {
         match self {
             Self::L16 => 2,

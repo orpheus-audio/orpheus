@@ -121,8 +121,9 @@ the filter corrects it. Gradual NTP adjustments (slewing) are harmless.
 
 - They speak PTP over IPv4 only. Use an interface with an IPv4 address, or
   set `transport = "ipv4"`.
-- SAP and SDP are not implemented yet, so the devices
-  cannot find the node's streams. Interoperability is untested; see the
+- SAP is not implemented, so the devices
+  cannot find the node's streams by themselves. Each sender has an SDP file
+  at `/x-orpheus/v1/senders/{id}/sdp`, which some devices can import. Interoperability is untested; see the
   [roadmap](roadmap.md).
 
 ## Two nodes on one machine

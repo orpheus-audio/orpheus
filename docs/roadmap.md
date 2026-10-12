@@ -10,7 +10,7 @@
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
-| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04 done |
+| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04, SDP done |
 | M5 | Memory and policy: pinned peers, aliases, route restore on reconnect, per-sender gains; mixing policies and ducking; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
@@ -26,7 +26,8 @@ and Bluetooth inputs.
 **Audio**
 
 - The stream format is fixed: L24, 48 kHz, stereo, 1 ms packets, payload type
-  97. There is no SDP yet, and the receiver accepts any payload type.
+  97. Senders describe their stream in an SDP file, but the receiver doesn't
+  read SDP and accepts any payload type.
 - One receiver per node, following one stream at a time. Mixing comes in M5.
 - Routes are not saved and end when `orpheusd` stops.
 - The sender sizes its buffer from `[audio] quantum` (or assumes 1024 frames)

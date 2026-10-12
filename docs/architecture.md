@@ -124,8 +124,9 @@ The TX, RX and PTP threads run at normal priority for now.
 ## Stream format
 
 L24 (24-bit big-endian PCM), 48 kHz, 2 channels, 1 ms per packet, RTP payload
-type 97. This is the AES67 baseline. It is fixed for now; with SDP it will be
-negotiated per stream.
+type 97. This is the AES67 baseline. It is fixed for now. Each sender
+describes its stream in an SDP file; RTP timestamps count media-clock frames
+since the PTP epoch, so the SDP says `mediaclk:direct=0`.
 
 ## NMOS
 
@@ -135,6 +136,10 @@ resources from the engine once a second and whenever the API is asked; a
 resource gets a new version when its content changes. The node then
 announces a new `ver_*` counter in its mDNS TXT record, which tells NMOS
 controllers and other nodes to fetch the resources again.
+
+Each sender's `manifest_href` points to its SDP file. Its session version
+follows the sender's and the node's resource versions, so it changes when the
+destination or the PTP grandmaster does.
 
 Resource IDs are UUIDv5 from the node ID and the resource's path
 (`node`, `device`, `receiver/0`, `sender/3`, …). Sender numbers restart at 0

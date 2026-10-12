@@ -167,6 +167,7 @@ pub struct PtpStatus {
     pub interface: String,
     /// `ipv4` or `ipv6`, never `auto`.
     pub transport: PtpTransport,
+    pub domain: u8,
     /// This node's clock identity.
     #[cfg_attr(feature = "openapi", schema(example = "4cb04a.fffe.50a582"))]
     pub identity: String,
@@ -299,6 +300,7 @@ impl PtpClock {
             status: Mutex::new(PtpStatus {
                 interface: interface.to_string(),
                 transport,
+                domain: cfg.domain,
                 identity: format_identity(identity),
                 state: PtpState::Initializing,
                 grandmaster: format_identity(identity),
@@ -932,6 +934,7 @@ mod tests {
             status: Mutex::new(PtpStatus {
                 interface: "lo".into(),
                 transport: PtpTransport::Ipv4,
+                domain: 0,
                 identity: String::new(),
                 state: PtpState::Listening,
                 grandmaster: String::new(),
