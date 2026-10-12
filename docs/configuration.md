@@ -158,14 +158,13 @@ from the icon theme. Until discovery exists, every network sink is `generic`.
 ### `[loopback]`
 
 A debug route, not a user feature: it creates a sink "Orpheus loopback" that
-plays straight back on a local output through the engine. It is used to
+plays straight back on the default output through the engine. It is used to
 measure the engine's own latency.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Create the loopback sink. |
 | `latency_ms` | `20` | Buffer between the sink and the playback stream. |
-| `target` | unset | `node.name` of the output; the default output if unset. |
 
 ## Environment
 

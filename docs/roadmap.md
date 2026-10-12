@@ -143,7 +143,7 @@ network delay, and no jitter or loss. Expected problems on real networks:
 - **Split between config and control plane** (open question). Routing
   belongs to the control plane: which output a receiver plays on, link
   offsets, senders. It would move to the API and be remembered in the state
-  directory, and `[receiver] target` and `[loopback] target` would leave the
+  directory, and `[receiver] target` would leave the
   config. Still open is how `config.toml` and settings changed through the
   API relate, for example the file as defaults that the API overrides, with
   the API showing where each value comes from.

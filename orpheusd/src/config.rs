@@ -128,8 +128,6 @@ pub struct LoopbackConfig {
     pub enabled: bool,
     /// Buffer between the sink and the playback stream.
     pub latency_ms: u32,
-    /// `node.name` of the output to play on; default output if unset.
-    pub target: Option<String>,
 }
 
 impl Default for LoopbackConfig {
@@ -137,7 +135,6 @@ impl Default for LoopbackConfig {
         Self {
             enabled: false,
             latency_ms: 20,
-            target: None,
         }
     }
 }
