@@ -13,8 +13,19 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | Command | Effect |
 |---|---|
 | `status` | Shows the node's ID, name, version, clock, receiver and senders. |
+| `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
 | `connect PEER [--name NAME]` | Sends the node's audio to `PEER`. This creates a sink called `NAME` (the peer if no name is given), marked with a network icon. Whatever is played into the sink goes to the peer's receiver. |
 | `disconnect ID` | Stops a sender and removes its sink. The ID is shown by `connect` and `status`. |
+
+`--json` prints the node's JSON responses instead of text: the status as the
+[HTTP API](#http-api) returns it, and `{"id": 0}` after `connect`. Scripts
+should use it, because the text output may change. With `--watch` it prints
+one line per sample:
+
+```sh
+orpheusctl --json status | jq .clock.ptp.offset_ns
+orpheusctl --json status --watch 5 >> status.jsonl
+```
 
 `PEER` is a host name or address with an optional port; the default port is
 5004. IPv6 addresses with a port need brackets:
@@ -63,6 +74,9 @@ On a terminal the dots are coloured: green is fine, yellow needs attention
 (settling, on the system clock), red is broken. Problem counters, a
 `margin` below 1 ms and more than two `steps` are highlighted too. Colour is
 off when the output is piped or `NO_COLOR` is set.
+
+Counters are totals since the start. With `--watch` they are rates over the
+last interval instead, so `problems` shows only what is going wrong now.
 
 **Clock**
 

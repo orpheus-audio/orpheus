@@ -1,7 +1,8 @@
 //! `orpheusctl`: command-line client for any Orpheus node.
 
 use std::fmt::Write as _;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write as _};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,6 +14,9 @@ struct Cli {
     /// Base URL of the node to talk to.
     #[arg(long, default_value = "http://localhost:7480", env = "ORPHEUS_NODE")]
     node: String,
+    /// Print the node's JSON responses instead of text.
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -20,7 +24,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Show the node's ID, name, version and streams.
-    Status,
+    Status {
+        /// Refresh every SECONDS (default 1), with counters as rates.
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1")]
+        watch: Option<f64>,
+    },
     /// Send the node's audio to a peer: creates a sink "<name>"
     /// whose audio is streamed to the peer.
     Connect {
@@ -38,7 +46,7 @@ enum Command {
     },
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Status {
     id: String,
     name: String,
@@ -56,7 +64,7 @@ fn yes() -> bool {
     true
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct ClockInfo {
     source: String,
     ptp: Option<Ptp>,
@@ -66,7 +74,7 @@ fn ipv4() -> String {
     "ipv4".into()
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Ptp {
     interface: String,
     /// Missing from older nodes, which only spoke IPv4.
@@ -82,7 +90,7 @@ struct Ptp {
     settled: bool,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Buffer {
     underruns: u64,
     overruns: u64,
@@ -90,7 +98,7 @@ struct Buffer {
     level_frames: u64,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Receiver {
     listen: String,
     link_offset_ms: u32,
@@ -107,7 +115,7 @@ struct Receiver {
     buffer: Buffer,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct Sender {
     id: u32,
     peer: String,
@@ -130,17 +138,72 @@ struct Created {
     id: u32,
 }
 
+impl Status {
+    /// The counters' increase since `prev`; levels and settings stay current.
+    fn since(&self, prev: &Status) -> Status {
+        let mut d = self.clone();
+        d.loopback = match (&self.loopback, &prev.loopback) {
+            (Some(b), Some(p)) => Some(b.since(p)),
+            (b, _) => b.as_ref().map(|b| b.since(b)),
+        };
+        d.receiver = self.receiver.as_ref().map(|r| {
+            let p = prev.receiver.as_ref().unwrap_or(r);
+            Receiver {
+                packets: r.packets.saturating_sub(p.packets),
+                malformed: r.malformed.saturating_sub(p.malformed),
+                late: r.late.saturating_sub(p.late),
+                early: r.early.saturating_sub(p.early),
+                lost: r.lost.saturating_sub(p.lost),
+                realigns: r.realigns.saturating_sub(p.realigns),
+                buffer: r.buffer.since(&p.buffer),
+                ..r.clone()
+            }
+        });
+        d.senders = self
+            .senders
+            .iter()
+            .map(|t| {
+                // A new sender counts from now.
+                let p = prev.senders.iter().find(|p| p.id == t.id).unwrap_or(t);
+                Sender {
+                    packets: t.packets.saturating_sub(p.packets),
+                    send_errors: t.send_errors.saturating_sub(p.send_errors),
+                    realigns: t.realigns.saturating_sub(p.realigns),
+                    buffer: t.buffer.since(&p.buffer),
+                    ..t.clone()
+                }
+            })
+            .collect();
+        d
+    }
+}
+
+impl Buffer {
+    fn since(&self, prev: &Buffer) -> Buffer {
+        Buffer {
+            underruns: self.underruns.saturating_sub(prev.underruns),
+            overruns: self.overruns.saturating_sub(prev.overruns),
+            resyncs: self.resyncs.saturating_sub(prev.resyncs),
+            level_frames: self.level_frames,
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let base = cli.node.trim_end_matches('/');
     match cli.command {
-        Command::Status => {
-            let url = format!("{base}/x-orpheus/v1/status");
-            let s: Status = ureq::get(&url)
-                .call()
-                .and_then(|mut r| r.body_mut().read_json())
-                .with_context(|| format!("querying {url}"))?;
-            print!("{}", render(&s, Paint::detect()));
+        Command::Status { watch: None } => {
+            let (raw, s) = status(base)?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                print!("{}", render(&s, Paint::detect(), Counts::Total));
+            }
+        }
+        Command::Status { watch: Some(secs) } => {
+            anyhow::ensure!(secs >= 0.1, "--watch needs at least 0.1 seconds");
+            watch(base, Duration::from_secs_f64(secs), cli.json)?;
         }
         Command::Connect { peer, name } => {
             let url = format!("{base}/x-orpheus/v1/senders");
@@ -151,7 +214,11 @@ fn main() -> Result<()> {
                 })
                 .and_then(|mut r| r.body_mut().read_json())
                 .with_context(|| format!("connecting to {peer} via {url}"))?;
-            println!("sender {} → {peer}", created.id);
+            if cli.json {
+                println!("{}", serde_json::json!({ "id": created.id }));
+            } else {
+                println!("sender {} → {peer}", created.id);
+            }
         }
         Command::Disconnect { id } => {
             let url = format!("{base}/x-orpheus/v1/senders/{id}");
@@ -161,6 +228,112 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The status as the node sent it, and parsed.
+fn status(base: &str) -> Result<(String, Status)> {
+    let url = format!("{base}/x-orpheus/v1/status");
+    let raw = ureq::get(&url)
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string())
+        .with_context(|| format!("querying {url}"))?;
+    let s = serde_json::from_str(&raw).with_context(|| format!("reading status from {url}"))?;
+    Ok((raw, s))
+}
+
+/// Shows the status every `interval` until interrupted. On a terminal each
+/// frame replaces the last; otherwise frames follow each other. With JSON
+/// every sample is one line. Errors are shown and retried, so the node may
+/// restart meanwhile.
+fn watch(base: &str, interval: Duration, json: bool) -> Result<()> {
+    let paint = Paint::detect();
+    let tty = std::io::stdout().is_terminal();
+    let mut out = std::io::stdout().lock();
+    let mut prev: Option<(Instant, Status)> = None;
+    let mut first = true;
+    let mut next = Instant::now();
+    loop {
+        let fetched = status(base);
+        let now = Instant::now();
+        let frame = match fetched {
+            Ok((raw, _)) if json => Some(format!("{}\n", raw.trim_end())),
+            Ok((_, s)) => {
+                // Rates need two samples; the first frame waits for the second.
+                let frame = prev.as_ref().map(|(at, p)| {
+                    let secs = (now - *at).as_secs_f64();
+                    render(&s.since(p), paint, Counts::Rate(secs))
+                });
+                prev = Some((now, s));
+                frame
+            }
+            Err(e) => {
+                prev = None;
+                let mark = paint.mark(Level::Bad, &format!("{e:#}"));
+                Some(format!("{mark}\n"))
+            }
+        };
+        if let Some(frame) = frame {
+            if json {
+                out.write_all(frame.as_bytes())?;
+            } else if tty {
+                // Home, then overwrite each line and clear the rest, which
+                // flickers less than clearing the screen first.
+                let mut f = String::from(if first { "\x1b[2J\x1b[H" } else { "\x1b[H" });
+                for line in frame.lines() {
+                    let _ = writeln!(f, "{line}\x1b[K");
+                }
+                f.push_str("\x1b[J");
+                out.write_all(f.as_bytes())?;
+            } else {
+                if !first {
+                    out.write_all(b"\n")?;
+                }
+                out.write_all(frame.as_bytes())?;
+            }
+            out.flush()?;
+            first = false;
+        }
+        next += interval;
+        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+}
+
+/// How counters are shown.
+#[derive(Clone, Copy)]
+enum Counts {
+    /// As they are: totals since the start.
+    Total,
+    /// Per second, from their increase over this many seconds.
+    Rate(f64),
+}
+
+impl Counts {
+    /// The number, and whether the name after it is singular.
+    fn show(self, n: u64) -> (String, bool) {
+        match self {
+            Counts::Total => (n.to_string(), n == 1),
+            Counts::Rate(secs) => {
+                let r = n as f64 / secs;
+                let text = if r >= 10.0 || r.fract() == 0.0 {
+                    format!("{r:.0}")
+                } else {
+                    format!("{r:.1}")
+                };
+                (text, r == 1.0)
+            }
+        }
+    }
+
+    fn unit(self) -> &'static str {
+        match self {
+            Counts::Total => "",
+            Counts::Rate(_) => "/s",
+        }
+    }
+
+    fn packets(self, n: u64) -> String {
+        format!("{}{}", self.show(n).0, self.unit())
+    }
 }
 
 /// Width of the key column, so that values line up under section headlines.
@@ -239,11 +412,14 @@ fn us(ns: Option<i64>) -> String {
 }
 
 /// The non-zero counters, highlighted, or "none".
-fn problems(p: Paint, counts: &[(u64, &str, &str)]) -> String {
+fn problems(p: Paint, c: Counts, counts: &[(u64, &str, &str)]) -> String {
     let found: Vec<String> = counts
         .iter()
         .filter(|(n, ..)| *n > 0)
-        .map(|&(n, one, many)| format!("{n} {}", if n == 1 { one } else { many }))
+        .map(|&(n, one, many)| {
+            let (num, single) = c.show(n);
+            format!("{num} {}{}", if single { one } else { many }, c.unit())
+        })
         .collect();
     if found.is_empty() {
         "none".into()
@@ -260,7 +436,7 @@ fn buffer_counts(b: &Buffer) -> [(u64, &'static str, &'static str); 3] {
     ]
 }
 
-fn render(s: &Status, p: Paint) -> String {
+fn render(s: &Status, p: Paint, c: Counts) -> String {
     let mut o = String::new();
     let _ = writeln!(
         o,
@@ -285,14 +461,14 @@ fn render(s: &Status, p: Paint) -> String {
         None => {}
     }
     if let Some(r) = &s.receiver {
-        receiver(&mut o, p, r);
+        receiver(&mut o, p, c, r);
     }
     if let Some(l) = &s.loopback {
         heading(&mut o, p, "Loopback", None);
         row(&mut o, p, "buffer", &format!("{} frames", l.level_frames));
-        row(&mut o, p, "problems", &problems(p, &buffer_counts(l)));
+        row(&mut o, p, "problems", &problems(p, c, &buffer_counts(l)));
     }
-    senders(&mut o, p, &s.senders);
+    senders(&mut o, p, c, &s.senders);
     o
 }
 
@@ -330,7 +506,7 @@ fn clock(o: &mut String, p: Paint, t: &Ptp) {
     row(o, p, "steps", &steps);
 }
 
-fn receiver(o: &mut String, p: Paint, r: &Receiver) {
+fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
     let mark = match r.ssrc {
         Some(ssrc) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
         None => p.mark(Level::Off, "idle"),
@@ -350,7 +526,7 @@ fn receiver(o: &mut String, p: Paint, r: &Receiver) {
         None => "-".into(),
     };
     row(o, p, "margin", &margin);
-    row(o, p, "packets", &r.packets.to_string());
+    row(o, p, "packets", &c.packets(r.packets));
     row(o, p, "buffer", &format!("{} frames", r.buffer.level_frames));
     row(o, p, "ASRC", &format!("{:+.1} ppm", r.asrc_ppm));
     let mut counts = vec![
@@ -361,10 +537,10 @@ fn receiver(o: &mut String, p: Paint, r: &Receiver) {
         (r.realigns, "realign", "realigns"),
     ];
     counts.extend(buffer_counts(&r.buffer));
-    row(o, p, "problems", &problems(p, &counts));
+    row(o, p, "problems", &problems(p, c, &counts));
 }
 
-fn senders(o: &mut String, p: Paint, senders: &[Sender]) {
+fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
     if senders.is_empty() {
         let mark = p.mark(Level::Off, "none");
         heading(o, p, "Senders", Some(mark));
@@ -383,10 +559,10 @@ fn senders(o: &mut String, p: Paint, senders: &[Sender]) {
             [
                 t.id.to_string(),
                 t.peer.clone(),
-                t.packets.to_string(),
+                c.packets(t.packets),
                 format!("{} frames", t.buffer.level_frames),
                 format!("{:+.1} ppm", t.asrc_ppm),
-                problems(p, &counts),
+                problems(p, c, &counts),
             ]
         })
         .collect();
@@ -444,7 +620,7 @@ mod tests {
     #[test]
     fn renders_plain_status() {
         let s: Status = serde_json::from_str(STATUS).unwrap();
-        let out = render(&s, Paint(false));
+        let out = render(&s, Paint(false), Counts::Total);
         let expected = "\
 desk  B73AQ0P0  orpheusd 0.0.1
 
@@ -475,10 +651,36 @@ Senders
     }
 
     #[test]
+    fn watch_shows_rates() {
+        let prev: Status = serde_json::from_str(STATUS).unwrap();
+        let mut s = prev.clone();
+        let r = s.receiver.as_mut().unwrap();
+        r.packets += 2000;
+        r.late += 3;
+        s.senders[0].packets += 2000;
+        s.senders[0].buffer.underruns += 2;
+        let mut new = s.senders[0].clone();
+        new.id = 1;
+        s.senders.push(new);
+        let out = render(&s.since(&prev), Paint(false), Counts::Rate(2.0));
+        assert!(out.contains("  packets      1000/s\n"), "{out}");
+        assert!(out.contains("  problems     1.5 late/s\n"), "{out}");
+        assert!(
+            out.contains("1000/s  1120 frames  +8.9 ppm  1 underrun/s\n"),
+            "{out}"
+        );
+        // A sender that appeared since the last sample counts from now.
+        assert!(
+            out.contains("  1   192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
     fn colour_stays_out_of_alignment() {
         let s: Status = serde_json::from_str(STATUS).unwrap();
-        let plain = render(&s, Paint(false));
-        let coloured = render(&s, Paint(true));
+        let plain = render(&s, Paint(false), Counts::Total);
+        let coloured = render(&s, Paint(true), Counts::Total);
         let stripped = coloured
             .split("\x1b[")
             .enumerate()

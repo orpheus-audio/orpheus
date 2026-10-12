@@ -43,6 +43,7 @@ played into it comes out of the second machine's default output.
 
 ```sh
 orpheusctl status          # clock, receiver and senders
+orpheusctl status --watch  # the same, refreshed every second
 orpheusctl disconnect 0    # stop sender 0
 ```
 

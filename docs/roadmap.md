@@ -183,12 +183,10 @@ network delay, and no jitter or loss. Expected problems on real networks:
 - **Source types** (todo): the same for inputs, such as microphone, turntable
   or TV audio.
 
-### `orpheusctl`
+### Graphs
 
-- `--json` for scripts and `jq`, so that the human output can change freely.
-- `--watch`: refresh in place, with counters as rates ("3 late/s").
-
-Graphs (PTP offset, latency, ASRC over time) are left to the web UI.
+Graphs of the PTP offset, latency and ASRC over time are left to the web UI;
+`orpheusctl status --watch` shows the current values only.
 
 ### Platforms and audio backends
 
