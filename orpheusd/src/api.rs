@@ -97,7 +97,8 @@ struct SenderEntry {
 
 #[derive(Deserialize, ToSchema)]
 struct NewSender {
-    /// `host`, `host:port`, `ip` or `ip:port`; the port defaults to 5004.
+    /// `host`, `host:port`, `ip`, `ip:port` or `[ipv6]:port`; the port
+    /// defaults to 5004.
     #[schema(example = "192.168.1.20")]
     peer: String,
     /// Shown in the sink name, "Orpheus → name"; defaults to the peer.
@@ -245,33 +246,68 @@ fn lock_engine(node: &Node) -> Result<std::sync::MutexGuard<'_, Engine>, ApiErro
         .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()))
 }
 
-/// Resolves a peer, preferring IPv4 (the receiver listens on IPv4).
+/// Resolves a peer: a host name or address, optionally with a port.
+/// Prefers IPv4, which every receiver (also AES67 devices) listens on.
 async fn resolve(peer: &str) -> Result<SocketAddr, ApiError> {
-    if let Ok(addr) = peer.parse::<SocketAddr>() {
-        return Ok(addr);
+    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let (host, port) = split_host_port(peer).ok_or_else(|| bad(format!("bad peer {peer:?}")))?;
+    let port = port.unwrap_or(RTP_PORT);
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return Ok(SocketAddr::new(ip, port));
     }
-    if let Ok(ip) = peer.parse::<IpAddr>() {
-        return Ok(SocketAddr::new(ip, RTP_PORT));
-    }
-    let found: Vec<SocketAddr> = match peer.rsplit_once(':') {
-        Some((host, port)) if port.parse::<u16>().is_ok() => {
-            tokio::net::lookup_host((host, port.parse::<u16>().unwrap())).await
-        }
-        _ => tokio::net::lookup_host((peer, RTP_PORT)).await,
-    }
-    .map_err(|e| (StatusCode::BAD_REQUEST, format!("resolving {peer}: {e}")))?
-    .collect();
+    // Also link-local addresses with an interface name (`fe80::1%eth0`).
+    let found: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| bad(format!("resolving {peer}: {e}")))?
+        .collect();
     found
         .iter()
         .find(|a| a.is_ipv4())
         .or(found.first())
         .copied()
-        .ok_or((StatusCode::BAD_REQUEST, format!("{peer} has no address")))
+        .ok_or_else(|| bad(format!("{peer} has no address")))
+}
+
+/// `host`, `host:port`, `[v6]` or `[v6]:port`; a bare IPv6 address has no
+/// port.
+fn split_host_port(peer: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = peer.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        return match rest {
+            "" => Some((host, None)),
+            _ => Some((host, Some(rest.strip_prefix(':')?.parse().ok()?))),
+        };
+    }
+    match peer.split_once(':') {
+        Some((host, port)) if !port.contains(':') => Some((host, Some(port.parse().ok()?))),
+        _ => Some((peer, None)),
+    }
+    .filter(|(host, _)| !host.is_empty())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn peer_addresses() {
+        let cases = [
+            ("box", Some(("box", None))),
+            ("box.local:5006", Some(("box.local", Some(5006)))),
+            ("192.168.1.2", Some(("192.168.1.2", None))),
+            ("192.168.1.2:5006", Some(("192.168.1.2", Some(5006)))),
+            ("fd00::2", Some(("fd00::2", None))),
+            ("fe80::2%eth0", Some(("fe80::2%eth0", None))),
+            ("[fd00::2]", Some(("fd00::2", None))),
+            ("[fe80::2%eth0]:5006", Some(("fe80::2%eth0", Some(5006)))),
+            ("box:http", None),
+            ("[fd00::2]5006", None),
+            (":5006", None),
+        ];
+        for (peer, want) in cases {
+            assert_eq!(split_host_port(peer), want, "{peer}");
+        }
+    }
 
     #[test]
     fn spec_lists_all_routes() {

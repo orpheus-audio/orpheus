@@ -15,13 +15,17 @@
 //! row, it has been within the settle threshold of the grandmaster with a
 //! steady frequency, or when this node is the grandmaster.
 //!
+//! PTP runs over UDP on IPv4 (as AES67 and Dante expect) or IPv6; nodes on
+//! different transports do not see each other. By default a node uses IPv4
+//! if its interface has an IPv4 address, IPv6 otherwise.
+//!
 //! Software timestamps only for now. Binding the PTP ports 319 and 320 needs
 //! `CAP_NET_BIND_SERVICE`.
 
 use std::cell::RefCell;
 use std::fs;
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
@@ -41,8 +45,9 @@ use statime::port::{
 use statime::time::{Duration, Interval, Time};
 use statime::{OverlayClock, PtpInstance, PtpInstanceState};
 use timestamped_socket::interface::{InterfaceName, interfaces};
+use timestamped_socket::networkaddress::MulticastJoinable;
 use timestamped_socket::socket::{
-    InterfaceTimestampMode, Open, Socket, Timestamp, open_interface_udp4,
+    InterfaceTimestampMode, Open, Socket, Timestamp, open_interface_udp4, open_interface_udp6,
 };
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep_until};
@@ -51,8 +56,12 @@ use crate::{Clock, Timescale};
 
 const EVENT_PORT: u16 = 319;
 const GENERAL_PORT: u16 = 320;
-const PRIMARY: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
-const PDELAY: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 107);
+const PRIMARY_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 1, 129);
+const PDELAY_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 107);
+/// `ff0e::181`: global scope, as ptp4l uses by default.
+const PRIMARY_V6: Ipv6Addr = Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x181);
+/// `ff02::6b`: link-local, as IEEE 1588 requires for peer delay.
+const PDELAY_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x6b);
 
 /// Announce intervals in a row within the settle threshold before the clock
 /// counts as settled.
@@ -75,10 +84,24 @@ const STEP_HOLDOFF_NS: u64 = 1_000_000_000;
 /// TAI − UTC announced when this node is the grandmaster.
 const UTC_OFFSET_S: i16 = 37;
 
+/// The network protocol PTP messages travel over.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PtpTransport {
+    /// IPv4 if the interface has an IPv4 address, IPv6 otherwise.
+    #[default]
+    Auto,
+    Ipv4,
+    Ipv6,
+}
+
 #[derive(Debug, Clone)]
 pub struct PtpConfig {
     /// Network interface; `None` picks the one with the default route.
     pub interface: Option<String>,
+    pub transport: PtpTransport,
     pub domain: u8,
     /// Lower wins the grandmaster election. Dedicated grandmasters usually
     /// use 128 or less.
@@ -98,6 +121,7 @@ impl Default for PtpConfig {
     fn default() -> Self {
         Self {
             interface: None,
+            transport: PtpTransport::Auto,
             domain: 0,
             priority1: 250,
             priority2: 128,
@@ -150,6 +174,8 @@ impl From<PortState> for PtpState {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PtpStatus {
     pub interface: String,
+    /// `ipv4` or `ipv6`, never `auto`.
+    pub transport: PtpTransport,
     /// This node's clock identity.
     #[cfg_attr(feature = "openapi", schema(example = "4cb04a.fffe.50a582"))]
     pub identity: String,
@@ -281,11 +307,16 @@ impl PtpClock {
                     format!("interface {interface} has no MAC address"),
                 )
             })?;
+        let transport = match cfg.transport {
+            PtpTransport::Auto => auto_transport(interface)?,
+            t => t,
+        };
         let identity = eui64(mac);
         let shared = Arc::new(Shared {
             clock: Mutex::new(OverlayClock::new(Base(cfg.timescale))),
             status: Mutex::new(PtpStatus {
                 interface: interface.to_string(),
+                transport,
                 identity: format_identity(identity),
                 state: PtpState::Initializing,
                 grandmaster: format_identity(identity),
@@ -309,7 +340,20 @@ impl PtpClock {
                     .enable_all()
                     .build();
                 match rt {
-                    Ok(rt) => rt.block_on(run(cfg, interface, identity, shared, ready_tx, stop_rx)),
+                    Ok(rt) => rt.block_on(async {
+                        let port = PortSetup {
+                            cfg,
+                            interface,
+                            identity,
+                            shared,
+                            ready: ready_tx,
+                            stop: stop_rx,
+                        };
+                        match transport {
+                            PtpTransport::Ipv6 => run::<SocketAddrV6>(port).await,
+                            _ => run::<SocketAddrV4>(port).await,
+                        }
+                    }),
                     Err(e) => {
                         let _ = ready_tx.send(Err(e));
                     }
@@ -372,12 +416,52 @@ async fn at(deadline: Option<Instant>) {
     }
 }
 
-struct Sockets {
-    event: Socket<SocketAddrV4, Open>,
-    general: Socket<SocketAddrV4, Open>,
+/// A UDP transport for PTP: IPv4 or IPv6.
+trait Transport: MulticastJoinable {
+    /// The primary or the peer-delay multicast group.
+    fn group(link_local: bool, port: u16) -> Self;
+
+    fn open(
+        interface: InterfaceName,
+        port: u16,
+        timestamping: InterfaceTimestampMode,
+    ) -> io::Result<Socket<Self, Open>>;
 }
 
-fn open_sockets(interface: InterfaceName) -> io::Result<Sockets> {
+impl Transport for SocketAddrV4 {
+    fn group(link_local: bool, port: u16) -> Self {
+        Self::new(if link_local { PDELAY_V4 } else { PRIMARY_V4 }, port)
+    }
+
+    fn open(
+        interface: InterfaceName,
+        port: u16,
+        timestamping: InterfaceTimestampMode,
+    ) -> io::Result<Socket<Self, Open>> {
+        open_interface_udp4(interface, port, timestamping, None)
+    }
+}
+
+impl Transport for SocketAddrV6 {
+    fn group(link_local: bool, port: u16) -> Self {
+        Self::new(if link_local { PDELAY_V6 } else { PRIMARY_V6 }, port, 0, 0)
+    }
+
+    fn open(
+        interface: InterfaceName,
+        port: u16,
+        timestamping: InterfaceTimestampMode,
+    ) -> io::Result<Socket<Self, Open>> {
+        open_interface_udp6(interface, port, timestamping, None)
+    }
+}
+
+struct Sockets<A: Transport> {
+    event: Socket<A, Open>,
+    general: Socket<A, Open>,
+}
+
+fn open_sockets<A: Transport>(interface: InterfaceName) -> io::Result<Sockets<A>> {
     let context = |what: &str, e: io::Error| {
         let hint = if e.kind() == io::ErrorKind::PermissionDenied {
             " (needs CAP_NET_BIND_SERVICE: sudo setcap cap_net_bind_service=ep orpheusd)"
@@ -389,34 +473,40 @@ fn open_sockets(interface: InterfaceName) -> io::Result<Sockets> {
             format!("PTP {what} socket on {interface}: {e}{hint}"),
         )
     };
-    let event = open_interface_udp4(
-        interface,
-        EVENT_PORT,
-        InterfaceTimestampMode::SoftwareAll,
-        None,
-    )
-    .map_err(|e| context("event", e))?;
-    let general = open_interface_udp4(interface, GENERAL_PORT, InterfaceTimestampMode::None, None)
+    let event = A::open(interface, EVENT_PORT, InterfaceTimestampMode::SoftwareAll)
+        .map_err(|e| context("event", e))?;
+    let general = A::open(interface, GENERAL_PORT, InterfaceTimestampMode::None)
         .map_err(|e| context("general", e))?;
     for socket in [&event, &general] {
-        for group in [PRIMARY, PDELAY] {
+        for link_local in [false, true] {
             socket
-                .join_multicast(SocketAddrV4::new(group, 0), interface)
+                .join_multicast(A::group(link_local, 0), interface)
                 .map_err(|e| context("multicast", e))?;
         }
     }
     Ok(Sockets { event, general })
 }
 
-async fn run(
+/// What the PTP thread starts with.
+struct PortSetup {
     cfg: PtpConfig,
     interface: InterfaceName,
     identity: ClockIdentity,
     shared: Arc<Shared>,
     ready: mpsc::Sender<io::Result<()>>,
-    mut stop: oneshot::Receiver<()>,
-) {
-    let mut sockets = match open_sockets(interface) {
+    stop: oneshot::Receiver<()>,
+}
+
+async fn run<A: Transport>(setup: PortSetup) {
+    let PortSetup {
+        cfg,
+        interface,
+        identity,
+        shared,
+        ready,
+        mut stop,
+    } = setup;
+    let mut sockets = match open_sockets::<A>(interface) {
         Ok(s) => {
             let _ = ready.send(Ok(()));
             s
@@ -463,7 +553,12 @@ async fn run(
         minor_ptp_version: PtpMinorVersion::One,
     };
     let mut port = instance.add_port(port_config, filter, clock.clone(), StdRng::from_entropy());
-    tracing::info!(%interface, identity = %format_identity(identity), "PTP running");
+    tracing::info!(
+        %interface,
+        transport = ?shared.status.lock().unwrap().transport,
+        identity = %format_identity(identity),
+        "PTP running"
+    );
 
     let mut timers = Timers::default();
     let mut settle = Settle::default();
@@ -543,9 +638,9 @@ async fn run(
 
 /// Carries out the port's actions; returns the send timestamp the port
 /// asked for, if any.
-async fn handle_actions(
+async fn handle_actions<A: Transport>(
     actions: PortActionIterator<'_>,
-    sockets: &mut Sockets,
+    sockets: &mut Sockets<A>,
     timers: &mut Timers,
     clock: &PortClock,
 ) -> Option<(TimestampContext, Time)> {
@@ -557,9 +652,11 @@ async fn handle_actions(
                 data,
                 link_local,
             } => {
-                let group = if link_local { PDELAY } else { PRIMARY };
-                let to = SocketAddrV4::new(group, EVENT_PORT);
-                match sockets.event.send_to(data, to).await {
+                match sockets
+                    .event
+                    .send_to(data, A::group(link_local, EVENT_PORT))
+                    .await
+                {
                     Ok(ts) => match ts.selected_timestamp() {
                         Some(ts) => pending = Some((context, clock.time_of(ts))),
                         None => tracing::warn!("PTP send timestamp missing"),
@@ -568,8 +665,7 @@ async fn handle_actions(
                 }
             }
             PortAction::SendGeneral { data, link_local } => {
-                let group = if link_local { PDELAY } else { PRIMARY };
-                let to = SocketAddrV4::new(group, GENERAL_PORT);
+                let to = A::group(link_local, GENERAL_PORT);
                 if let Err(e) = sockets.general.send_to(data, to).await {
                     tracing::warn!(error = %e, "PTP send failed");
                 }
@@ -666,18 +762,13 @@ fn format_identity(id: ClockIdentity) -> String {
     )
 }
 
-/// The interface of the default IPv4 route.
+/// The interface of the default route, IPv4 preferred.
 fn default_interface() -> io::Result<InterfaceName> {
-    let routes = fs::read_to_string("/proc/net/route")?;
-    routes
-        .lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let iface = fields.next()?;
-            (fields.next()? == "00000000").then_some(iface)
-        })
-        .find_map(|iface| iface.parse().ok())
+    let v4 = fs::read_to_string("/proc/net/route").unwrap_or_default();
+    let v6 = fs::read_to_string("/proc/net/ipv6_route").unwrap_or_default();
+    default_route_v4(&v4)
+        .or_else(|| default_route_v6(&v6))
+        .and_then(|iface| iface.parse().ok())
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -686,9 +777,82 @@ fn default_interface() -> io::Result<InterfaceName> {
         })
 }
 
+/// In `/proc/net/route`: interface, destination, gateway, … in hex.
+fn default_route_v4(routes: &str) -> Option<&str> {
+    routes.lines().skip(1).find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let iface = fields.next()?;
+        (fields.next()? == "00000000").then_some(iface)
+    })
+}
+
+/// In `/proc/net/ipv6_route`: destination, prefix length, source, …,
+/// flags, interface. Unreachable routes also have prefix length 0 but point
+/// at `lo`.
+fn default_route_v6(routes: &str) -> Option<&str> {
+    routes.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let [dest, prefix, .., iface] = fields[..] else {
+            return None;
+        };
+        (fields.len() == 10 && prefix == "00" && dest.bytes().all(|b| b == b'0') && iface != "lo")
+            .then_some(iface)
+    })
+}
+
+/// IPv4 if the interface has an IPv4 address, otherwise IPv6 if it has one.
+fn auto_transport(interface: InterfaceName) -> io::Result<PtpTransport> {
+    let ips: Vec<IpAddr> = interfaces()?
+        .get(&interface)
+        .map(|i| i.ips().collect())
+        .unwrap_or_default();
+    if ips.iter().any(IpAddr::is_ipv4) {
+        Ok(PtpTransport::Ipv4)
+    } else if ips.iter().any(IpAddr::is_ipv6) {
+        Ok(PtpTransport::Ipv6)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::AddrNotAvailable,
+            format!("interface {interface} has no IP address"),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_routes() {
+        let v4 = "Iface\tDestination\tGateway\tFlags\n\
+                  wlan0\t0018A8C0\t00000000\t0001\n\
+                  eth0\t00000000\t0118A8C0\t0003\n";
+        assert_eq!(default_route_v4(v4), Some("eth0"));
+        assert_eq!(default_route_v4("Iface\tDestination\n"), None);
+        let zero = "00000000000000000000000000000000";
+        let v6 = format!(
+            "{zero} 00 {zero} 00 {zero} ffffffff 00000001 00000000 00200200 lo\n\
+             fd000000000000000000000000000000 40 {zero} 00 {zero} 00000100 00000001 00000000 00000001 eth0\n\
+             {zero} 00 {zero} 00 fe800000000000000000000000000001 00000400 00000001 00000000 00450003 eth0\n"
+        );
+        assert_eq!(default_route_v6(&v6), Some("eth0"));
+    }
+
+    #[test]
+    fn transport_groups() {
+        assert_eq!(
+            SocketAddrV4::group(false, EVENT_PORT).to_string(),
+            "224.0.1.129:319"
+        );
+        assert_eq!(
+            SocketAddrV6::group(false, EVENT_PORT).to_string(),
+            "[ff0e::181]:319"
+        );
+        assert_eq!(
+            SocketAddrV6::group(true, GENERAL_PORT).to_string(),
+            "[ff02::6b]:320"
+        );
+    }
 
     #[test]
     fn identity_format() {
@@ -702,6 +866,7 @@ mod tests {
             clock: Mutex::new(OverlayClock::new(Base(Timescale::tai()))),
             status: Mutex::new(PtpStatus {
                 interface: "lo".into(),
+                transport: PtpTransport::Ipv4,
                 identity: String::new(),
                 state: PtpState::Listening,
                 grandmaster: String::new(),

@@ -21,7 +21,8 @@ enum Command {
     /// Send the node's audio to a peer: creates a sink "Orpheus → <name>"
     /// whose audio is streamed to the peer.
     Connect {
-        /// Peer address: host or IP, optionally with :port (default 5004).
+        /// Peer: host name or address, optionally with :port (default 5004);
+        /// IPv6 with a port as [addr]:port.
         peer: String,
         /// Name shown in the sink; defaults to the peer address.
         #[arg(long)]
@@ -58,9 +59,16 @@ struct ClockInfo {
     ptp: Option<Ptp>,
 }
 
+fn ipv4() -> String {
+    "ipv4".into()
+}
+
 #[derive(Deserialize)]
 struct Ptp {
     interface: String,
+    /// Missing from older nodes, which only spoke IPv4.
+    #[serde(default = "ipv4")]
+    transport: String,
     identity: String,
     state: String,
     grandmaster: String,
@@ -144,8 +152,9 @@ fn main() -> Result<()> {
                         format!("grandmaster {}", p.grandmaster)
                     };
                     println!(
-                        "clock: PTP on {} ({}), {}, {}, offset {}, delay {}, {:+.2} ppm, {} steps, {}",
+                        "clock: PTP on {}/{} ({}), {}, {}, offset {}, delay {}, {:+.2} ppm, {} steps, {}",
                         p.interface,
+                        p.transport,
                         p.identity,
                         p.state,
                         role,

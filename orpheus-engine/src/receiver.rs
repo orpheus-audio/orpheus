@@ -9,10 +9,11 @@
 //! packetization, network delay and the error between the nodes' clocks.
 //!
 //! The receiver follows one stream (SSRC) at a time and switches to another
-//! once the current one has been quiet for [`SWITCH_AFTER_MS`].
+//! once the current one has been quiet for [`SWITCH_AFTER_MS`]. Listening on
+//! `[::]`, it takes streams over IPv4 and IPv6.
 
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
 use std::thread::{self, JoinHandle};
@@ -23,6 +24,7 @@ use orpheus_core::AudioFormat;
 use orpheus_core::jitter::{Insert, JitterBuffer};
 use orpheus_core::rtp::{self, Encoding, SequenceStats};
 use orpheus_core::timebase::{MediaClock, extend};
+use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::asrc::{Asrc, Fixed};
 use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
@@ -45,6 +47,8 @@ pub struct ReceiverConfig {
     pub description: String,
     pub format: AudioFormat,
     pub encoding: Encoding,
+    /// `[::]:port` listens on IPv4 and IPv6 (only IPv4 where IPv6 is
+    /// disabled).
     pub listen: SocketAddr,
     /// Playout delay after the media-clock time in the RTP timestamp.
     pub link_offset_ms: u32,
@@ -71,7 +75,7 @@ struct Counters {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReceiverStatus {
-    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "0.0.0.0:5004"))]
+    #[cfg_attr(feature = "openapi", schema(value_type = String, example = "[::]:5004"))]
     pub listen: SocketAddr,
     pub link_offset_ms: u32,
     /// The stream being played, if any.
@@ -96,6 +100,21 @@ pub struct ReceiverStatus {
     pub buffer: StatsSnapshot,
 }
 
+/// Binds the receive socket. `[::]` also accepts IPv4 (as IPv4-mapped
+/// addresses); where IPv6 is disabled it falls back to `0.0.0.0`.
+fn bind(listen: SocketAddr) -> io::Result<UdpSocket> {
+    if !(listen.is_ipv6() && listen.ip().is_unspecified()) {
+        return UdpSocket::bind(listen);
+    }
+    let dual = || -> io::Result<UdpSocket> {
+        let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_only_v6(false)?;
+        socket.bind(&listen.into())?;
+        Ok(socket.into())
+    };
+    dual().or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, listen.port())))
+}
+
 pub(crate) struct Receiver {
     listen: SocketAddr,
     link_offset_ms: u32,
@@ -113,7 +132,7 @@ impl Receiver {
         cfg: &ReceiverConfig,
     ) -> Result<Self, BackendError> {
         let format = cfg.format;
-        let socket = UdpSocket::bind(cfg.listen)?;
+        let socket = bind(cfg.listen)?;
         let listen = socket.local_addr()?;
         let (capture, playback, buffer) =
             port_pair(format.channels, format.frames_in_ms(BUFFER_MS));
@@ -358,5 +377,30 @@ impl Rx {
         let margin = self.window.min_ns.take().map_or(NO_MARGIN, |m| m / 1000);
         self.counters.margin_us.store(margin, Relaxed);
         self.window.start_ns = now;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unspecified_ipv6_also_receives_ipv4() {
+        let socket = bind("[::]:0".parse().unwrap()).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let mut targets = vec![SocketAddr::from((Ipv4Addr::LOCALHOST, port))];
+        // Without IPv6 the socket fell back to IPv4.
+        if socket.local_addr().unwrap().is_ipv6() {
+            targets.push(SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)));
+        }
+        for to in targets {
+            let from = UdpSocket::bind(SocketAddr::new(to.ip(), 0)).unwrap();
+            from.send_to(b"rtp", to).unwrap();
+            let mut buf = [0; 8];
+            assert_eq!(socket.recv(&mut buf).unwrap(), 3, "via {to}");
+        }
     }
 }

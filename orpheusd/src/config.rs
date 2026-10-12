@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use orpheus_clock::ptp::PtpTransport;
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -23,14 +24,15 @@ pub struct Config {
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ApiConfig {
-    /// Address the HTTP API (NMOS + /x-orpheus) listens on.
+    /// Address the HTTP API (NMOS + /x-orpheus) listens on. `[::]` means
+    /// all addresses, IPv4 and IPv6.
     pub listen: SocketAddr,
 }
 
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
-            listen: SocketAddr::from(([0, 0, 0, 0], 7480)),
+            listen: SocketAddr::from(([0u16; 8], 7480)),
         }
     }
 }
@@ -51,7 +53,7 @@ pub const RTP_PORT: u16 = 5004;
 #[serde(default, deny_unknown_fields)]
 pub struct ReceiverConfig {
     pub enabled: bool,
-    /// UDP port to receive RTP on.
+    /// UDP port to receive RTP on, over IPv4 and IPv6.
     pub port: u16,
     /// Playout delay after the sender's timestamp. Covers network delay and
     /// the clock error between the nodes.
@@ -80,6 +82,9 @@ pub struct PtpConfig {
     pub enabled: bool,
     /// Network interface; the one with the default route if unset.
     pub interface: Option<String>,
+    /// `ipv4`, `ipv6`, or `auto`: IPv4 if the interface has an IPv4
+    /// address. AES67 and Dante devices only speak PTP over IPv4.
+    pub transport: PtpTransport,
     pub domain: u8,
     /// Grandmaster election: lower wins. Nodes default to 250 so that
     /// dedicated grandmasters (usually 128 or less) take precedence.
@@ -100,6 +105,7 @@ impl Default for PtpConfig {
         Self {
             enabled: true,
             interface: d.interface,
+            transport: d.transport,
             domain: d.domain,
             priority1: d.priority1,
             priority2: d.priority2,
@@ -189,6 +195,9 @@ mod tests {
         assert_eq!(c.ptp.interface.as_deref(), Some("enp3s0"));
         assert_eq!(c.ptp.domain, 1);
         assert_eq!(c.ptp.step_threshold_us, 1000);
+        assert_eq!(c.ptp.transport, PtpTransport::Auto);
+        let c: Config = toml::from_str("[ptp]\ntransport = \"ipv6\"").unwrap();
+        assert_eq!(c.ptp.transport, PtpTransport::Ipv6);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
 use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
 use orpheus_pipewire::PipeWireBackend;
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing_subscriber::EnvFilter;
 
@@ -52,10 +53,9 @@ async fn main() -> Result<()> {
         quantum: config.audio.quantum,
     });
 
-    let listener = tokio::net::TcpListener::bind(config.api.listen)
-        .await
+    let listener = listen_tcp(config.api.listen)
         .with_context(|| format!("binding API to {}", config.api.listen))?;
-    tracing::info!(addr = %config.api.listen, "API listening");
+    tracing::info!(addr = %listener.local_addr()?, "API listening");
 
     axum::serve(listener, api::router(node.clone()))
         .with_graceful_shutdown(shutdown())
@@ -63,6 +63,30 @@ async fn main() -> Result<()> {
     drop(node);
     tracing::info!("stopped");
     Ok(())
+}
+
+/// Binds a TCP listener. `[::]` also accepts IPv4; where IPv6 is disabled
+/// it falls back to `0.0.0.0`.
+fn listen_tcp(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let open = |addr: SocketAddr| -> std::io::Result<std::net::TcpListener> {
+        let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))?;
+        if addr.is_ipv6() {
+            socket.set_only_v6(false)?;
+        }
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        Ok(socket.into())
+    };
+    let listener = open(addr).or_else(|e| {
+        if addr.is_ipv6() && addr.ip().is_unspecified() {
+            open(SocketAddr::from(([0, 0, 0, 0], addr.port())))
+        } else {
+            Err(e)
+        }
+    })?;
+    tokio::net::TcpListener::from_std(listener)
 }
 
 /// The time base, normally TAI from the system clock. For testing on one
@@ -92,6 +116,7 @@ fn start_clock(config: &Config) -> (Arc<dyn Clock>, Option<Arc<PtpClock>>) {
     if p.enabled {
         let cfg = PtpConfig {
             interface: p.interface.clone(),
+            transport: p.transport,
             domain: p.domain,
             priority1: p.priority1,
             priority2: p.priority2,
@@ -134,7 +159,7 @@ fn start_engine(
     }
     let rx = &config.receiver;
     if rx.enabled {
-        let listen = SocketAddr::from(([0, 0, 0, 0], rx.port));
+        let listen = SocketAddr::from(([0u16; 8], rx.port));
         engine
             .start_receiver(&ReceiverConfig {
                 name: "orpheus.receive".into(),

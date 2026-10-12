@@ -13,6 +13,7 @@ orpheus-engine = { path = "../orpheus-engine", features = ["openapi"] }
 orpheus-clock = { path = "../orpheus-clock", features = ["openapi"] }
 orpheus-pipewire = { path = "../orpheus-pipewire" }
 serde.workspace = true
+socket2 = "0.6"
 anyhow = "1"
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal"] }

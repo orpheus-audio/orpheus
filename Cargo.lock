@@ -957,6 +957,7 @@ dependencies = [
  "rtrb",
  "rubato",
  "serde",
+ "socket2",
  "utoipa",
 ]
 
@@ -996,6 +997,7 @@ dependencies = [
  "orpheus-engine",
  "orpheus-pipewire",
  "serde",
+ "socket2",
  "tempfile",
  "tokio",
  "toml",
