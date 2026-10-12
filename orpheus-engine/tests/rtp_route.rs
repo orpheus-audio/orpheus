@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use orpheus_clock::SystemClock;
+use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
 use orpheus_engine::*;
@@ -36,13 +36,19 @@ impl AudioBackend for FakeBackend {
     }
 }
 
-#[test]
-fn audio_arrives_intact_and_on_time() {
-    const QUANTUM: usize = 240; // 5 ms
-    const LINK_OFFSET_MS: u32 = 5;
+const QUANTUM: usize = 240; // 5 ms
+const LINK_OFFSET_MS: u32 = 5;
+const FULL: f32 = (1 << 23) as f32;
+
+/// Builds a sender → receiver route on `clock` and plays a ramp through it
+/// for `cycles` audio cycles. The fake sound card runs on `Instant`. Each
+/// sample is its frame number, which L24 carries exactly and the resamplers
+/// (at a ratio of almost exactly 1) to within a fraction of a frame. Returns
+/// the played samples (left channel).
+fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
     let format = AudioFormat::AES67;
     let fake = FakeBackend::default();
-    let mut engine = Engine::new(Box::new(fake.clone()), Arc::new(SystemClock));
+    let mut engine = Engine::new(Box::new(fake.clone()), clock);
     engine
         .start_receiver(&ReceiverConfig {
             name: "rx".into(),
@@ -69,38 +75,44 @@ fn audio_arrives_intact_and_on_time() {
     let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
     let mut playback = fake.playbacks.lock().unwrap().pop().unwrap();
 
-    // Play a ramp into the sink and record the playback side, one cycle at a
-    // time like the audio system would. Each sample is its frame number,
-    // which L24 carries exactly.
-    let full = (1 << 23) as f32;
-    let cycles = 300;
     let mut out = vec![0.0f32; QUANTUM * 2];
     let mut played = Vec::new();
     let start = Instant::now();
     for cycle in 0..cycles {
         let input: Vec<f32> = (0..QUANTUM)
-            .flat_map(|i| [(cycle * QUANTUM + i + 1) as f32 / full; 2])
+            .flat_map(|i| [(cycle * QUANTUM + i + 1) as f32 / FULL; 2])
             .collect();
         sink.push(&input);
         playback.fill(&mut out);
-        played.extend(out.iter().step_by(2).map(|s| (s * full) as i64));
+        played.extend(out.iter().step_by(2).map(|s| (s * FULL) as f64));
         let due = start + Duration::from_millis(5 * (cycle as u64 + 1));
         thread::sleep(due.saturating_duration_since(Instant::now()));
     }
+    (engine, played)
+}
+
+/// Latency in frames of the audio at `at`, from the ramp value there.
+fn latency_at(played: &[f64], at: usize) -> f64 {
+    at as f64 - (played[at] - 1.0)
+}
+
+#[test]
+fn audio_arrives_intact_and_on_time() {
+    let (engine, played) = play_ramp(Arc::new(SystemClock::new()), 300);
 
     let first = played
         .iter()
-        .position(|&s| s != 0)
+        .position(|&s| s.abs() > 0.5)
         .expect("nothing arrived");
     let tail = &played[played.len() - 4800..];
     assert!(
-        tail.windows(2).all(|w| w[1] == w[0] + 1),
+        tail.windows(2).all(|w| (w[1] - w[0] - 1.0).abs() < 0.1),
         "last 100 ms not continuous"
     );
     // Latency = sender buffer (~1 cycle) + link offset + receiver buffer
-    // (~1 cycle + 4 ms); allow for scheduling.
-    let latency = (played.len() - tail.len()) as i64 - (tail[0] - 1);
-    let ms = latency as f64 / 48.0;
+    // (~1 cycle + 4 ms) + two resamplers (~0.7 ms each); allow for
+    // scheduling.
+    let ms = latency_at(&played, played.len() - tail.len()) / 48.0;
     assert!((10.0..40.0).contains(&ms), "latency {ms} ms");
     assert!(first > 0);
 
@@ -111,4 +123,39 @@ fn audio_arrives_intact_and_on_time() {
     assert!(rx.packets > 1000);
     assert_eq!(status.senders[0].1.send_errors, 0);
     eprintln!("latency {ms:.1} ms, {rx:?}");
+}
+
+/// The media clock runs 500 ppm fast against the sound card. Without ASRC
+/// the sender's buffer would run dry about every 20 s and the receiver's
+/// overflow; with it the latency holds. Takes two minutes.
+#[test]
+#[ignore]
+fn drift_is_absorbed() {
+    let skew = 500.0;
+    let clock = SystemClock::with_timescale(Timescale::tai().skewed(skew, 0));
+    let cycles = 24_000; // 120 s
+    let (engine, played) = play_ramp(Arc::new(clock), cycles);
+
+    let status = engine.status();
+    let rx = status.receiver.unwrap();
+    let tx = status.senders[0].1;
+    eprintln!("tx {tx:?}\nrx {rx:?}");
+    // Both sides converge on the skew: the sender takes less from its port
+    // than 1 ms per packet, the receiver puts more into its port.
+    assert!((tx.asrc_ppm + skew).abs() < 50.0, "tx {}", tx.asrc_ppm);
+    assert!((rx.asrc_ppm - skew).abs() < 50.0, "rx {}", rx.asrc_ppm);
+    // No buffer had to re-prime or drop audio after the start.
+    for buffer in [tx.buffer, rx.buffer] {
+        assert_eq!(buffer.underruns, 0, "{buffer:?}");
+        assert_eq!(buffer.resyncs, 0, "{buffer:?}");
+    }
+    // The latency 10 s in equals the latency at the end, within a few
+    // frames (it would have grown by 60 ms without ASRC).
+    let early = latency_at(&played, 48_000 * 10);
+    let late = latency_at(&played, played.len() - 1);
+    assert!(
+        (early - late).abs() < 48.0,
+        "latency {early} → {late} frames"
+    );
+    eprintln!("latency {early} → {late} frames");
 }

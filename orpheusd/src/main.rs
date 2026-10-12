@@ -8,7 +8,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
-use orpheus_clock::SystemClock;
+use orpheus_clock::ptp::{PtpClock, PtpConfig};
+use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
 use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
@@ -35,8 +36,9 @@ async fn main() -> Result<()> {
     let name = config.name();
     tracing::info!(%id, %name, home = %home.root().display(), "starting");
 
+    let (clock, ptp) = start_clock(&config);
     let engine = match PipeWireBackend::connect() {
-        Ok(backend) => Some(start_engine(backend, &config)?),
+        Ok(backend) => Some(start_engine(backend, clock, &config)?),
         Err(e) => {
             tracing::warn!(error = %e, "no audio system; running without audio");
             None
@@ -46,6 +48,7 @@ async fn main() -> Result<()> {
         id,
         name,
         engine: engine.map(Mutex::new),
+        ptp,
         quantum: config.audio.quantum,
     });
 
@@ -62,9 +65,59 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The time base, normally TAI from the system clock. For testing on one
+/// host, `ORPHEUS_DEBUG_CLOCK_SKEW_PPM` and `ORPHEUS_DEBUG_CLOCK_OFFSET_MS`
+/// make it run fast and off, as if it were another machine.
+fn timescale() -> Timescale {
+    let var = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
+    let skew = var("ORPHEUS_DEBUG_CLOCK_SKEW_PPM");
+    let offset_ms = var("ORPHEUS_DEBUG_CLOCK_OFFSET_MS");
+    let scale = Timescale::tai();
+    if skew == 0.0 && offset_ms == 0.0 {
+        return scale;
+    }
+    tracing::warn!(skew_ppm = skew, offset_ms, "debug: skewed clock");
+    scale.skewed(skew, (offset_ms * 1e6) as i64)
+}
+
+/// Starts PTP if enabled, falling back to the system clock.
+fn start_clock(config: &Config) -> (Arc<dyn Clock>, Option<Arc<PtpClock>>) {
+    let scale = timescale();
+    let p = &config.ptp;
+    if p.enabled {
+        let cfg = PtpConfig {
+            interface: p.interface.clone(),
+            domain: p.domain,
+            priority1: p.priority1,
+            priority2: p.priority2,
+            slave_only: p.slave_only,
+            step_threshold_us: p.step_threshold_us,
+            settle_threshold_us: p.settle_threshold_us,
+            timescale: scale,
+        };
+        match PtpClock::start(cfg) {
+            Ok(ptp) => {
+                let ptp = Arc::new(ptp);
+                return (ptp.clone(), Some(ptp));
+            }
+            Err(e) => tracing::warn!(error = %e, "PTP unavailable; using the system clock"),
+        }
+    }
+    (Arc::new(SystemClock::with_timescale(scale)), None)
+}
+
 /// Starts the routes the config asks for.
-fn start_engine(backend: PipeWireBackend, config: &Config) -> Result<Engine> {
-    let mut engine = Engine::new(Box::new(backend), Arc::new(SystemClock));
+fn start_engine(
+    backend: PipeWireBackend,
+    clock: Arc<dyn Clock>,
+    config: &Config,
+) -> Result<Engine> {
+    let mut engine = Engine::new(Box::new(backend), clock);
     if config.loopback.enabled {
         engine
             .start_loopback(&LoopbackConfig {

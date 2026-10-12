@@ -4,6 +4,7 @@
 //! network. Realtime threads and the engine only share lock-free
 //! [ports](port).
 
+mod asrc;
 pub mod backend;
 pub mod engine;
 mod grid;

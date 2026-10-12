@@ -11,6 +11,7 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
+use orpheus_clock::ptp::{PtpClock, PtpStatus};
 use orpheus_core::rtp::Encoding;
 use orpheus_core::{AudioFormat, DeviceId};
 use orpheus_engine::{Engine, ReceiverStatus, SenderConfig, SenderId, SenderStatus, StatsSnapshot};
@@ -26,6 +27,8 @@ pub struct Node {
     pub name: String,
     /// `None` if the audio system was not reachable.
     pub engine: Option<Mutex<Engine>>,
+    /// `None` if the node runs on the system clock.
+    pub ptp: Option<Arc<PtpClock>>,
     pub quantum: Option<u32>,
 }
 
@@ -58,11 +61,30 @@ struct Status {
     /// Whether the node reached its audio system; without it there are no
     /// streams.
     audio: bool,
+    clock: ClockInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     loopback: Option<StatsSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     receiver: Option<ReceiverStatus>,
     senders: Vec<SenderEntry>,
+}
+
+/// Where the media clock comes from.
+#[derive(Serialize, ToSchema)]
+struct ClockInfo {
+    source: ClockSource,
+    /// Present when the source is PTP.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ptp: Option<PtpStatus>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+enum ClockSource {
+    /// Synchronized with the other nodes over PTP.
+    Ptp,
+    /// The system clock, kept in step by NTP at best.
+    System,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -127,6 +149,16 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
         name: node.name.clone(),
         version: env!("CARGO_PKG_VERSION"),
         audio: node.engine.is_some(),
+        clock: match &node.ptp {
+            Some(ptp) => ClockInfo {
+                source: ClockSource::Ptp,
+                ptp: Some(ptp.status()),
+            },
+            None => ClockInfo {
+                source: ClockSource::System,
+                ptp: None,
+            },
+        },
         loopback: engine.loopback,
         receiver: engine.receiver,
         senders: engine

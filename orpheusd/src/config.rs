@@ -16,6 +16,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub audio: AudioConfig,
     pub receiver: ReceiverConfig,
+    pub ptp: PtpConfig,
     pub loopback: LoopbackConfig,
 }
 
@@ -53,7 +54,7 @@ pub struct ReceiverConfig {
     /// UDP port to receive RTP on.
     pub port: u16,
     /// Playout delay after the sender's timestamp. Covers network delay and
-    /// the clock error between the nodes (NTP until PTP is in place).
+    /// the clock error between the nodes.
     pub link_offset_ms: u32,
     /// `node.name` of the output to play on; default output if unset.
     pub target: Option<String>,
@@ -66,6 +67,45 @@ impl Default for ReceiverConfig {
             port: RTP_PORT,
             link_offset_ms: 10,
             target: None,
+        }
+    }
+}
+
+/// Clock synchronization with the other nodes (and AES67 devices). Without
+/// it, or if it can't start, the node falls back to the system clock and
+/// relies on NTP.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PtpConfig {
+    pub enabled: bool,
+    /// Network interface; the one with the default route if unset.
+    pub interface: Option<String>,
+    pub domain: u8,
+    /// Grandmaster election: lower wins. Nodes default to 250 so that
+    /// dedicated grandmasters (usually 128 or less) take precedence.
+    pub priority1: u8,
+    pub priority2: u8,
+    /// Never become grandmaster.
+    pub slave_only: bool,
+    /// Clock offsets above this are stepped (cold start), smaller ones
+    /// slewed.
+    pub step_threshold_us: u32,
+    /// Offset from the grandmaster under which the clock counts as settled.
+    pub settle_threshold_us: u32,
+}
+
+impl Default for PtpConfig {
+    fn default() -> Self {
+        let d = orpheus_clock::ptp::PtpConfig::default();
+        Self {
+            enabled: true,
+            interface: d.interface,
+            domain: d.domain,
+            priority1: d.priority1,
+            priority2: d.priority2,
+            slave_only: d.slave_only,
+            step_threshold_us: d.step_threshold_us,
+            settle_threshold_us: d.settle_threshold_us,
         }
     }
 }
@@ -138,6 +178,17 @@ mod tests {
         assert!(c.loopback.enabled);
         assert_eq!(c.loopback.latency_ms, 20);
         assert!(!Config::default().loopback.enabled);
+    }
+
+    #[test]
+    fn ptp_section() {
+        let c = Config::default();
+        assert!(c.ptp.enabled);
+        assert_eq!(c.ptp.priority1, 250);
+        let c: Config = toml::from_str("[ptp]\ninterface = \"enp3s0\"\ndomain = 1").unwrap();
+        assert_eq!(c.ptp.interface.as_deref(), Some("enp3s0"));
+        assert_eq!(c.ptp.domain, 1);
+        assert_eq!(c.ptp.step_threshold_us, 1000);
     }
 
     #[test]

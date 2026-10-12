@@ -5,8 +5,9 @@
 //! the media-clock grid and stamps each packet with the media-clock time of
 //! its first frame. The port's target covers one audio-system cycle, since
 //! the sink delivers a whole cycle at once while the TX thread takes 1 ms.
-//! Until there is ASRC, drift between the sound card and the media clock is
-//! absorbed by the port dropping or re-priming audio (see its stats).
+//! The TX thread resamples from the sound card's clock to the media clock
+//! ([`asrc`](crate::asrc)), taking a little more or less than 1 ms from the
+//! port so that its level stays put.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use orpheus_core::AudioFormat;
 use orpheus_core::rtp::{Encoding, HEADER_LEN, Header};
 use orpheus_core::timebase::MediaClock;
 
+use crate::asrc::{Asrc, Fixed};
 use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
 use crate::grid::{Grid, Tick};
 use crate::port::{PlaybackPort, PortStats, StatsSnapshot, port_pair};
@@ -49,11 +51,13 @@ struct Counters {
     packets: AtomicU64,
     send_errors: AtomicU64,
     realigns: AtomicU64,
+    /// `f64` bits.
+    asrc_ppm: AtomicU64,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SenderStatus {
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "192.168.1.20:5004"))]
     pub peer: SocketAddr,
@@ -61,6 +65,8 @@ pub struct SenderStatus {
     pub send_errors: u64,
     /// The TX thread was stalled or the clock jumped.
     pub realigns: u64,
+    /// Rate correction from the sound card's clock to the media clock.
+    pub asrc_ppm: f64,
     /// The buffer between the sink and the TX thread.
     pub buffer: StatsSnapshot,
 }
@@ -90,6 +96,13 @@ impl Sender {
             SocketAddr::V6(_) => ([0u16; 8], 0).into(),
         };
         let socket = UdpSocket::bind(bind)?;
+        let asrc = Asrc::new(
+            format.rate,
+            format.channels as usize,
+            format.frames_in_ms(1),
+            Fixed::Output,
+            0.001,
+        );
         let sink = backend.create_sink(
             &StreamSpec {
                 name: cfg.name.clone(),
@@ -98,7 +111,7 @@ impl Sender {
                 target: None,
                 group: None,
                 quantum: cfg.quantum,
-                process_latency: target as u32,
+                process_latency: (target + asrc.delay()) as u32,
             },
             capture,
         )?;
@@ -113,6 +126,8 @@ impl Sender {
                 clock,
                 format,
                 encoding: cfg.encoding,
+                asrc,
+                buffer: buffer.clone(),
                 counters: counters.clone(),
             };
             let stop = stop.clone();
@@ -134,6 +149,7 @@ impl Sender {
             packets: self.counters.packets.load(Relaxed),
             send_errors: self.counters.send_errors.load(Relaxed),
             realigns: self.counters.realigns.load(Relaxed),
+            asrc_ppm: f64::from_bits(self.counters.asrc_ppm.load(Relaxed)),
             buffer: self.buffer.snapshot(),
         }
     }
@@ -155,13 +171,17 @@ struct Tx {
     clock: Arc<dyn Clock>,
     format: AudioFormat,
     encoding: Encoding,
+    asrc: Asrc,
+    buffer: Arc<PortStats>,
     counters: Arc<Counters>,
 }
 
 impl Tx {
     fn run(mut self, stop: &AtomicBool) {
         let ptime = self.format.frames_in_ms(1);
-        let mut samples = vec![0.0f32; ptime * self.format.channels as usize];
+        let ch = self.format.channels as usize;
+        let mut input = vec![0.0f32; self.asrc.input_frames_max() * ch];
+        let mut samples = vec![0.0f32; ptime * ch];
         let mut packet = vec![0u8; HEADER_LEN + samples.len() * self.encoding.bytes_per_sample()];
         let mut header = Header {
             marker: true,
@@ -182,12 +202,23 @@ impl Tx {
                 }
                 Tick::Realigned => {
                     self.counters.realigns.fetch_add(1, Relaxed);
+                    self.asrc.restart();
                     header.marker = true;
                     continue;
                 }
                 Tick::Due => {}
             }
-            self.port.fill(&mut samples);
+            let need = self.asrc.input_frames_next() * ch;
+            self.port.fill(&mut input[..need]);
+            self.asrc.process(&input[..need], &mut samples);
+            self.asrc.control(
+                self.port.level(),
+                self.buffer.generation(),
+                self.buffer.playing(),
+            );
+            self.counters
+                .asrc_ppm
+                .store(self.asrc.correction_ppm().to_bits(), Relaxed);
             header.timestamp = grid.next() as u32;
             header.write((&mut packet[..HEADER_LEN]).try_into().unwrap());
             self.encoding.encode(&samples, &mut packet[HEADER_LEN..]);

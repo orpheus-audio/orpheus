@@ -15,7 +15,7 @@
 //! when the producer runs ahead.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -26,6 +26,10 @@ pub struct PortStats {
     overruns: AtomicU64,
     resyncs: AtomicU64,
     level_frames: AtomicU64,
+    /// Counts the times the latency was set anew: the playback side started
+    /// playing or dropped audio.
+    generation: AtomicU64,
+    playing: AtomicBool,
 }
 
 /// A point-in-time copy of [`PortStats`].
@@ -51,6 +55,17 @@ impl PortStats {
             resyncs: self.resyncs.load(Relaxed),
             level_frames: self.level_frames.load(Relaxed),
         }
+    }
+
+    /// Changes whenever the latency is set anew: the playback side started
+    /// playing again or dropped audio to get back to its target.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Relaxed)
+    }
+
+    /// The playback side is playing, not waiting for audio.
+    pub fn playing(&self) -> bool {
+        self.playing.load(Relaxed)
     }
 }
 
@@ -97,6 +112,11 @@ impl CapturePort {
         self.channels
     }
 
+    /// Frames currently buffered.
+    pub fn level(&self) -> usize {
+        (self.producer.buffer().capacity() - self.producer.slots()) / self.channels
+    }
+
     /// Appends interleaved samples. A trailing partial frame is ignored; if
     /// the ring is full, the samples that do not fit are dropped and counted
     /// as an overrun.
@@ -129,6 +149,11 @@ impl PlaybackPort {
         self.channels
     }
 
+    /// Frames currently buffered.
+    pub fn level(&self) -> usize {
+        self.consumer.slots() / self.channels
+    }
+
     /// Fills `out` with interleaved samples, writing silence where no audio
     /// is available.
     pub fn fill(&mut self, out: &mut [f32]) {
@@ -147,6 +172,8 @@ impl PlaybackPort {
                 return;
             }
             self.priming = false;
+            self.stats.generation.fetch_add(1, Relaxed);
+            self.stats.playing.store(true, Relaxed);
             avail -= self.skip(avail - need);
         }
 
@@ -156,6 +183,7 @@ impl PlaybackPort {
         if avail > self.target + want + slack {
             avail -= self.skip(avail - self.target - want);
             self.stats.resyncs.fetch_add(1, Relaxed);
+            self.stats.generation.fetch_add(1, Relaxed);
         }
 
         let n = want.min(avail);
@@ -170,6 +198,7 @@ impl PlaybackPort {
         out[n..].fill(0.0);
         if n < want {
             self.stats.underruns.fetch_add(1, Relaxed);
+            self.stats.playing.store(false, Relaxed);
             self.priming = true;
         }
     }
@@ -206,7 +235,10 @@ mod tests {
         play.fill(&mut out);
         assert_eq!(out, [0.0, 1.0, 2.0, 3.0]);
         assert_eq!(stats.snapshot().underruns, 0);
-        assert_eq!(play.consumer.slots(), 8, "target stays buffered");
+        assert_eq!(play.level(), 4, "target stays buffered");
+        assert_eq!(cap.level(), 4);
+        assert_eq!(stats.generation(), 1);
+        assert!(stats.playing());
     }
 
     #[test]
@@ -237,6 +269,7 @@ mod tests {
         play.fill(&mut out);
         assert_eq!(out, [5.0, 6.0, 7.0, 0.0]);
         assert_eq!(stats.snapshot().underruns, 1);
+        assert!(!stats.playing());
 
         // Below target + one read, so we stay silent.
         cap.push(&[8.0]);
@@ -268,6 +301,7 @@ mod tests {
         // play 2 of them.
         assert_eq!(out, [10.0, 11.0]);
         assert_eq!(stats.snapshot().resyncs, 1);
+        assert_eq!(stats.generation(), 2, "a resync sets the latency anew");
     }
 
     #[test]

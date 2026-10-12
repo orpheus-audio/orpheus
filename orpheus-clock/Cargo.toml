@@ -4,7 +4,21 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Media clocks (system clock, later PTP) for Orpheus"
+description = "Media clocks (system clock, PTP) for Orpheus"
 publish = false
 
 [dependencies]
+libc = "0.2"
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+serde = { workspace = true, optional = true }
+statime = { version = "0.4", default-features = false, features = ["std"] }
+timestamped-socket = { version = "0.3", default-features = false }
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
+tracing = "0.1"
+utoipa = { version = "6", optional = true }
+
+[features]
+# `Serialize` for the status types.
+serde = ["dep:serde"]
+# OpenAPI schemas for the status types.
+openapi = ["serde", "dep:utoipa"]

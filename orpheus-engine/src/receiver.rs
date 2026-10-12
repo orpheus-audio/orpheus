@@ -2,8 +2,9 @@
 //!
 //! An RX thread stores incoming packets in a jitter buffer and, on the
 //! media-clock grid, takes out the audio stamped `link_offset` earlier than
-//! the current media-clock time. That audio goes through a port to a
-//! playback stream. Every node shares the media clock, so audio from one
+//! the current media-clock time. That audio is resampled from the media
+//! clock to the sound card's clock ([`asrc`](crate::asrc)) and goes through
+//! a port to a playback stream. Every node shares the media clock, so audio from one
 //! sender plays at the same time everywhere; the link offset must cover
 //! packetization, network delay and the error between the nodes' clocks.
 //!
@@ -23,6 +24,7 @@ use orpheus_core::jitter::{Insert, JitterBuffer};
 use orpheus_core::rtp::{self, Encoding, SequenceStats};
 use orpheus_core::timebase::{MediaClock, extend};
 
+use crate::asrc::{Asrc, Fixed};
 use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
 use crate::grid::{Grid, Tick};
 use crate::port::{CapturePort, PortStats, StatsSnapshot, port_pair};
@@ -61,11 +63,13 @@ struct Counters {
     realigns: AtomicU64,
     ssrc: AtomicU64,
     margin_us: AtomicI64,
+    /// `f64` bits.
+    asrc_ppm: AtomicU64,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ReceiverStatus {
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "0.0.0.0:5004"))]
     pub listen: SocketAddr,
@@ -86,6 +90,8 @@ pub struct ReceiverStatus {
     /// Smallest time between arrival and playout over the last second, in
     /// microseconds. Negative means late; it should stay well above zero.
     pub margin_us: Option<i64>,
+    /// Rate correction from the media clock to the sound card's clock.
+    pub asrc_ppm: f64,
     /// The buffer between the RX thread and the playback stream.
     pub buffer: StatsSnapshot,
 }
@@ -133,6 +139,7 @@ impl Receiver {
             realigns: AtomicU64::new(0),
             ssrc: AtomicU64::new(NO_SSRC),
             margin_us: AtomicI64::new(NO_MARGIN),
+            asrc_ppm: AtomicU64::new(0f64.to_bits()),
         });
         let stop = Arc::new(AtomicBool::new(false));
         let offset = format.frames_in_ms(cfg.link_offset_ms) as u64;
@@ -153,6 +160,14 @@ impl Receiver {
             ssrc: None,
             last_heard: 0,
             window: MarginWindow::default(),
+            asrc: Asrc::new(
+                format.rate,
+                format.channels as usize,
+                format.frames_in_ms(1),
+                Fixed::Input,
+                0.001,
+            ),
+            buffer: buffer.clone(),
             counters: counters.clone(),
         };
         let thread = thread::Builder::new().name("orpheus-rx".into()).spawn({
@@ -185,6 +200,7 @@ impl Receiver {
             lost: c.lost.load(Relaxed),
             realigns: c.realigns.load(Relaxed),
             margin_us: (margin != NO_MARGIN).then_some(margin),
+            asrc_ppm: f64::from_bits(c.asrc_ppm.load(Relaxed)),
             buffer: self.buffer.snapshot(),
         }
     }
@@ -220,13 +236,17 @@ struct Rx {
     ssrc: Option<u32>,
     last_heard: u64,
     window: MarginWindow,
+    asrc: Asrc,
+    buffer: Arc<PortStats>,
     counters: Arc<Counters>,
 }
 
 impl Rx {
     fn run(mut self, stop: &AtomicBool) {
         let ptime = self.format.frames_in_ms(1);
-        let mut block = vec![0.0f32; ptime * self.format.channels as usize];
+        let ch = self.format.channels as usize;
+        let mut block = vec![0.0f32; ptime * ch];
+        let mut resampled = vec![0.0f32; self.asrc.output_frames_max() * ch];
         let mut packet = vec![0u8; 65_536];
         let mut samples = vec![0.0f32; packet.len() / self.encoding.bytes_per_sample()];
         let mut grid = Grid::new(self.media, ptime as u64, self.clock.now_ns());
@@ -242,13 +262,23 @@ impl Rx {
                 }
                 Tick::Realigned => {
                     self.counters.realigns.fetch_add(1, Relaxed);
+                    self.asrc.restart();
                     continue;
                 }
                 Tick::Due => {}
             }
             let ts = grid.next().wrapping_sub(self.offset) as u32;
             self.jitter.read(ts, &mut block);
-            self.port.push(&block);
+            let n = self.asrc.process(&block, &mut resampled);
+            self.port.push(&resampled[..n * ch]);
+            self.asrc.control(
+                self.port.level(),
+                self.buffer.generation(),
+                self.buffer.playing(),
+            );
+            self.counters
+                .asrc_ppm
+                .store(self.asrc.correction_ppm().to_bits(), Relaxed);
             grid.advance();
             self.publish_margin(now);
         }

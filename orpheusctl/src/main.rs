@@ -41,6 +41,7 @@ struct Status {
     version: String,
     #[serde(default = "yes")]
     audio: bool,
+    clock: Option<ClockInfo>,
     loopback: Option<Buffer>,
     receiver: Option<Receiver>,
     #[serde(default)]
@@ -49,6 +50,25 @@ struct Status {
 
 fn yes() -> bool {
     true
+}
+
+#[derive(Deserialize)]
+struct ClockInfo {
+    source: String,
+    ptp: Option<Ptp>,
+}
+
+#[derive(Deserialize)]
+struct Ptp {
+    interface: String,
+    identity: String,
+    state: String,
+    grandmaster: String,
+    offset_ns: Option<i64>,
+    mean_delay_ns: Option<i64>,
+    frequency_ppm: f64,
+    steps: u64,
+    settled: bool,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +91,8 @@ struct Receiver {
     lost: u64,
     realigns: u64,
     margin_us: Option<i64>,
+    #[serde(default)]
+    asrc_ppm: f64,
     buffer: Buffer,
 }
 
@@ -81,6 +103,8 @@ struct Sender {
     packets: u64,
     send_errors: u64,
     realigns: u64,
+    #[serde(default)]
+    asrc_ppm: f64,
     buffer: Buffer,
 }
 
@@ -109,6 +133,32 @@ fn main() -> Result<()> {
             if !s.audio {
                 println!("no audio system");
             }
+            match s.clock {
+                Some(ClockInfo { ptp: Some(p), .. }) => {
+                    let us = |ns: Option<i64>| {
+                        ns.map_or("-".into(), |n| format!("{:.1} µs", n as f64 / 1000.0))
+                    };
+                    let role = if p.grandmaster == p.identity {
+                        "grandmaster".to_owned()
+                    } else {
+                        format!("grandmaster {}", p.grandmaster)
+                    };
+                    println!(
+                        "clock: PTP on {} ({}), {}, {}, offset {}, delay {}, {:+.2} ppm, {} steps, {}",
+                        p.interface,
+                        p.identity,
+                        p.state,
+                        role,
+                        us(p.offset_ns),
+                        us(p.mean_delay_ns),
+                        p.frequency_ppm,
+                        p.steps,
+                        if p.settled { "settled" } else { "settling" }
+                    );
+                }
+                Some(c) => println!("clock: {}", c.source),
+                None => {}
+            }
             if let Some(l) = s.loopback {
                 println!("loopback: {}", buffer(&l));
             }
@@ -130,14 +180,22 @@ fn main() -> Result<()> {
                     r.realigns,
                     margin
                 );
-                println!("  playout: {}", buffer(&r.buffer));
+                println!(
+                    "  playout: {}, ASRC {:+.1} ppm",
+                    buffer(&r.buffer),
+                    r.asrc_ppm
+                );
             }
             for t in s.senders {
                 println!(
                     "sender {} → {}: {} packets, {} send errors, {} realigns",
                     t.id, t.peer, t.packets, t.send_errors, t.realigns
                 );
-                println!("  input: {}", buffer(&t.buffer));
+                println!(
+                    "  input: {}, ASRC {:+.1} ppm",
+                    buffer(&t.buffer),
+                    t.asrc_ppm
+                );
             }
         }
         Command::Connect { peer, name } => {

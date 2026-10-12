@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 orpheus-core.workspace = true
 orpheus-engine = { path = "../orpheus-engine", features = ["openapi"] }
-orpheus-clock = { path = "../orpheus-clock" }
+orpheus-clock = { path = "../orpheus-clock", features = ["openapi"] }
 orpheus-pipewire = { path = "../orpheus-pipewire" }
 serde.workspace = true
 anyhow = "1"
