@@ -16,7 +16,11 @@ use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
 use orpheus_pipewire::PipeWireBackend;
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::signal::unix::{SignalKind, signal};
+use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::home::Home;
@@ -27,9 +31,7 @@ async fn main() -> Result<()> {
         println!("{}", api::openapi().to_pretty_json()?);
         return Ok(());
     }
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    init_logging();
 
     let home = Home::from_env()?;
     let config = Config::load(&home.config_path())?;
@@ -70,6 +72,60 @@ async fn main() -> Result<()> {
     drop(node);
     tracing::info!("stopped");
     Ok(())
+}
+
+/// Logs to stderr, `info` and above unless `RUST_LOG` says otherwise. Under
+/// systemd, where stderr goes to the journal, each line starts with its
+/// syslog priority (`<4>` for warnings) instead of a timestamp, so that
+/// `journalctl -p` can filter by level.
+fn init_logging() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
+    let fmt = tracing_subscriber::fmt().with_env_filter(filter);
+    if stderr_is_journal() {
+        fmt.with_ansi(false).event_format(JournalFormat).init();
+    } else {
+        fmt.init();
+    }
+}
+
+/// One line per event: `<priority>target: message field=value …`.
+struct JournalFormat;
+
+impl<S, N> FormatEvent<S, N> for JournalFormat
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        mut w: Writer<'_>,
+        event: &Event<'_>,
+    ) -> std::fmt::Result {
+        let meta = event.metadata();
+        let priority = match *meta.level() {
+            Level::ERROR => 3,
+            Level::WARN => 4,
+            Level::INFO => 6,
+            _ => 7,
+        };
+        write!(w, "<{priority}>{}: ", meta.target())?;
+        ctx.field_format().format_fields(w.by_ref(), event)?;
+        writeln!(w)
+    }
+}
+
+/// Whether stderr is the journal stream systemd announces in `JOURNAL_STREAM`
+/// (`device:inode`). A redirected stderr keeps the variable but not the inode.
+fn stderr_is_journal() -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Some(stream) = std::env::var_os("JOURNAL_STREAM") else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata("/proc/self/fd/2") else {
+        return false;
+    };
+    stream.to_str() == Some(&format!("{}:{}", meta.dev(), meta.ino()))
 }
 
 /// Binds a TCP listener. `[::]` also accepts IPv4; where IPv6 is disabled
