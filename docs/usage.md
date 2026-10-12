@@ -33,53 +33,84 @@ Senders are not saved. They end when `orpheusd` stops.
 ## Reading the status
 
 ```text
-B73AQ0P0  desk  (orpheusd 0.0.1)
-clock: PTP on enp3s0/ipv4 (4cb04a.fffe.50a582), slave, grandmaster 9c6b00.fffe.1a2b3c, offset -0.4 µs, delay 41.2 µs, +12.31 ppm, 1 steps, settled
-receiver [::]:5004 (ssrc 5e1f02aa, link offset 10 ms): 120000 packets, 0 lost, 0 late, 0 early, 0 malformed, 0 realigns, margin 8.71 ms
-  playout: 1140 frames buffered, 0 underruns, 0 overruns, 0 resyncs, ASRC -3.2 ppm
-sender 0 → 192.168.1.20:5004: 120000 packets, 0 send errors, 0 realigns
-  input: 1120 frames buffered, 0 underruns, 0 overruns, 0 resyncs, ASRC +8.9 ppm
+desk  B73AQ0P0  orpheusd 0.0.1
+
+Clock          ● PTP, settled
+  interface    enp3s0 (IPv4)
+  identity     4cb04a.fffe.50a582
+  state        slave
+  grandmaster  9c6b00.fffe.1a2b3c
+  offset       -0.4 µs
+  delay        41.2 µs
+  frequency    +12.31 ppm
+  steps        1
+
+Receiver       ● receiving ssrc 5e1f02aa
+  listen       [::]:5004
+  link offset  10 ms
+  margin       8.71 ms
+  packets      120000
+  buffer       1140 frames
+  ASRC         -3.2 ppm
+  problems     none
+
+Senders
+  ID  PEER               PACKETS       BUFFER      ASRC  PROBLEMS
+  0   192.168.1.20:5004   120000  1120 frames  +8.9 ppm  none
 ```
 
-**Clock line**
+On a terminal the dots are coloured: green is fine, yellow needs attention
+(settling, on the system clock), red is broken. Problem counters, a
+`margin` below 1 ms and more than two `steps` are highlighted too. Colour is
+off when the output is piped or `NO_COLOR` is set.
 
-- `PTP on enp3s0/ipv4`: the interface and transport PTP uses. `clock: system`
-  means PTP is off or could not start; the log says why.
-- `slave` or `master`: following the grandmaster, or being it. `listening`
-  means no other PTP clock has been heard yet. `uncalibrated` means following
-  but not yet synchronized.
+**Clock**
+
+- `PTP, settled` or `PTP, settling`: see [clock](clock.md#ptp).
+  `system clock` means PTP is off or could not start; the log says why.
+- `interface`: the interface and transport PTP uses.
+- `state`: `slave` follows the grandmaster, `master` is it. `listening` means
+  no other PTP clock has been heard yet. `uncalibrated` means following but
+  not yet synchronized.
+- `grandmaster`: the clock everyone follows; `this node` if it is this one.
 - `offset`: estimated difference from the grandmaster. A few µs to tens of µs
   is normal with software timestamps.
 - `delay`: estimated one-way network delay to the grandmaster.
-- `ppm`: how much faster than the system clock the PTP clock runs. This is the
-  crystal difference between the two machines, typically within ±50 ppm.
-- `steps`: how often the clock was stepped. One or two after a start is
+- `frequency`: how much faster than the system clock the PTP clock runs. This
+  is the crystal difference between the two machines, typically within
+  ±50 ppm.
+- `steps`: how often the clock was stepped. One or two after a start are
   normal; more later means the clock is jumping.
-- `settled` or `settling`: see [clock](clock.md#ptp).
 
 **Receiver**
 
-- `ssrc`: the stream being played; `idle` if none.
-- `lost`: packets that never arrived. `late`: arrived after their playout
-  time. Both cause short gaps.
-- `early`: arrived too far ahead to buffer, which usually means the clocks
-  disagree.
-- `malformed`: not RTP, or not the expected format.
+- `receiving ssrc …`: the stream being played; `idle` if none.
 - `margin`: the smallest time between a packet's arrival and its playout over
   the last second. It should stay well above zero. If it gets close to zero,
   raise `link_offset_ms`.
-- `realigns`: the thread stalled or the clock jumped by more than 100 ms.
+- `problems`: the counters that are not zero, all counted since the start:
+  - `lost`: packets that never arrived. `late`: arrived after their playout
+    time. Both cause short gaps.
+  - `early`: arrived too far ahead to buffer, which usually means the clocks
+    disagree.
+  - `malformed`: not RTP, or not the expected format.
+  - `realigns`: the thread stalled or the clock jumped by more than 100 ms.
+  - buffer problems, see below.
 
-**Buffers** (`playout`, `input`, `loopback`)
+**Senders** have the same buffer columns, and `send errors` among their
+problems: packets the operating system could not send, for example because
+there is no route to the peer.
 
-- `frames buffered`: fill level of the ring between PipeWire and the network
-  thread. In both directions it is about one quantum plus a few milliseconds:
+**Buffers** (receiver, senders, loopback)
+
+- `buffer`: fill level of the ring between PipeWire and the network thread.
+  In both directions it is about one quantum plus a few milliseconds:
   PipeWire moves a whole cycle at a time, the network threads 1 ms.
+- `ASRC`: the current rate correction between the media clock and the sound
+  card. It settles near the sound card's crystal error.
 - `underruns`: the ring ran dry, so there was a gap.
 - `overruns`: the ring was full and audio was dropped.
 - `resyncs`: audio was dropped to bring the latency back to target.
-- `ASRC`: the current rate correction between the media clock and the sound
-  card. It settles near the sound card's crystal error.
 
 ## HTTP API
 

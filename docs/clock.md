@@ -39,8 +39,8 @@ the virtual clock:
 - Offsets above `step_threshold_us` (1 ms) are stepped in one go. This
   happens on a cold start.
 - Smaller offsets are slewed: the virtual clock runs slightly fast or slow
-  until it catches up. `orpheusctl status` shows this rate as `ppm` (parts
-  per million; 1 ppm is 1 µs per second, or 3.6 ms per hour).
+  until it catches up. `orpheusctl status` shows this rate as `frequency`
+  in ppm (parts per million; 1 ppm is 1 µs per second, or 3.6 ms per hour).
 
 **Servo.** Two changes to statime's defaults make a cold start fast:
 
@@ -106,7 +106,7 @@ The node uses the system clock (on the TAI timescale) when:
 - the interface has no MAC address (VPN and other tunnel interfaces) or,
   with `transport = "auto"`, no IP address.
 
-`orpheusctl status` then shows `clock: system`, and the log says why. Nodes
+`orpheusctl status` then shows `system clock`, and the log says why. Nodes
 on the system clock stay in sync only as well as NTP keeps their clocks
 together, which on a LAN is typically within a few milliseconds. That must
 fit into the link offset. Raise `link_offset_ms` if receivers report late
@@ -123,7 +123,7 @@ card's clock. A control loop watches the fill level of the buffer between the
 network thread and PipeWire, and nudges the resampling ratio so that the
 level, and with it the latency, stays where it was when the stream started.
 The correction is limited to ±1000 ppm. `orpheusctl status` shows it as
-`ASRC ±x ppm`.
+`ASRC`.
 
 The loop starts with a period of 10 s to acquire the drift quickly and slows
 down to 60 s. While it acquires, the latency may wander by about a

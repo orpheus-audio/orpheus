@@ -185,8 +185,6 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 ### `orpheusctl`
 
-- Clearer output: sections, aligned columns, coloured status symbols (only
-  on a terminal, and never with `NO_COLOR` set).
 - `--json` for scripts and `jq`, so that the human output can change freely.
 - `--watch`: refresh in place, with counters as rates ("3 late/s").
 

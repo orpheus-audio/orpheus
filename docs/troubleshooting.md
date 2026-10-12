@@ -23,7 +23,7 @@ journalctl --user -u orpheusd -p warning  # warnings and errors only
 Fallbacks are logged as warnings with the reason, for example
 `PTP unavailable; using the system clock error=…`.
 
-## `clock: system` instead of PTP
+## `system clock` instead of PTP
 
 The log line `PTP unavailable; using the system clock` gives the reason.
 
@@ -74,10 +74,10 @@ affected.
 
 ## No sound
 
-1. On the receiving node, `orpheusctl status` should show `ssrc …` and a
-   rising packet count. If it stays `idle`:
-   - the sender points to the wrong address or port (`sender … → address`
-     on the sending node);
+1. On the receiving node, `orpheusctl status` should show `receiving ssrc …`
+   and a rising packet count. If it stays `idle`:
+   - the sender points to the wrong address or port (the `PEER` column on
+     the sending node);
    - a firewall blocks UDP 5004;
    - the receiver is disabled, or `[receiver] port` differs.
 2. If packets arrive but count as `late` or `early`, the clocks disagree. See
