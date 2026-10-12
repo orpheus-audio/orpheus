@@ -42,7 +42,7 @@ Linux.
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
 | `orpheusd` | The node daemon: config, home directory, HTTP API. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
-| `orpheus-discovery` | Placeholder for mDNS discovery. |
+| `orpheus-discovery` | Announces the node over mDNS and keeps the list of other nodes. |
 | `orpheus-nmos` | Placeholder for the NMOS APIs. |
 
 ## Audio path
@@ -118,6 +118,7 @@ The TX, RX and PTP threads run at normal priority for now.
 | 319/udp | PTP event messages | multicast, IPv4 or IPv6 |
 | 320/udp | PTP general messages | multicast, IPv4 or IPv6 |
 | 5004/udp | RTP | unicast, IPv4 and IPv6 |
+| 5353/udp | mDNS | multicast, IPv4 and IPv6 |
 | 7480/tcp | HTTP API | IPv4 and IPv6 |
 
 ## Stream format

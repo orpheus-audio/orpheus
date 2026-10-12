@@ -10,7 +10,7 @@
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
-| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | planned |
+| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS done |
 | M5 | Memory and policy: pinned peers, aliases, route restore on reconnect, per-sender gains; mixing policies and ducking; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
@@ -60,7 +60,7 @@ and Bluetooth inputs.
 **Control**
 
 - The HTTP API has no authentication.
-- No discovery: peers are addressed by host name or IP.
+- Nodes are discovered, but peers are still addressed by host name or IP.
 
 ## Future work
 

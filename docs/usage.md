@@ -14,11 +14,13 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 |---|---|
 | `status` | Shows the node's ID, name, version, clock, receiver and senders. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
+| `nodes` | Lists the other nodes the node found on the network, with ID, address and version. Nodes that stopped stay listed as offline. |
 | `connect PEER [--name NAME]` | Sends the node's audio to `PEER`. This creates a sink called `NAME` (the peer if no name is given), marked with a network icon. Whatever is played into the sink goes to the peer's receiver. |
 | `disconnect ID` | Stops a sender and removes its sink. The ID is shown by `connect` and `status`. |
 
 `--json` prints the node's JSON responses instead of text: the status as the
-[HTTP API](#http-api) returns it, and `{"id": 0}` after `connect`. Scripts
+[HTTP API](#http-api) returns it, the node list, and `{"id": 0}` after
+`connect`. Scripts
 should use it, because the text output may change. With `--watch` it prints
 one line per sample:
 
@@ -135,6 +137,7 @@ The API lives under `/x-orpheus/v1`. The NMOS APIs will be added next to it.
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows). |
 | `POST /x-orpheus/v1/senders` | Starts a sender. Body: `{"peer": "192.168.1.20", "name": "Kitchen"}`; `name` is optional. Returns `201` with `{"id": 0}`. |
 | `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender. Returns `204`, or `404` if there is no such sender. |
+| `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows). Returns `503` if mDNS could not start. |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
 
 The same OpenAPI document is printed by `orpheusd --openapi`.
@@ -144,6 +147,20 @@ curl -s localhost:7480/x-orpheus/v1/status | jq .clock
 curl -s -X POST localhost:7480/x-orpheus/v1/senders \
   -H 'content-type: application/json' -d '{"peer": "192.168.1.20"}'
 ```
+
+## Discovery
+
+Every node announces its HTTP API over mDNS as an NMOS node
+(`_nmos-node._tcp`), under its name and as the host
+`orpheus-<id>.local`. Other NMOS nodes show up in `orpheusctl nodes` too,
+without an ID. To see the announcements with Avahi:
+
+```sh
+avahi-browse -rt _nmos-node._tcp
+```
+
+If two nodes have the same name, the second announces itself as
+`Name (2)`; `orpheusctl nodes` still shows the configured name.
 
 The API has no authentication yet. Restrict `[api] listen` to `127.0.0.1` if
 the network is not trusted.

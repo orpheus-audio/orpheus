@@ -39,6 +39,8 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// List the other nodes on the network.
+    Nodes,
     /// Stop a sender started with `connect`.
     Disconnect {
         /// Sender ID, as shown by `status`.
@@ -125,6 +127,17 @@ struct Sender {
     #[serde(default)]
     asrc_ppm: f64,
     buffer: Buffer,
+}
+
+/// Another node, as found over mDNS.
+#[derive(Clone, Deserialize)]
+struct Node {
+    id: Option<String>,
+    name: String,
+    version: Option<String>,
+    #[serde(default)]
+    addresses: Vec<String>,
+    online: bool,
 }
 
 #[derive(Serialize)]
@@ -218,6 +231,20 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::json!({ "id": created.id }));
             } else {
                 println!("sender {} → {peer}", created.id);
+            }
+        }
+        Command::Nodes => {
+            let url = format!("{base}/x-orpheus/v1/nodes");
+            let raw = ureq::get(&url)
+                .call()
+                .and_then(|mut r| r.body_mut().read_to_string())
+                .with_context(|| format!("querying {url}"))?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let nodes: Vec<Node> = serde_json::from_str(&raw)
+                    .with_context(|| format!("reading nodes from {url}"))?;
+                print!("{}", render_nodes(&nodes, Paint::detect()));
             }
         }
         Command::Disconnect { id } => {
@@ -566,19 +593,29 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             ]
         })
         .collect();
-    // Column widths from the plain text; the last column is not padded, so
-    // its colour codes don't matter.
+    let right = [false, false, true, true, true, false];
+    table(o, p, header, right, &rows);
+}
+
+/// A table with a dim header. Widths come from the plain text; the last
+/// column is not padded, so it may carry colour codes.
+fn table<const N: usize>(
+    o: &mut String,
+    p: Paint,
+    header: [&str; N],
+    right: [bool; N],
+    rows: &[[String; N]],
+) {
     let mut width = header.map(str::len);
-    for r in &rows {
+    for r in rows {
         for (w, cell) in width.iter_mut().zip(r) {
             *w = (*w).max(cell.chars().count());
         }
     }
-    let right = [false, false, true, true, true, false];
-    let line = |cells: [&str; 6]| {
+    let line = |cells: [&str; N]| {
         let mut l = String::from(" ");
         for (i, cell) in cells.iter().enumerate() {
-            if i == cells.len() - 1 {
+            if i == N - 1 {
                 let _ = write!(l, " {cell}");
             } else if right[i] {
                 let _ = write!(l, " {cell:>w$} ", w = width[i]);
@@ -589,9 +626,38 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
         l
     };
     let _ = writeln!(o, "{}", p.dim(&line(header)));
-    for r in &rows {
+    for r in rows {
         let _ = writeln!(o, "{}", line(r.each_ref().map(String::as_str)));
     }
+}
+
+/// The nodes a node found on the network.
+fn render_nodes(nodes: &[Node], p: Paint) -> String {
+    let mut o = String::new();
+    if nodes.is_empty() {
+        let _ = writeln!(o, "{}", p.mark(Level::Off, "no other nodes found"));
+        return o;
+    }
+    let rows: Vec<[String; 5]> = nodes
+        .iter()
+        .map(|n| {
+            let state = if n.online {
+                p.mark(Level::Good, "online")
+            } else {
+                p.mark(Level::Off, "offline")
+            };
+            [
+                n.name.clone(),
+                n.id.clone().unwrap_or_else(|| "-".into()),
+                n.addresses.first().cloned().unwrap_or_else(|| "-".into()),
+                n.version.clone().unwrap_or_else(|| "-".into()),
+                state,
+            ]
+        })
+        .collect();
+    let header = ["NAME", "ID", "ADDRESS", "VERSION", "STATE"];
+    table(&mut o, p, header, [false; 5], &rows);
+    o
 }
 
 #[cfg(test)]
@@ -693,5 +759,23 @@ Senders
             })
             .collect::<String>();
         assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn renders_nodes() {
+        let nodes: Vec<Node> = serde_json::from_str(
+            r#"[
+                {"id":"B73AQ0P0","name":"Kitchen","version":"0.0.1","host":"orpheus-b73aq0p0.local.",
+                 "addresses":["10.99.0.2","fe80::2%veth-a"],"port":7480,"online":true},
+                {"name":"nmos-cpp node","host":"box.local.","addresses":[],"port":1080,"online":false}
+            ]"#,
+        )
+        .unwrap();
+        let expected = "  NAME           ID        ADDRESS    VERSION  STATE
+  Kitchen        B73AQ0P0  10.99.0.2  0.0.1    ● online
+  nmos-cpp node  -         -          -        ○ offline
+";
+        assert_eq!(render_nodes(&nodes, Paint(false)), expected);
+        assert_eq!(render_nodes(&[], Paint(false)), "○ no other nodes found\n");
     }
 }

@@ -39,15 +39,15 @@ The log line `PTP unavailable; using the system clock` gives the reason.
 ## PTP runs but never settles
 
 - **Firewall.** PTP needs UDP 319 and 320 in both directions; RTP needs UDP
-  5004, and the API TCP 7480. With firewalld:
+  5004, mDNS UDP 5353, and the API TCP 7480. With firewalld:
 
   ```sh
-  sudo firewall-cmd --permanent --add-port=319-320/udp --add-port=5004/udp --add-port=7480/tcp
+  sudo firewall-cmd --permanent --add-port=319-320/udp --add-port=5004/udp --add-port=7480/tcp --add-service=mdns
   sudo firewall-cmd --reload
   ```
 
   With ufw: `sudo ufw allow 319:320/udp`, `sudo ufw allow 5004/udp`,
-  `sudo ufw allow 7480/tcp`.
+  `sudo ufw allow 5353/udp`, `sudo ufw allow 7480/tcp`.
 - **Every node is master.** If each node reports `master` and itself as
   grandmaster, they don't hear each other's announce messages. Check the
   firewall, the `domain`, and that all nodes use the same transport (the
@@ -107,11 +107,21 @@ The PTP clock sits on top of the system clock. If NTP **steps** the system
 clock (as at boot or after a long suspend), the PTP clock jumps with it until
 the filter corrects it. Gradual NTP adjustments (slewing) are harmless.
 
+## `orpheusctl nodes` doesn't list a node
+
+- **Firewall.** mDNS needs UDP 5353; see [above](#ptp-runs-but-never-settles).
+- **Different networks.** mDNS does not cross routers, and many access
+  points filter it between Wi-Fi and Ethernet or between guest networks.
+- **Just started.** A node announces itself about one second after it
+  starts. A node that crashed instead of stopping stays listed as online for
+  up to two minutes.
+- `avahi-browse -rt _nmos-node._tcp` shows what the machine hears.
+
 ## AES67 and Dante devices don't see the node
 
 - They speak PTP over IPv4 only. Use an interface with an IPv4 address, or
   set `transport = "ipv4"`.
-- Discovery (SAP, mDNS) and SDP are not implemented yet, so the devices
+- SAP and SDP are not implemented yet, so the devices
   cannot find the node's streams. Interoperability is untested; see the
   [roadmap](roadmap.md).
 

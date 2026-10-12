@@ -12,8 +12,8 @@ planned; see the [roadmap](docs/roadmap.md).
 **Status:** early development. Two Linux nodes can stream to each other over
 RTP unicast (IPv4 or IPv6), with the clock synchronized over PTP and
 sample-rate conversion against the sound cards' clocks. Routes are set up by
-hand with `orpheusctl`. There is no discovery, no authentication and no UI
-yet.
+hand with `orpheusctl`; nodes find each other over mDNS. There is no
+authentication and no UI yet.
 
 ## Quick start
 
@@ -42,6 +42,7 @@ This creates a sink "Kitchen" on the first machine. Whatever is
 played into it comes out of the second machine's default output.
 
 ```sh
+orpheusctl nodes           # other nodes on the network
 orpheusctl status          # clock, receiver and senders
 orpheusctl status --watch  # the same, refreshed every second
 orpheusctl disconnect 0    # stop sender 0

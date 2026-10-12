@@ -8,3 +8,14 @@ description = "mDNS/DNS-SD discovery for Orpheus nodes"
 publish = false
 
 [dependencies]
+orpheus-core.workspace = true
+mdns-sd = "0.21"
+tracing = "0.1"
+serde = { workspace = true, optional = true }
+utoipa = { version = "6", optional = true }
+
+[features]
+# `Serialize` for the node list.
+serde = ["dep:serde"]
+# OpenAPI schemas for the node list.
+openapi = ["serde", "dep:utoipa"]

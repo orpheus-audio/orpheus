@@ -11,6 +11,7 @@ publish = false
 orpheus-core = { workspace = true, features = ["serde"] }
 orpheus-engine = { path = "../orpheus-engine", features = ["openapi"] }
 orpheus-clock = { path = "../orpheus-clock", features = ["openapi"] }
+orpheus-discovery = { path = "../orpheus-discovery", features = ["openapi"] }
 orpheus-pipewire = { path = "../orpheus-pipewire" }
 serde.workspace = true
 socket2 = "0.6"

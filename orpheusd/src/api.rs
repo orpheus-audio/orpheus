@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
 use orpheus_core::rtp::Encoding;
 use orpheus_core::{AudioFormat, DeviceId};
+use orpheus_discovery::Discovery;
 use orpheus_engine::{Engine, ReceiverStatus, SenderConfig, SenderId, SenderStatus, StatsSnapshot};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
@@ -29,6 +30,8 @@ pub struct Node {
     pub engine: Option<Mutex<Engine>>,
     /// `None` if the node runs on the system clock.
     pub ptp: Option<Arc<PtpClock>>,
+    /// `None` if mDNS could not start.
+    pub discovery: Option<Discovery>,
     pub quantum: Option<u32>,
 }
 
@@ -45,7 +48,11 @@ const BASE: &str = "/x-orpheus/v1";
         license(name = "GPL-3.0-or-later", identifier = "GPL-3.0-or-later"),
     ),
     servers((url = "/", description = "The node serving this document")),
-    tags((name = "node", description = "The node itself"), (name = "senders", description = "Streams this node sends")),
+    tags(
+        (name = "node", description = "The node itself"),
+        (name = "senders", description = "Streams this node sends"),
+        (name = "discovery", description = "Other nodes on the network"),
+    ),
 )]
 struct ApiDoc;
 
@@ -116,6 +123,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(status))
         .routes(routes!(add_sender))
         .routes(routes!(remove_sender))
+        .routes(routes!(nodes))
         .split_for_parts()
 }
 
@@ -239,6 +247,26 @@ async fn remove_sender(
     }
 }
 
+/// The other nodes found over mDNS: Orpheus nodes and other NMOS nodes.
+/// Nodes that left stay listed as offline.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/nodes",
+    tag = "discovery",
+    responses(
+        (status = OK, description = "Online nodes first, then by name", body = Vec<orpheus_discovery::Node>),
+        (status = SERVICE_UNAVAILABLE, description = "mDNS is not running", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn nodes(
+    State(node): State<Arc<Node>>,
+) -> Result<Json<Vec<orpheus_discovery::Node>>, ApiError> {
+    node.discovery.as_ref().map(|d| Json(d.nodes())).ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "mDNS is not running".into(),
+    ))
+}
+
 fn lock_engine(node: &Node) -> Result<std::sync::MutexGuard<'_, Engine>, ApiError> {
     node.engine
         .as_ref()
@@ -317,6 +345,7 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "/x-orpheus/v1/nodes",
                 "/x-orpheus/v1/senders",
                 "/x-orpheus/v1/senders/{id}",
                 "/x-orpheus/v1/status",

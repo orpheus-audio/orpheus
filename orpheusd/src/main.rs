@@ -12,6 +12,7 @@ use orpheus_clock::ptp::{PtpClock, PtpConfig};
 use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
+use orpheus_discovery::{Announcement, Discovery};
 use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
 use orpheus_pipewire::{Icons, PipeWireBackend};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -58,17 +59,27 @@ async fn main() -> Result<()> {
             None
         }
     };
+    let listener = listen_tcp(config.api.listen)
+        .with_context(|| format!("binding API to {}", config.api.listen))?;
+    let port = listener.local_addr()?.port();
+    tracing::info!(addr = %listener.local_addr()?, "API listening");
+
+    let discovery = Discovery::start(&Announcement {
+        id,
+        name: name.clone(),
+        port,
+        version: env!("CARGO_PKG_VERSION").into(),
+    })
+    .inspect_err(|e| tracing::warn!(error = %e, "mDNS unavailable; no discovery"))
+    .ok();
     let node = Arc::new(api::Node {
         id,
         name,
         engine: engine.map(Mutex::new),
         ptp,
+        discovery,
         quantum: config.audio.quantum,
     });
-
-    let listener = listen_tcp(config.api.listen)
-        .with_context(|| format!("binding API to {}", config.api.listen))?;
-    tracing::info!(addr = %listener.local_addr()?, "API listening");
 
     axum::serve(listener, api::router(node.clone()))
         .with_graceful_shutdown(shutdown())
