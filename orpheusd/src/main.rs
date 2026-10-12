@@ -35,7 +35,14 @@ async fn main() -> Result<()> {
     let config = Config::load(&home.config_path())?;
     let id = home.load_or_create_id()?;
     let name = config.name();
-    tracing::info!(%id, %name, home = %home.root().display(), "starting");
+    tracing::info!(
+        %id,
+        %name,
+        config = %home.config_path().display(),
+        state = %home.state_dir().display(),
+        cache = %home.cache_dir().display(),
+        "starting"
+    );
 
     let (clock, ptp) = start_clock(&config);
     let engine = match PipeWireBackend::connect() {
