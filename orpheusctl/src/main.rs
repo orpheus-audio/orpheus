@@ -56,6 +56,28 @@ enum Command {
     },
     /// List the other nodes on the network.
     Nodes,
+    /// Give another node a name of your own, shown here instead of the
+    /// one it announces: in `nodes`, in sinks to it and in streams from it.
+    Alias {
+        /// The node: its name, alias or ID (see `nodes`).
+        node: String,
+        /// The new alias.
+        #[arg(required_unless_present = "remove", conflicts_with = "remove")]
+        alias: Option<String>,
+        /// Remove the alias and show the announced name again.
+        #[arg(long)]
+        remove: bool,
+    },
+    /// Keep another node listed while it is offline, also after a restart.
+    Pin {
+        /// The node: its name, alias or ID (see `nodes`).
+        node: String,
+    },
+    /// Stop keeping a node listed while it is offline.
+    Unpin {
+        /// The node: its name, alias or ID (see `nodes`).
+        node: String,
+    },
     /// List the node's outputs and their types.
     Outputs,
     /// Set what kind of device an output is, which other nodes show.
@@ -229,6 +251,10 @@ struct PeerLink {
 struct Node {
     id: Option<String>,
     name: String,
+    /// This node's own name for it.
+    alias: Option<String>,
+    #[serde(default)]
+    pinned: bool,
     version: Option<String>,
     #[serde(default)]
     addresses: Vec<String>,
@@ -414,6 +440,23 @@ fn main() -> Result<()> {
                     .with_context(|| format!("setting {kind} via {url}"))?;
             }
         }
+        Command::Alias {
+            node,
+            alias,
+            remove,
+        } => {
+            let id = find_node(base, &node)?;
+            let alias = if remove { None } else { alias };
+            change_node(base, &id, serde_json::json!({ "alias": alias }))?;
+        }
+        Command::Pin { node } => {
+            let id = find_node(base, &node)?;
+            change_node(base, &id, serde_json::json!({ "pinned": true }))?;
+        }
+        Command::Unpin { node } => {
+            let id = find_node(base, &node)?;
+            change_node(base, &id, serde_json::json!({ "pinned": false }))?;
+        }
         Command::Disconnect { id } => {
             let url = format!("{base}/x-orpheus/v1/senders/{id}");
             ureq::delete(&url)
@@ -421,6 +464,38 @@ fn main() -> Result<()> {
                 .with_context(|| format!("stopping sender {id} via {url}"))?;
         }
     }
+    Ok(())
+}
+
+/// The device ID of the Orpheus node `query` names: by ID, alias or name.
+fn find_node(base: &str, query: &str) -> Result<String> {
+    let nodes: Vec<Node> = serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/nodes"))?)
+        .context("reading the nodes")?;
+    let is = |s: &Option<String>| s.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(query));
+    let found = nodes
+        .iter()
+        .find(|n| is(&n.id))
+        .or_else(|| nodes.iter().find(|n| is(&n.alias)))
+        .or_else(|| nodes.iter().find(|n| n.name.eq_ignore_ascii_case(query)))
+        .with_context(|| format!("no node {query:?}; see `orpheusctl nodes`"))?;
+    found
+        .id
+        .clone()
+        .with_context(|| format!("{query} is not an Orpheus node"))
+}
+
+/// Changes another node's alias or pin.
+fn change_node(base: &str, id: &str, body: serde_json::Value) -> Result<()> {
+    let url = format!("{base}/x-orpheus/v1/nodes/{id}");
+    let mut r = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+        .patch(&url)
+        .send_json(body)
+        .with_context(|| format!("changing node {id} via {url}"))?;
+    let text = r.body_mut().read_to_string()?;
+    anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
     Ok(())
 }
 
@@ -992,13 +1067,17 @@ fn render_nodes(nodes: &[Node], p: Paint) -> String {
     let rows: Vec<[String; 6]> = nodes
         .iter()
         .map(|n| {
+            let pin = if n.pinned { ", pinned" } else { "" };
             let state = if n.online {
-                p.mark(Level::Good, "online")
+                p.mark(Level::Good, &format!("online{pin}"))
             } else {
-                p.mark(Level::Off, "offline")
+                p.mark(Level::Off, &format!("offline{pin}"))
             };
             [
-                n.name.clone(),
+                match &n.alias {
+                    Some(a) => format!("{a} ({})", n.name),
+                    None => n.name.clone(),
+                },
                 n.id.clone().unwrap_or_else(|| "-".into()),
                 n.addresses.first().cloned().unwrap_or_else(|| "-".into()),
                 n.version.clone().unwrap_or_else(|| "-".into()),
@@ -1273,13 +1352,16 @@ Senders
             r#"[
                 {"id":"B73AQ0P0","name":"Kitchen","version":"0.0.1","host":"orpheus-b73aq0p0.local.",
                  "addresses":["10.99.0.2","fe80::2%veth-a"],"port":7480,"online":true},
+                {"id":"C73AQ0P0","name":"Bad","alias":"Bathroom","version":"0.0.1","host":"orpheus-c73aq0p0.local.",
+                 "addresses":["10.99.0.3"],"port":7480,"online":false,"pinned":true},
                 {"name":"nmos-cpp node","host":"box.local.","addresses":[],"port":1080,"online":false}
             ]"#,
         )
         .unwrap();
-        let expected = "  NAME           ID        ADDRESS    VERSION  LINK  STATE
-  Kitchen        B73AQ0P0  10.99.0.2  0.0.1    -     ● online
-  nmos-cpp node  -         -          -        -     ○ offline
+        let expected = "  NAME            ID        ADDRESS    VERSION  LINK  STATE
+  Kitchen         B73AQ0P0  10.99.0.2  0.0.1    -     ● online
+  Bathroom (Bad)  C73AQ0P0  10.99.0.3  0.0.1    -     ○ offline, pinned
+  nmos-cpp node   -         -          -        -     ○ offline
 ";
         assert_eq!(render_nodes(&nodes, Paint(false)), expected);
         assert_eq!(render_nodes(&[], Paint(false)), "○ no other nodes found\n");

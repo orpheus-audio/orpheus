@@ -9,6 +9,7 @@ mod network;
 mod nmos;
 mod outputs;
 mod peer;
+mod peers;
 mod policy;
 
 use std::net::SocketAddr;
@@ -101,6 +102,7 @@ async fn main() -> Result<()> {
         )),
         health: Mutex::default(),
         mixer: Mutex::default(),
+        peers: Mutex::new(peers::Peers::load(home.state_dir().join("peers.json"))),
     });
     connection::restore(&node);
 

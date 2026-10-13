@@ -276,7 +276,7 @@ fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) 
                 .receiver_active(id)
                 .filter(|a| a.master_enable)
                 .and_then(|a| a.transport_params.first().cloned());
-            (leg, conns.receiver_sender(id))
+            (leg, conns.receiver_sender(id, &node.peers.lock().unwrap()))
         };
         let warn = |kind, message| Warning {
             kind,

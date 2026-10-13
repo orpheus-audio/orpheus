@@ -50,6 +50,8 @@ pub struct Node {
     pub health: Mutex<crate::health::Health>,
     /// What the policy does to each receiver's stream. Lock it last.
     pub mixer: Mutex<crate::policy::Mixer>,
+    /// Aliases and pins of other nodes. Lock it last.
+    pub peers: Mutex<crate::peers::Peers>,
 }
 
 /// An error status with a plain-text message.
@@ -247,6 +249,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(remove_sender))
         .routes(routes!(sender_sdp))
         .routes(routes!(nodes))
+        .routes(routes!(change_node))
         .routes(routes!(outputs))
         .routes(routes!(set_output_type, clear_output_type))
         .split_for_parts()
@@ -295,7 +298,12 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
                     .and_then(|a| a.transport_params.first()?.destination_port.value())
                     .unwrap_or_default();
                 let priority = priorities.get(&id).copied().unwrap_or_default();
-                (id, port, conns.receiver_sender(id), priority)
+                (
+                    id,
+                    port,
+                    conns.receiver_sender(id, &node.peers.lock().unwrap()),
+                    priority,
+                )
             })
             .collect();
         let senders: BTreeMap<SenderId, Priority> = conns
@@ -472,24 +480,98 @@ async fn sender_sdp(
         .ok_or((StatusCode::NOT_FOUND, format!("no sender {id}")))
 }
 
-/// The other nodes found over mDNS: Orpheus nodes and other NMOS nodes.
-/// Nodes that left stay listed as offline.
+/// The other nodes found over mDNS: Orpheus nodes and other NMOS nodes,
+/// with this node's aliases and pins. Nodes that left stay listed as
+/// offline; pinned ones also after a restart.
 #[utoipa::path(
     get,
     path = "/x-orpheus/v1/nodes",
     tag = "discovery",
     responses(
-        (status = OK, description = "Online nodes first, then by name", body = Vec<orpheus_discovery::Node>),
+        (status = OK, description = "Online nodes first, then by the name shown", body = Vec<crate::peers::Known>),
         (status = SERVICE_UNAVAILABLE, description = "mDNS is not running", body = String, content_type = "text/plain"),
     ),
 )]
-async fn nodes(
-    State(node): State<Arc<Node>>,
-) -> Result<Json<Vec<orpheus_discovery::Node>>, ApiError> {
-    node.discovery.as_ref().map(|d| Json(d.nodes())).ok_or((
+async fn nodes(State(node): State<Arc<Node>>) -> Result<Json<Vec<crate::peers::Known>>, ApiError> {
+    let d = node.discovery.as_ref().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
-        "mDNS is not running".into(),
-    ))
+        "mDNS is not running".to_string(),
+    ))?;
+    Ok(Json(node.peers.lock().unwrap().list(d.nodes())))
+}
+
+/// A change to another node's alias or pin; fields left out stay.
+#[derive(Deserialize, ToSchema)]
+struct NodeChange {
+    /// This node's own name for it; `null` removes the alias.
+    #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>, example = "Kitchen")]
+    alias: Option<Option<String>>,
+    /// Keep it listed while offline, also after a restart.
+    pinned: Option<bool>,
+}
+
+/// Tells a field set to `null` from one left out.
+fn present<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(d).map(Some)
+}
+
+/// Sets or removes another Orpheus node's alias, or pins or unpins it.
+/// Kept across restarts. The alias replaces the node's announced name
+/// wherever this node shows it, also in the names of sinks to it and of
+/// streams from it.
+#[utoipa::path(
+    patch,
+    path = "/x-orpheus/v1/nodes/{id}",
+    tag = "discovery",
+    params(("id" = String, Path, description = "Orpheus device ID of the node")),
+    request_body = NodeChange,
+    responses(
+        (status = NO_CONTENT, description = "Changed"),
+        (status = BAD_REQUEST, description = "Not a device ID, or an empty alias", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "Not an Orpheus node this node has seen", body = String, content_type = "text/plain"),
+        (status = CONFLICT, description = "Another node has that alias", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn change_node(
+    State(node): State<Arc<Node>>,
+    Path(id): Path<String>,
+    Json(req): Json<NodeChange>,
+) -> Result<StatusCode, ApiError> {
+    use crate::peers::{Change, Refused};
+    let dev: DeviceId = id
+        .parse()
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("{id} is not a device ID")))?;
+    tokio::task::spawn_blocking(move || {
+        let seen = node.discovery.as_ref().map(|d| d.nodes()).unwrap_or_default();
+        let renames = req.alias.is_some();
+        let change = Change {
+            alias: req.alias,
+            pinned: req.pinned,
+        };
+        node.peers
+            .lock()
+            .unwrap()
+            .change(dev, change, &seen)
+            .map_err(|e| match e {
+                Refused::Unknown => (StatusCode::NOT_FOUND, format!("no Orpheus node {dev} seen")),
+                Refused::Empty => (StatusCode::BAD_REQUEST, "empty alias".into()),
+                Refused::Taken(other) => {
+                    (StatusCode::CONFLICT, format!("node {other} already has that alias"))
+                }
+            })?;
+        tracing::info!(id = %dev, alias = ?node.peers.lock().unwrap().alias(&dev.to_string()), "peer's alias or pin changed");
+        if renames {
+            crate::connection::rename_peer(&node, &dev.to_string());
+        }
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// The audio system's outputs and their types. The receiver announces the
@@ -675,6 +757,7 @@ mod tests {
             paths,
             [
                 "/x-orpheus/v1/nodes",
+                "/x-orpheus/v1/nodes/{id}",
                 "/x-orpheus/v1/outputs",
                 "/x-orpheus/v1/outputs/{name}",
                 "/x-orpheus/v1/senders",

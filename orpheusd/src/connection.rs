@@ -53,6 +53,7 @@ use crate::nmos::FORMAT;
 use crate::nmos::{self, error};
 use crate::outputs;
 use crate::peer::{self, PeerReceiver};
+use crate::peers::Peers;
 use crate::policy::State as PolicyState;
 
 const BASE: &str = "/x-nmos/connection/v1.1";
@@ -309,19 +310,21 @@ impl Connections {
             .collect()
     }
 
-    /// Who receiver `id` is connected to: the name in the sender's SDP
-    /// file, else its address; `None` if no sender is connected.
-    pub fn receiver_sender(&self, id: ReceiverId) -> Option<String> {
+    /// Who receiver `id` is connected to: this node's alias for the
+    /// sending node, else the name in the sender's SDP file, else its
+    /// address; `None` if no sender is connected.
+    pub fn receiver_sender(&self, id: ReceiverId, peers: &Peers) -> Option<String> {
         let active = self.receiver_active(id).filter(|a| a.master_enable)?;
         let leg = active.transport_params.first()?;
-        let named = active
+        let stream = active
             .transport_file
             .data
             .as_deref()
-            .and_then(|d| sdp::parse(d).ok())
-            .map(|s| s.name)
-            .filter(|n| !n.is_empty() && n != "-");
-        named.or_else(|| leg.source_ip.or(leg.multicast_ip).map(|ip| ip.to_string()))
+            .and_then(|d| sdp::parse(d).ok());
+        stream
+            .as_ref()
+            .and_then(|s| stream_name(s, peers))
+            .or_else(|| leg.source_ip.or(leg.multicast_ip).map(|ip| ip.to_string()))
     }
 
     fn save(&self, engine: Option<&Engine>) {
@@ -357,6 +360,15 @@ impl Connections {
             tracing::warn!(error = %e, path = %self.path.display(), "saving routes");
         }
     }
+}
+
+/// The name a received stream is shown by: this node's alias for the
+/// sending node, else the name in its SDP file, if it has one.
+fn stream_name(s: &sdp::Stream, peers: &Peers) -> Option<String> {
+    let alias = s.node.as_deref().and_then(|n| peers.alias(n));
+    alias
+        .map(str::to_owned)
+        .or_else(|| Some(s.name.clone()).filter(|n| !n.is_empty() && n != "-"))
 }
 
 /// Sets up the receivers' connections and restarts the senders saved
@@ -774,6 +786,7 @@ fn check_peers(node: &Node, watch: &mut Watch) {
         .as_ref()
         .map(|d| d.nodes())
         .unwrap_or_default();
+    node.peers.lock().unwrap().remember(&nodes);
     check_sources(node, &mut watch.sources, &nodes);
     let links: Vec<(SenderId, PeerReceiver)> = {
         let conns = node.connections.lock().unwrap();
@@ -819,9 +832,64 @@ fn check_peers(node: &Node, watch: &mut Watch) {
             }
             _ => peer::playing(&to),
         };
-        if update_link(node, id, &to, playing, found.map(|n| n.name.as_str())) {
+        let shown = found.map(|n| shown_name(node, n));
+        if update_link(node, id, &to, playing, shown.as_deref()) {
             reclaim(node, id, &to);
         }
+    }
+}
+
+/// The name a node is shown by here: the alias, else its announced name.
+fn shown_name(node: &Node, n: &orpheus_discovery::Node) -> String {
+    n.id.as_deref()
+        .and_then(|id| node.peers.lock().unwrap().alias(id).map(str::to_owned))
+        .unwrap_or_else(|| n.name.clone())
+}
+
+/// Shows the node with device ID `dev` by the name it has now, after its
+/// alias changed: in the sinks to it that the user didn't name, and in the
+/// streams received from it.
+pub fn rename_peer(node: &Node, dev: &str) {
+    let Some(engine) = &node.engine else {
+        return;
+    };
+    let announced = node.discovery.as_ref().and_then(|d| {
+        d.nodes()
+            .into_iter()
+            .find(|n| n.id.as_deref() == Some(dev))
+            .map(|n| n.name)
+    });
+    let conns = node.connections.lock().unwrap();
+    let mut engine = engine.lock().unwrap();
+    let peers = node.peers.lock().unwrap();
+    let name = peers.alias(dev).map(str::to_owned).or(announced);
+    let mut renamed = false;
+    if let Some(name) = &name {
+        for (&id, link) in &conns.links {
+            let to_dev = link.receiver.as_ref().and_then(|r| r.node.as_deref()) == Some(dev);
+            if to_dev && !link.named {
+                tracing::info!(id, %name, "renaming the sink to the peer");
+                engine.rename_sender(id, name);
+                renamed = true;
+            }
+        }
+    }
+    for (&id, port) in &conns.receivers {
+        let Some(stream) = port
+            .active
+            .transport_file
+            .data
+            .as_deref()
+            .and_then(|d| sdp::parse(d).ok())
+            .filter(|s| s.node.as_deref() == Some(dev))
+        else {
+            continue;
+        };
+        engine.set_receiver_description(id, stream_name(&stream, &peers).as_deref());
+    }
+    drop(peers);
+    if renamed {
+        conns.save(Some(&engine));
     }
 }
 
@@ -1304,8 +1372,8 @@ fn apply_receiver(
     // The playback stream is named after the sender.
     let name = stream
         .as_ref()
-        .map(|s| s.name.clone())
-        .filter(|n| connected && !n.is_empty() && n != "-");
+        .filter(|_| connected)
+        .and_then(|s| stream_name(s, &node.peers.lock().unwrap()));
     let listen = SocketAddr::from(([0u16; 8], port));
     let failed = |e: String| {
         (

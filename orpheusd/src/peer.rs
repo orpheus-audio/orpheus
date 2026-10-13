@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::api::Node;
 use crate::config::RTP_PORT;
+use crate::peers::Known;
 use crate::policy::State;
 
 /// A failed request: status and message.
@@ -110,24 +111,36 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
     }
 
     let id: Option<DeviceId> = peer.parse().ok();
-    let found = node.discovery.as_ref().and_then(|d| {
-        d.nodes().into_iter().find(|n| {
-            let host = n.host.trim_end_matches('.').trim_end_matches(".local");
-            n.online
-                && (n.name.eq_ignore_ascii_case(peer)
+    let known: Vec<Known> = match &node.discovery {
+        Some(d) => node.peers.lock().unwrap().list(d.nodes()),
+        None => vec![],
+    };
+    let online = || known.iter().filter(|k| k.node.online);
+    // An alias first: it is this node's own name for the peer.
+    let found = online()
+        .find(|k| {
+            k.alias
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(peer))
+        })
+        .or_else(|| {
+            online().find(|k| {
+                let n = &k.node;
+                let host = n.host.trim_end_matches('.').trim_end_matches(".local");
+                n.name.eq_ignore_ascii_case(peer)
                     || (id.is_some() && n.id.as_deref().and_then(|i| i.parse().ok()) == id)
                     || host.eq_ignore_ascii_case(peer.trim_end_matches(".local"))
-                    || n.addresses.iter().any(|a| a == peer))
-        })
-    });
-    if let Some(n) = found {
+                    || n.addresses.iter().any(|a| a == peer)
+            })
+        });
+    if let Some(k) = found {
         let (ip, api) =
-            address(&n).ok_or_else(|| bad(format!("{} has no usable address", n.name)))?;
+            address(&k.node).ok_or_else(|| bad(format!("{} has no usable address", k.shown())))?;
         return Ok(Peer {
             api,
             ip,
-            name: Some(n.name),
-            node: n.id,
+            name: Some(k.shown().to_owned()),
+            node: k.node.id.clone(),
         });
     }
 
