@@ -19,9 +19,8 @@ use axum::extract::Request;
 use orpheus_clock::ptp::{PtpClock, PtpConfig};
 use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
-use orpheus_core::rtp::Encoding;
 use orpheus_discovery::{Announcement, Discovery};
-use orpheus_engine::{Engine, LoopbackConfig, ReceiverConfig};
+use orpheus_engine::{Engine, LoopbackConfig};
 use orpheus_pipewire::{Icons, PipeWireBackend};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::signal::unix::{SignalKind, signal};
@@ -95,8 +94,7 @@ async fn main() -> Result<()> {
             home.state_dir().join("routes.json"),
         )),
         block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
-        receiver_port: config.receiver.port,
-        accept: config.receiver.accept,
+        receiver: config.receiver.clone(),
         outputs: Mutex::new(outputs::Overrides::load(
             home.state_dir().join("outputs.json"),
         )),
@@ -250,7 +248,8 @@ fn start_clock(config: &Config) -> (Arc<dyn Clock>, Option<Arc<PtpClock>>) {
     (Arc::new(SystemClock::with_timescale(scale)), None)
 }
 
-/// Starts the routes the config asks for.
+/// Starts the loopback if the config asks for it. The receivers and
+/// senders come from [`connection::restore`].
 fn start_engine(
     backend: PipeWireBackend,
     clock: Arc<dyn Clock>,
@@ -269,27 +268,6 @@ fn start_engine(
             .map_err(|e| anyhow!(e))
             .context("starting loopback")?;
         tracing::info!(latency_ms = config.loopback.latency_ms, "loopback running");
-    }
-    let rx = &config.receiver;
-    if rx.enabled {
-        let listen = SocketAddr::from(([0u16; 8], rx.port));
-        engine
-            .start_receiver(
-                0,
-                &ReceiverConfig {
-                    name: "orpheus.receive".into(),
-                    description: "Orpheus".into(),
-                    format: AudioFormat::AES67,
-                    encoding: Encoding::L24,
-                    listen,
-                    link_offset_ms: rx.link_offset_ms,
-                    block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
-                    gain: 1.0,
-                },
-            )
-            .map_err(|e| anyhow!(e))
-            .with_context(|| format!("starting receiver on {listen}"))?;
-        tracing::info!(%listen, link_offset_ms = rx.link_offset_ms, "receiver running");
     }
     Ok(engine)
 }

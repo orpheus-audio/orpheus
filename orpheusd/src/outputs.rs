@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use orpheus_core::OutputType;
-use orpheus_engine::{Output, SenderId};
+use orpheus_engine::{Output, ReceiverId, SenderId};
 
 use crate::api::Node;
 
@@ -64,13 +64,13 @@ impl Overrides {
     }
 }
 
-/// The audio system's outputs, which one the receiver plays on, and the
-/// effective type of each.
+/// The audio system's outputs and which ones the receivers play on.
 pub struct View {
     pub outputs: Vec<Output>,
-    /// The output the receiver plays on: the one its stream is linked to,
-    /// else the default.
-    pub receiver: Option<String>,
+    /// The default output, where streams go unless moved.
+    pub default: Option<String>,
+    /// The output each running receiver's stream is linked to.
+    pub receivers: BTreeMap<ReceiverId, String>,
 }
 
 impl View {
@@ -78,22 +78,42 @@ impl View {
         let Some(engine) = &node.engine else {
             return Self {
                 outputs: Vec::new(),
-                receiver: None,
+                default: None,
+                receivers: BTreeMap::new(),
             };
         };
         let engine = engine.lock().unwrap();
         let outputs = engine.outputs();
-        let receiver = engine
+        let default = outputs.iter().find(|o| o.default).map(|o| o.name.clone());
+        let receivers = engine
             .status()
             .receivers
-            .first()
-            .and_then(|&(id, _)| engine.receiver_output(id))
-            .or_else(|| outputs.iter().find(|o| o.default).map(|o| o.name.clone()));
-        Self { outputs, receiver }
+            .iter()
+            .filter_map(|&(id, _)| Some((id, engine.receiver_output(id)?)))
+            .collect();
+        Self {
+            outputs,
+            default,
+            receivers,
+        }
     }
 
     pub fn find(&self, name: &str) -> Option<&Output> {
         self.outputs.iter().find(|o| o.name == name)
+    }
+
+    /// The output receiver `id` plays on: the one its stream is linked to,
+    /// else the default, where it would go.
+    pub fn receiver(&self, id: ReceiverId) -> Option<&Output> {
+        let name = self.receivers.get(&id).or(self.default.as_ref())?;
+        self.find(name)
+    }
+
+    /// The kind of output receiver `id` plays on, as announced to other
+    /// nodes.
+    pub fn receiver_type(&self, node: &Node, id: ReceiverId) -> OutputType {
+        self.receiver(id)
+            .map_or(OutputType::Generic, |o| effective(node, o))
     }
 }
 
@@ -104,13 +124,4 @@ pub fn effective(node: &Node, output: &Output) -> OutputType {
         .unwrap()
         .get(&output.name)
         .unwrap_or(output.kind)
-}
-
-/// The kind of output the receiver plays on, as announced to other nodes.
-pub fn receiver_type(node: &Node) -> OutputType {
-    let view = View::of(node);
-    view.receiver
-        .as_deref()
-        .and_then(|name| view.find(name))
-        .map_or(OutputType::Generic, |o| effective(node, o))
 }

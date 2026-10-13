@@ -79,6 +79,7 @@ impl Engine {
                 group: Some(cfg.name.clone()),
                 remote: None,
                 block_frames: cfg.block_frames,
+                restore_key: None,
                 process_latency: 0,
             },
             playback,
@@ -91,6 +92,7 @@ impl Engine {
                 group: Some(cfg.name.clone()),
                 remote: None,
                 block_frames: cfg.block_frames,
+                restore_key: None,
                 process_latency: target as u32,
             },
             capture,
@@ -174,6 +176,11 @@ impl Engine {
         if let Some(r) = self.receivers.get(&id) {
             r.describe(description);
         }
+    }
+
+    /// Whether receiver `id` runs, and under which restore key.
+    pub fn receiver_restore_key(&self, id: ReceiverId) -> Option<Option<&str>> {
+        self.receivers.get(&id).map(Receiver::restore_key)
     }
 
     /// Fades a receiver to `gain` (0 to 1); returns whether it exists.

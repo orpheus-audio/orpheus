@@ -8,8 +8,14 @@
 //! also connects a free receiver on the peer to it, through the peer's
 //! IS-05 API, and disconnects it again when the sender goes.
 //!
-//! What an unconnected receiver plays is a setting (`[receiver] accept`):
-//! nothing, or any stream sent to its port.
+//! Each connection has a receiver of its own, and there is always one free
+//! receiver more, up to `[receiver] max`. Receiver `k` (NMOS ID from
+//! `receiver/k`) listens on `[receiver] port + 2k`, and only while it is
+//! connected does it run, with a playback stream named after its sender.
+//! A connection keeps its receiver across restarts, so a slot saved for a
+//! connection is never handed out to another. Free receivers beyond the
+//! lowest go after [`FREE_GRACE`]. What the free receiver plays is a
+//! setting (`[receiver] accept`): nothing, or any stream sent to its port.
 //!
 //! The parameters last activated are saved to `routes.json` in the state
 //! directory, as requested (with `auto`), and activated again at start.
@@ -27,7 +33,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use orpheus_core::OutputType;
-use orpheus_engine::{Engine, Filter, Group, Route, SenderConfig, SenderId};
+use orpheus_engine::{
+    Engine, Filter, Group, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId,
+};
 use orpheus_nmos::is04::Version;
 use orpheus_nmos::is05::{
     self, Activation, Auto, Mode, ReceiverParams, ReceiverTransport, SenderParams, SenderTransport,
@@ -40,11 +48,16 @@ use serde_json::{Value, json};
 
 use crate::api::Node;
 use crate::config::{Accept, RTP_PORT};
+use crate::nmos::FORMAT;
 use crate::nmos::{self, error};
 use crate::outputs;
 use crate::peer::{self, PeerReceiver};
 
 const BASE: &str = "/x-nmos/connection/v1.1";
+
+/// How long a free receiver beyond the lowest stays, so that controllers
+/// that just saw it can still use it.
+const FREE_GRACE: Duration = Duration::from_secs(60);
 
 /// A failed request: status and message.
 type Fail = (StatusCode, String);
@@ -56,7 +69,10 @@ fn bad(msg: impl Into<String>) -> Fail {
 /// The connection state of all ports.
 pub struct Connections {
     senders: BTreeMap<SenderId, Port<SenderParams>>,
-    receiver: Option<Port<ReceiverParams>>,
+    /// The receivers advertised: the connected ones and the free ones.
+    receivers: BTreeMap<ReceiverId, Port<ReceiverParams>>,
+    /// Since when each free receiver is free.
+    free_since: BTreeMap<ReceiverId, Instant>,
     /// What each sender is connected to.
     links: BTreeMap<SenderId, Link>,
     /// Where the active parameters are saved.
@@ -120,14 +136,15 @@ impl Params for ReceiverParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PortId {
     Sender(SenderId),
-    Receiver,
+    Receiver(ReceiverId),
 }
 
-/// What `routes.json` holds: the requested parameters of each port.
+/// What `routes.json` holds: the requested parameters of each port; of
+/// the receivers only the connected ones.
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
     senders: Vec<SavedSender>,
-    receiver: Option<ReceiverParams>,
+    receivers: BTreeMap<ReceiverId, ReceiverParams>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -206,7 +223,8 @@ impl Connections {
     pub fn new(path: PathBuf) -> Self {
         Self {
             senders: BTreeMap::new(),
-            receiver: None,
+            receivers: BTreeMap::new(),
+            free_since: BTreeMap::new(),
             links: BTreeMap::new(),
             path,
             generation: 0,
@@ -217,8 +235,13 @@ impl Connections {
         self.senders.get(&id).map(|p| &p.active)
     }
 
-    pub fn receiver_active(&self) -> Option<&ReceiverParams> {
-        self.receiver.as_ref().map(|p| &p.active)
+    pub fn receiver_active(&self, id: ReceiverId) -> Option<&ReceiverParams> {
+        self.receivers.get(&id).map(|p| &p.active)
+    }
+
+    /// The receivers advertised.
+    pub fn receiver_ids(&self) -> Vec<ReceiverId> {
+        self.receivers.keys().copied().collect()
     }
 
     /// The type each sender's peer announces.
@@ -245,10 +268,10 @@ impl Connections {
             .collect()
     }
 
-    /// Who the receiver is connected to: the name in the sender's SDP
+    /// Who receiver `id` is connected to: the name in the sender's SDP
     /// file, else its address; `None` if no sender is connected.
-    pub fn receiver_sender(&self) -> Option<String> {
-        let active = self.receiver_active().filter(|a| a.master_enable)?;
+    pub fn receiver_sender(&self, id: ReceiverId) -> Option<String> {
+        let active = self.receiver_active(id).filter(|a| a.master_enable)?;
         let leg = active.transport_params.first()?;
         let named = active
             .transport_file
@@ -281,7 +304,12 @@ impl Connections {
                     })
                 })
                 .collect(),
-            receiver: self.receiver.as_ref().map(|p| p.requested.clone()),
+            receivers: self
+                .receivers
+                .iter()
+                .filter(|(_, p)| connected(&p.active))
+                .map(|(&id, p)| (id, p.requested.clone()))
+                .collect(),
         };
         let json = serde_json::to_vec_pretty(&saved).expect("routes serialize");
         if let Err(e) = crate::home::write_atomic(&self.path, &json) {
@@ -290,8 +318,8 @@ impl Connections {
     }
 }
 
-/// Sets up the receiver's connection and restarts the senders saved before
-/// the last stop.
+/// Sets up the receivers' connections and restarts the senders saved
+/// before the last stop.
 pub fn restore(node: &Node) {
     let Some(engine) = &node.engine else {
         return;
@@ -306,24 +334,22 @@ pub fn restore(node: &Node) {
     };
     let mut engine = engine.lock().unwrap();
 
-    if !engine.status().receivers.is_empty() {
-        let params = saved.receiver.unwrap_or_else(|| ReceiverParams {
-            sender_id: None,
-            master_enable: true,
-            activation: Activation::default(),
-            transport_file: TransportFile::default(),
-            transport_params: vec![ReceiverTransport {
-                source_ip: None,
-                multicast_ip: None,
-                interface_ip: Auto::Auto,
-                destination_port: Auto::Auto,
-                rtp_enabled: true,
-            }],
-        });
-        match apply_receiver(node, &mut engine, &params) {
-            Ok(active) => conns.receiver = Some(Port::new(params, active)),
-            Err((_, e)) => tracing::warn!(error = %e, "restoring the receiver's connection"),
+    if node.receiver.enabled {
+        for (id, params) in saved.receivers {
+            if id >= ReceiverId::from(node.receiver.max) {
+                tracing::warn!(id, "dropping a saved receiver beyond [receiver] max");
+                continue;
+            }
+            match apply_receiver(node, &mut engine, id, &params) {
+                Ok(active) => {
+                    conns.receivers.insert(id, Port::new(params, active));
+                }
+                Err((_, e)) => {
+                    tracing::warn!(id, error = %e, "restoring a receiver's connection")
+                }
+            }
         }
+        balance(node, &mut conns, &mut engine);
     }
 
     for s in saved.senders {
@@ -553,7 +579,17 @@ pub async fn watch_peers(node: Arc<Node>) {
     }
 }
 
+/// Drops free receivers that are no longer needed.
+fn tend_receivers(node: &Node) {
+    let Some(engine) = &node.engine else {
+        return;
+    };
+    let mut conns = node.connections.lock().unwrap();
+    balance(node, &mut conns, &mut engine.lock().unwrap());
+}
+
 fn check_peers(node: &Node, seen: &mut BTreeMap<SenderId, Seen>) {
+    tend_receivers(node);
     let links: Vec<(SenderId, PeerReceiver)> = {
         let conns = node.connections.lock().unwrap();
         seen.retain(|id, _| conns.links.contains_key(id));
@@ -756,32 +792,106 @@ fn apply_sender(engine: &mut Engine, id: SenderId, p: &SenderParams) -> Result<S
     })
 }
 
-/// Sets the receiver's filter from `p`; returns `p` with every `auto`
-/// resolved.
+/// Whether receiver parameters connect a sender: by ID, source or group.
+fn connected(p: &ReceiverParams) -> bool {
+    p.sender_id.is_some()
+        || p.transport_params
+            .first()
+            .is_some_and(|l| l.source_ip.is_some() || l.multicast_ip.is_some())
+}
+
+/// The parameters of a free receiver.
+fn free_params() -> ReceiverParams {
+    ReceiverParams {
+        sender_id: None,
+        master_enable: true,
+        activation: Activation::default(),
+        transport_file: TransportFile::default(),
+        transport_params: vec![ReceiverTransport {
+            source_ip: None,
+            multicast_ip: None,
+            interface_ip: Auto::Auto,
+            destination_port: Auto::Auto,
+            rtp_enabled: true,
+        }],
+    }
+}
+
+/// The port receiver `id` listens on unless its connection asks for
+/// another.
+fn receiver_port(node: &Node, id: ReceiverId) -> u16 {
+    // The config keeps the sum below 65536.
+    (u32::from(node.receiver.port) + 2 * id) as u16
+}
+
+/// The NMOS ID of receiver `id`.
+pub fn receiver_uuid(node: &Node, id: ReceiverId) -> Uuid {
+    resource_id(node.id, &format!("receiver/{id}"))
+}
+
+/// Keeps one free receiver: adds the lowest free slot if none is free and
+/// there is room, and removes free receivers beyond the lowest once they
+/// have been free for [`FREE_GRACE`].
+fn balance(node: &Node, conns: &mut Connections, engine: &mut Engine) {
+    if !node.receiver.enabled {
+        return;
+    }
+    let free: Vec<ReceiverId> = conns
+        .receivers
+        .iter()
+        .filter(|(_, p)| !connected(&p.active))
+        .map(|(&id, _)| id)
+        .collect();
+    conns.free_since.retain(|id, _| free.contains(id));
+    for &id in &free {
+        conns.free_since.entry(id).or_insert_with(Instant::now);
+    }
+    for &id in free.iter().skip(1) {
+        let idle = conns.free_since[&id].elapsed() >= FREE_GRACE;
+        if idle && conns.receivers[&id].pending.is_none() {
+            conns.receivers.remove(&id);
+            conns.free_since.remove(&id);
+            engine.remove_receiver(id);
+            tracing::debug!(id, "free receiver removed");
+        }
+    }
+    if !free.is_empty() {
+        return;
+    }
+    let Some(id) =
+        (0..ReceiverId::from(node.receiver.max)).find(|id| !conns.receivers.contains_key(id))
+    else {
+        return;
+    };
+    let params = free_params();
+    match apply_receiver(node, engine, id, &params) {
+        Ok(active) => {
+            conns.receivers.insert(id, Port::new(params, active));
+            conns.free_since.insert(id, Instant::now());
+            tracing::debug!(id, "free receiver added");
+        }
+        Err((_, e)) => tracing::warn!(id, error = %e, "adding a free receiver"),
+    }
+}
+
+/// Runs receiver `id` as `p` says: starts it for a connection (or, with
+/// `accept = "any"`, also while free), stops it otherwise, and sets its
+/// port and filter. Returns `p` with every `auto` resolved.
 fn apply_receiver(
     node: &Node,
     engine: &mut Engine,
+    id: ReceiverId,
     p: &ReceiverParams,
 ) -> Result<ReceiverParams, Fail> {
     let leg = &p.transport_params[0];
-    let port = leg.destination_port.value().unwrap_or(node.receiver_port);
-    engine.set_receiver_port(0, port).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("listening on port {port}: {e}"),
-        )
-    })?;
-    let (_, status) = engine
-        .status()
-        .receivers
-        .into_iter()
-        .next()
-        .ok_or((StatusCode::NOT_FOUND, "no receiver".to_string()))?;
+    let port = leg
+        .destination_port
+        .value()
+        .unwrap_or(receiver_port(node, id));
     let stream = match &p.transport_file.data {
         Some(data) => Some(sdp::parse(data).map_err(bad)?),
         None => None,
     };
-    let payload_type = stream.as_ref().map(|s| s.payload_type);
     // Without a source or group, any stream to the port would play.
     let connected = leg.source_ip.is_some() || leg.multicast_ip.is_some();
     // Of the same family as the stream, if it says.
@@ -791,6 +901,61 @@ fn apply_receiver(
         let fits = |ip: &&IpAddr| family.is_none_or(|v4| ip.is_ipv4() == v4);
         ips.iter().find(fits).or(ips.first()).copied()
     });
+    let resolved = |port| ReceiverParams {
+        transport_params: vec![ReceiverTransport {
+            interface_ip: Auto::Value(interface_ip.unwrap_or(IpAddr::from([0u16; 8]))),
+            destination_port: Auto::Value(port),
+            ..leg.clone()
+        }],
+        ..p.clone()
+    };
+
+    let runs =
+        p.master_enable && leg.rtp_enabled && (connected || node.receiver.accept == Accept::Any);
+    if !runs {
+        engine.remove_receiver(id);
+        return Ok(resolved(port));
+    }
+    // The audio system remembers the stream's volume and output by this.
+    let from = stream
+        .as_ref()
+        .and_then(|s| s.node.clone())
+        .or_else(|| leg.source_ip.or(leg.multicast_ip).map(|ip| ip.to_string()));
+    let restore_key = from.map(|f| format!("orpheus.from.{f}"));
+    // The playback stream is named after the sender.
+    let name = stream
+        .as_ref()
+        .map(|s| s.name.clone())
+        .filter(|n| connected && !n.is_empty() && n != "-");
+    let listen = SocketAddr::from(([0u16; 8], port));
+    let failed = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("receiving on port {port}: {e}"),
+        )
+    };
+    if engine.receiver_restore_key(id) != Some(restore_key.as_deref()) {
+        engine
+            .start_receiver(
+                id,
+                &ReceiverConfig {
+                    name: format!("orpheus.receive.{id}"),
+                    description: name.clone().unwrap_or_else(|| "Orpheus".into()),
+                    format: FORMAT,
+                    encoding: nmos::ENCODING,
+                    listen,
+                    link_offset_ms: node.receiver.link_offset_ms,
+                    block_frames: node.block_frames,
+                    gain: 1.0,
+                    restore_key,
+                },
+            )
+            .map_err(|e| failed(e.to_string()))?;
+        tracing::info!(id, %listen, "receiver running");
+    }
+    engine
+        .set_receiver_port(id, port)
+        .map_err(|e| failed(e.to_string()))?;
     // Joined on that interface: without a default route, the system has
     // no choice to make.
     let group = leg.multicast_ip.map(|address| Group {
@@ -799,13 +964,11 @@ fn apply_receiver(
     });
     engine
         .set_receiver_filter(
-            0,
+            id,
             Filter {
-                enabled: p.master_enable
-                    && leg.rtp_enabled
-                    && (connected || node.accept == Accept::Any),
+                enabled: true,
                 source: leg.source_ip,
-                payload_type,
+                payload_type: stream.as_ref().map(|s| s.payload_type),
                 group,
             },
         )
@@ -815,20 +978,8 @@ fn apply_receiver(
                 format!("joining {group:?}: {e}"),
             )
         })?;
-    // The playback stream is named after the sender.
-    let name = stream
-        .map(|s| s.name)
-        .filter(|n| connected && !n.is_empty() && n != "-");
-    engine.set_receiver_description(0, name.as_deref());
-    let interface_ip = interface_ip.unwrap_or(status.listen.ip());
-    Ok(ReceiverParams {
-        transport_params: vec![ReceiverTransport {
-            interface_ip: Auto::Value(interface_ip),
-            destination_port: Auto::Value(status.listen.port()),
-            ..leg.clone()
-        }],
-        ..p.clone()
-    })
+    engine.set_receiver_description(id, name.as_deref());
+    Ok(resolved(port))
 }
 
 fn check_sender(p: &SenderParams) -> Result<(), String> {
@@ -965,8 +1116,11 @@ fn find(node: &Node, kind: &str, id: &str) -> Result<PortId, Fail> {
             .keys()
             .find(|&&n| resource_id(node.id, &format!("sender/{n}")) == uuid)
             .map(|&n| PortId::Sender(n)),
-        "receivers" => (conns.receiver.is_some() && uuid == resource_id(node.id, "receiver/0"))
-            .then_some(PortId::Receiver),
+        "receivers" => conns
+            .receivers
+            .keys()
+            .find(|&&n| receiver_uuid(node, n) == uuid)
+            .map(|&n| PortId::Receiver(n)),
         _ => None,
     }
     .ok_or_else(not_found)
@@ -975,7 +1129,7 @@ fn find(node: &Node, kind: &str, id: &str) -> Result<PortId, Fail> {
 fn uuid_of(node: &Node, port: PortId) -> Uuid {
     match port {
         PortId::Sender(n) => resource_id(node.id, &format!("sender/{n}")),
-        PortId::Receiver => resource_id(node.id, "receiver/0"),
+        PortId::Receiver(n) => receiver_uuid(node, n),
     }
 }
 
@@ -990,7 +1144,11 @@ async fn ports(State(node): State<Arc<Node>>, Path(kind): Path<String>) -> Respo
     let conns = node.connections.lock().unwrap();
     let ids: Vec<PortId> = match kind.as_str() {
         "senders" => conns.senders.keys().map(|&n| PortId::Sender(n)).collect(),
-        "receivers" => conns.receiver.iter().map(|_| PortId::Receiver).collect(),
+        "receivers" => conns
+            .receivers
+            .keys()
+            .map(|&n| PortId::Receiver(n))
+            .collect(),
         _ => return error(StatusCode::NOT_FOUND, format!("no {kind}")),
     };
     drop(conns);
@@ -1013,7 +1171,7 @@ async fn port_index(
             "transportfile/",
             "transporttype/"
         ]),
-        PortId::Receiver => json!(["constraints/", "staged/", "active/", "transporttype/"]),
+        PortId::Receiver(_) => json!(["constraints/", "staged/", "active/", "transporttype/"]),
     }))
 }
 
@@ -1031,7 +1189,7 @@ async fn constraints(
             "rtp_enabled": {},
         }]),
         // Ports below 1024 need privileges.
-        PortId::Receiver => json!([{
+        PortId::Receiver(_) => json!([{
             "source_ip": {},
             "multicast_ip": {},
             "interface_ip": {"enum": ips},
@@ -1066,7 +1224,7 @@ fn view(
     let gone = || (StatusCode::NOT_FOUND, "gone".to_string());
     match port {
         PortId::Sender(n) => conns.senders.get(&n).map(|p| json!(sender(p))),
-        PortId::Receiver => conns.receiver.as_ref().map(|p| json!(receiver(p))),
+        PortId::Receiver(n) => conns.receivers.get(&n).map(|p| json!(receiver(p))),
     }
     .ok_or_else(gone)
 }
@@ -1084,7 +1242,7 @@ async fn transport_file(
 ) -> Response {
     let port = match find(&node, &kind, &id) {
         Ok(PortId::Sender(n)) => n,
-        Ok(PortId::Receiver) => {
+        Ok(PortId::Receiver(_)) => {
             return error(
                 StatusCode::NOT_FOUND,
                 "receivers have no transport file".into(),
@@ -1183,10 +1341,10 @@ fn patch(node: &Arc<Node>, port: PortId, body: Value) -> Result<(StatusCode, Val
             conns.save(node.engine.as_ref().map(|e| e.lock().unwrap()).as_deref());
             Ok(reply)
         }
-        PortId::Receiver => {
+        PortId::Receiver(n) => {
             let p = conns
-                .receiver
-                .as_mut()
+                .receivers
+                .get_mut(&n)
                 .ok_or((StatusCode::NOT_FOUND, "gone".into()))?;
             let staged = staged_patch(p, &body, |s| {
                 let mut new = is05::patch(s, body.clone())?;
@@ -1195,7 +1353,11 @@ fn patch(node: &Arc<Node>, port: PortId, body: Value) -> Result<(StatusCode, Val
             })?;
             check_receiver(&staged).map_err(bad)?;
             let reply = stage_or_activate(node, &mut conns.generation, p, port, staged)?;
-            conns.save(node.engine.as_ref().map(|e| e.lock().unwrap()).as_deref());
+            let mut engine = node.engine.as_ref().map(|e| e.lock().unwrap());
+            if let Some(engine) = engine.as_deref_mut() {
+                balance(node, conns, engine);
+            }
+            conns.save(engine.as_deref());
             Ok(reply)
         }
     }
@@ -1304,8 +1466,11 @@ impl Activate for SenderParams {
 }
 
 impl Activate for ReceiverParams {
-    fn activate(node: &Node, _: PortId, p: &Self) -> Result<Self, Fail> {
-        apply_receiver(node, &mut *lock_engine(node)?, p)
+    fn activate(node: &Node, id: PortId, p: &Self) -> Result<Self, Fail> {
+        let PortId::Receiver(n) = id else {
+            unreachable!("receiver parameters for a sender")
+        };
+        apply_receiver(node, &mut *lock_engine(node)?, n, p)
     }
 }
 
@@ -1323,13 +1488,19 @@ fn fire(node: &Node, id: PortId, generation: u64) {
             .senders
             .get_mut(&n)
             .map(|p| fire_port(node, id, generation, p)),
-        PortId::Receiver => conns
-            .receiver
-            .as_mut()
+        PortId::Receiver(n) => conns
+            .receivers
+            .get_mut(&n)
             .map(|p| fire_port(node, id, generation, p)),
     };
     match result {
-        Some(Ok(true)) => conns.save(node.engine.as_ref().map(|e| e.lock().unwrap()).as_deref()),
+        Some(Ok(true)) => {
+            let mut engine = node.engine.as_ref().map(|e| e.lock().unwrap());
+            if let Some(engine) = engine.as_deref_mut() {
+                balance(node, &mut conns, engine);
+            }
+            conns.save(engine.as_deref());
+        }
         Some(Err((_, e))) => tracing::warn!(?id, error = %e, "scheduled activation failed"),
         _ => {}
     }

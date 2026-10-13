@@ -216,6 +216,7 @@ impl Sender {
                 group: None,
                 remote: Some(cfg.remote),
                 block_frames: cfg.block_frames,
+                restore_key: None,
                 process_latency: (target + asrc.delay()) as u32,
             },
             capture,

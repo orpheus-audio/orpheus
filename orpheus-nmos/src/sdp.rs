@@ -34,6 +34,8 @@ pub struct Session<'a> {
     pub clock: RefClock,
     /// The RTP timestamp at the clock's epoch; Orpheus counts from 0.
     pub media_clock_offset: u32,
+    /// The sending Orpheus node's ID, as `a=x-orpheus-node`.
+    pub node: Option<&'a str>,
 }
 
 impl Session<'_> {
@@ -91,6 +93,9 @@ impl Session<'_> {
             }
         };
         let _ = write!(s, "a=mediaclk:direct={}\r\n", self.media_clock_offset);
+        if let Some(node) = self.node {
+            let _ = write!(s, "a=x-orpheus-node:{}\r\n", one_line(node));
+        }
         s
     }
 }
@@ -110,6 +115,8 @@ pub struct Stream {
     pub encoding: String,
     pub rate: u32,
     pub channels: u16,
+    /// The sending Orpheus node's ID (`a=x-orpheus-node`), if it is one.
+    pub node: Option<String>,
 }
 
 /// Reads the first `m=audio` section with RTP/AVP.
@@ -121,6 +128,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
     let mut media: Option<(Option<IpAddr>, u16, u8)> = None;
     let mut rtpmap: Option<(String, u32, u16)> = None;
     let mut filter = None;
+    let mut node = None;
     let mut done = false;
     for line in sdp.lines() {
         let line = line.trim_end_matches('\r');
@@ -163,6 +171,8 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
                         };
                         rtpmap = Some((name, rate, channels));
                     }
+                } else if let Some(id) = value.strip_prefix("x-orpheus-node:") {
+                    node = Some(id.trim().to_owned()).filter(|id| !id.is_empty());
                 } else if let Some(f) = value.strip_prefix("source-filter:") {
                     let f: Vec<&str> = f.split_whitespace().collect();
                     if let ["incl", "IN", _, _, src, ..] = f[..] {
@@ -185,6 +195,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
         encoding,
         rate,
         channels,
+        node,
     })
 }
 
@@ -235,6 +246,7 @@ mod tests {
             ptime_ms: 1,
             clock,
             media_clock_offset: 0,
+            node: None,
         }
     }
 
@@ -265,7 +277,10 @@ mod tests {
 
     #[test]
     fn reads_own_files() {
-        let sdp = session(RefClock::LocalMac("00-1b-21-ab-cd-ef".into())).render();
+        let mut sdp = session(RefClock::LocalMac("00-1b-21-ab-cd-ef".into()));
+        sdp.node = Some("B73AQ0P0");
+        let sdp = sdp.render();
+        assert!(sdp.ends_with("a=x-orpheus-node:B73AQ0P0\r\n"));
         assert_eq!(
             parse(&sdp),
             Ok(Stream {
@@ -277,6 +292,7 @@ mod tests {
                 encoding: "L24".into(),
                 rate: 48_000,
                 channels: 2,
+                node: Some("B73AQ0P0".into()),
             })
         );
     }

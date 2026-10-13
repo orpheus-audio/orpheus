@@ -119,13 +119,19 @@ impl AudioConfig {
 /// Default UDP port for RTP, as is common for AES67.
 pub const RTP_PORT: u16 = 5004;
 
-/// Plays the RTP stream sent to this node.
-#[derive(Debug, Deserialize)]
+/// The most receivers a node can have.
+const MAX_RECEIVERS: u16 = 32;
+
+/// Plays the RTP streams sent to this node, one receiver per connection.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReceiverConfig {
     pub enabled: bool,
-    /// UDP port to receive RTP on, over IPv4 and IPv6.
+    /// UDP port of the first receiver, over IPv4 and IPv6; receiver `k`
+    /// listens on `port + 2k`.
     pub port: u16,
+    /// How many receivers there can be, and so connections.
+    pub max: u16,
     /// Playout delay after the sender's timestamp. Covers network delay and
     /// the clock error between the nodes.
     pub link_offset_ms: u32,
@@ -138,6 +144,7 @@ impl Default for ReceiverConfig {
         Self {
             enabled: true,
             port: RTP_PORT,
+            max: 8,
             link_offset_ms: 10,
             accept: Accept::default(),
         }
@@ -220,10 +227,29 @@ impl Default for LoopbackConfig {
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
-            Ok(s) => toml::from_str(&s).with_context(|| format!("parsing {}", path.display())),
+            Ok(s) => {
+                let config: Self =
+                    toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+                config
+                    .check()
+                    .with_context(|| format!("checking {}", path.display()))?;
+                Ok(config)
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
         }
+    }
+
+    /// What the types can't express.
+    fn check(&self) -> Result<()> {
+        let r = &self.receiver;
+        if !(1..=MAX_RECEIVERS).contains(&r.max) {
+            anyhow::bail!("[receiver] max must be 1 to {MAX_RECEIVERS}");
+        }
+        if u32::from(r.port) + 2 * (u32::from(r.max) - 1) > u32::from(u16::MAX) {
+            anyhow::bail!("[receiver] port + 2 × (max − 1) must stay below 65536");
+        }
+        Ok(())
     }
 
     /// The configured name, or the hostname if none is set.
@@ -323,5 +349,12 @@ mod tests {
         let c: Config = toml::from_str("[receiver]\naccept = \"any\"").unwrap();
         assert_eq!(c.receiver.accept, Accept::Any);
         assert!(toml::from_str::<Config>("[receiver]\naccept = \"all\"").is_err());
+        assert_eq!(c.receiver.max, 8);
+        let max = |toml: &str| toml::from_str::<Config>(toml).unwrap().check();
+        assert!(max("[receiver]\nmax = 1").is_ok());
+        assert!(max("[receiver]\nmax = 0").is_err());
+        assert!(max("[receiver]\nmax = 33").is_err());
+        assert!(max("[receiver]\nport = 65530\nmax = 3").is_ok());
+        assert!(max("[receiver]\nport = 65530\nmax = 4").is_err());
     }
 }

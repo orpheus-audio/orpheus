@@ -80,7 +80,10 @@ struct Status {
     audio: bool,
     clock: Option<ClockInfo>,
     loopback: Option<Buffer>,
-    receiver: Option<Receiver>,
+    /// `connected` or `any`: what a free receiver plays.
+    accept: Option<String>,
+    #[serde(default)]
+    receivers: Vec<Receiver>,
     #[serde(default)]
     senders: Vec<Sender>,
     /// Missing from older nodes.
@@ -132,37 +135,41 @@ struct Buffer {
     level_frames: u64,
 }
 
+/// A receiver: one per connection, and a free one.
 #[derive(Clone, Deserialize)]
 struct Receiver {
+    id: u32,
+    port: u16,
+    /// The connected sender's name or address.
+    sender: Option<String>,
+    /// Absent while free or off.
+    stream: Option<Stream>,
+    /// The kind of output.
+    output: Option<String>,
+    /// Description of the output it plays on.
+    plays_on: Option<String>,
+}
+
+/// A running receiver's stream.
+#[derive(Clone, Deserialize)]
+struct Stream {
     listen: String,
     link_offset_ms: u32,
-    /// Missing from older nodes, which are always on.
-    #[serde(default = "yes")]
-    enabled: bool,
     ssrc: Option<u32>,
     packets: u64,
     malformed: u64,
     /// Turned away by the connection's source or payload type.
-    #[serde(default)]
     ignored: u64,
     late: u64,
     early: u64,
     lost: u64,
     realigns: u64,
     margin_us: Option<i64>,
-    /// Missing from older nodes.
     jitter_us: Option<i64>,
-    #[serde(default)]
     asrc_ppm: f64,
     buffer: Buffer,
-    /// `connected` or `any`; missing from older nodes.
-    accept: Option<String>,
-    /// The connected sender's name or address.
-    sender: Option<String>,
-    /// The kind of output; missing from older nodes.
-    output: Option<String>,
-    /// Description of the output it plays on.
-    plays_on: Option<String>,
+    /// Peak level over the last second; `None` for silence.
+    peak_dbfs: Option<f32>,
 }
 
 /// An output of a node.
@@ -175,7 +182,9 @@ struct Output {
     #[serde(rename = "override")]
     overridden: Option<String>,
     default: bool,
-    receiver: bool,
+    /// The receivers playing here.
+    #[serde(default)]
+    receivers: Vec<u32>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -240,20 +249,36 @@ impl Status {
             (Some(b), Some(p)) => Some(b.since(p)),
             (b, _) => b.as_ref().map(|b| b.since(b)),
         };
-        d.receiver = self.receiver.as_ref().map(|r| {
-            let p = prev.receiver.as_ref().unwrap_or(r);
-            Receiver {
-                packets: r.packets.saturating_sub(p.packets),
-                malformed: r.malformed.saturating_sub(p.malformed),
-                ignored: r.ignored.saturating_sub(p.ignored),
-                late: r.late.saturating_sub(p.late),
-                early: r.early.saturating_sub(p.early),
-                lost: r.lost.saturating_sub(p.lost),
-                realigns: r.realigns.saturating_sub(p.realigns),
-                buffer: r.buffer.since(&p.buffer),
-                ..r.clone()
-            }
-        });
+        d.receivers = self
+            .receivers
+            .iter()
+            .map(|r| {
+                // A new stream counts from now.
+                let p = prev
+                    .receivers
+                    .iter()
+                    .find(|p| p.id == r.id)
+                    .and_then(|p| p.stream.as_ref());
+                let stream = r.stream.as_ref().map(|t| {
+                    let p = p.unwrap_or(t);
+                    Stream {
+                        packets: t.packets.saturating_sub(p.packets),
+                        malformed: t.malformed.saturating_sub(p.malformed),
+                        ignored: t.ignored.saturating_sub(p.ignored),
+                        late: t.late.saturating_sub(p.late),
+                        early: t.early.saturating_sub(p.early),
+                        lost: t.lost.saturating_sub(p.lost),
+                        realigns: t.realigns.saturating_sub(p.realigns),
+                        buffer: t.buffer.since(&p.buffer),
+                        ..t.clone()
+                    }
+                });
+                Receiver {
+                    stream,
+                    ..r.clone()
+                }
+            })
+            .collect();
         d.senders = self
             .senders
             .iter()
@@ -681,8 +706,8 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
         }
         None => {}
     }
-    if let Some(r) = &s.receiver {
-        receiver(&mut o, p, c, r);
+    for r in &s.receivers {
+        receiver(&mut o, p, c, r, s.accept.as_deref());
     }
     if let Some(l) = &s.loopback {
         heading(&mut o, p, "Loopback", None);
@@ -727,26 +752,25 @@ fn clock(o: &mut String, p: Paint, t: &Ptp) {
     row(o, p, "steps", &steps);
 }
 
-fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
-    let waiting = r.sender.is_none() && r.accept.as_deref() == Some("connected");
-    let mark = match (r.ssrc, &r.sender) {
-        _ if !r.enabled && waiting => p.mark(Level::Off, "not connected"),
-        _ if !r.enabled => p.mark(Level::Off, "off"),
+fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&str>) {
+    let title = format!("Receiver {}", r.id);
+    let Some(st) = &r.stream else {
+        let mark = match &r.sender {
+            Some(from) => p.mark(Level::Off, &format!("connected to {from}, off")),
+            None => p.mark(Level::Off, &format!("free, port {}", r.port)),
+        };
+        heading(o, p, &title, Some(mark));
+        return;
+    };
+    let mark = match (st.ssrc, &r.sender) {
         (Some(_), Some(from)) => p.mark(Level::Good, &format!("receiving from {from}")),
         (Some(ssrc), None) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
         (None, Some(from)) => p.mark(Level::Off, &format!("connected to {from}, idle")),
+        (None, None) if accept == Some("any") => p.mark(Level::Off, "free, plays any sender"),
         (None, None) => p.mark(Level::Off, "idle"),
     };
-    heading(o, p, "Receiver", Some(mark));
-    row(o, p, "listen", &r.listen);
-    if let Some(accept) = &r.accept {
-        let accept = match accept.as_str() {
-            "connected" => "connected senders",
-            "any" => "any sender",
-            other => other,
-        };
-        row(o, p, "accepts", accept);
-    }
+    heading(o, p, &title, Some(mark));
+    row(o, p, "listen", &st.listen);
     if let Some(output) = &r.output {
         let output = match &r.plays_on {
             Some(on) => format!("{output} ({on})"),
@@ -754,8 +778,12 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
         };
         row(o, p, "output", &output);
     }
-    row(o, p, "link offset", &format!("{} ms", r.link_offset_ms));
-    let margin = match r.margin_us {
+    row(o, p, "link offset", &format!("{} ms", st.link_offset_ms));
+    let level = st
+        .peak_dbfs
+        .map_or("silence".into(), |db| format!("{db:.1} dBFS"));
+    row(o, p, "level", &level);
+    let margin = match st.margin_us {
         Some(m) => {
             let text = format!("{:.2} ms", m as f64 / 1000.0);
             match m {
@@ -767,7 +795,7 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
         None => "-".into(),
     };
     row(o, p, "margin", &margin);
-    if let Some(j) = r.jitter_us {
+    if let Some(j) = st.jitter_us {
         let text = format!("{:.2} ms", j as f64 / 1000.0);
         // As orpheusd's health check warns.
         let text = if j > 3000 {
@@ -777,21 +805,26 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
         };
         row(o, p, "jitter", &text);
     }
-    row(o, p, "packets", &c.packets(r.packets));
-    if r.ignored > 0 {
+    row(o, p, "packets", &c.packets(st.packets));
+    if st.ignored > 0 {
         // From other sources: expected while connected to one sender.
-        row(o, p, "ignored", &c.packets(r.ignored));
+        row(o, p, "ignored", &c.packets(st.ignored));
     }
-    row(o, p, "buffer", &format!("{} frames", r.buffer.level_frames));
-    row(o, p, "ASRC", &format!("{:+.1} ppm", r.asrc_ppm));
+    row(
+        o,
+        p,
+        "buffer",
+        &format!("{} frames", st.buffer.level_frames),
+    );
+    row(o, p, "ASRC", &format!("{:+.1} ppm", st.asrc_ppm));
     let mut counts = vec![
-        (r.lost, "lost", "lost"),
-        (r.late, "late", "late"),
-        (r.early, "early", "early"),
-        (r.malformed, "malformed", "malformed"),
-        (r.realigns, "realign", "realigns"),
+        (st.lost, "lost", "lost"),
+        (st.late, "late", "late"),
+        (st.early, "early", "early"),
+        (st.malformed, "malformed", "malformed"),
+        (st.realigns, "realign", "realigns"),
     ];
-    counts.extend(buffer_counts(&r.buffer));
+    counts.extend(buffer_counts(&st.buffer));
     row(o, p, "problems", &problems(p, c, &counts));
 }
 
@@ -882,11 +915,17 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
                 None => out.kind.clone(),
             };
             let mut notes = Vec::new();
-            if out.receiver {
-                notes.push("receiver");
+            if !out.receivers.is_empty() {
+                let ids: Vec<String> = out.receivers.iter().map(u32::to_string).collect();
+                let noun = if ids.len() == 1 {
+                    "receiver"
+                } else {
+                    "receivers"
+                };
+                notes.push(format!("{noun} {}", ids.join(", ")));
             }
             if out.default {
-                notes.push("default");
+                notes.push("default".into());
             }
             [
                 out.description.clone(),
@@ -947,11 +986,14 @@ mod tests {
             "grandmaster": "9c6b00.fffe.1a2b3c", "offset_ns": -412,
             "mean_delay_ns": 41200, "frequency_ppm": 12.31, "steps": 1,
             "settled": true}},
-        "receiver": {"listen": "[::]:5004", "link_offset_ms": 10,
-            "ssrc": 1579090602, "packets": 120000, "malformed": 0, "late": 3,
-            "early": 0, "lost": 1, "realigns": 0, "margin_us": 8710,
-            "asrc_ppm": -3.2, "buffer": {"underruns": 0, "overruns": 0,
-            "resyncs": 0, "level_frames": 1140}},
+        "accept": "connected",
+        "receivers": [{"id": 0, "port": 5004, "stream": {"listen": "[::]:5004",
+            "link_offset_ms": 10, "ssrc": 1579090602, "packets": 120000,
+            "malformed": 0, "ignored": 0, "late": 3, "early": 0, "lost": 1,
+            "realigns": 0, "margin_us": 8710, "jitter_us": null, "asrc_ppm": -3.2,
+            "buffer": {"underruns": 0, "overruns": 0, "resyncs": 0,
+            "level_frames": 1140}, "peak_dbfs": -12.04}},
+            {"id": 1, "port": 5006}],
         "senders": [{"id": 0, "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
             "send_errors": 0, "realigns": 0, "asrc_ppm": 8.9,
             "buffer": {"underruns": 2, "overruns": 0, "resyncs": 0,
@@ -975,14 +1017,17 @@ Clock          ● PTP, settled
   frequency    +12.31 ppm
   steps        1
 
-Receiver       ● receiving ssrc 5e1f02aa
+Receiver 0     ● receiving ssrc 5e1f02aa
   listen       [::]:5004
   link offset  10 ms
+  level        -12.0 dBFS
   margin       8.71 ms
   packets      120000
   buffer       1140 frames
   ASRC         -3.2 ppm
   problems     1 lost, 3 late
+
+Receiver 1     ○ free, port 5006
 
 Senders
   ID  NAME     PEER               PACKETS       BUFFER      ASRC  PROBLEMS
@@ -995,7 +1040,7 @@ Senders
     fn watch_shows_rates() {
         let prev: Status = serde_json::from_str(STATUS).unwrap();
         let mut s = prev.clone();
-        let r = s.receiver.as_mut().unwrap();
+        let r = s.receivers[0].stream.as_mut().unwrap();
         r.packets += 2000;
         r.late += 3;
         s.senders[0].packets += 2000;
@@ -1022,12 +1067,14 @@ Senders
     #[test]
     fn shows_ports_that_are_off() {
         let mut s: Status = serde_json::from_str(STATUS).unwrap();
-        let r = s.receiver.as_mut().unwrap();
-        r.enabled = false;
-        r.ignored = 42;
+        s.receivers[0].stream.as_mut().unwrap().ignored = 42;
+        s.receivers[1].sender = Some("Laptop".into());
         s.senders[0].enabled = false;
         let out = render(&s, Paint(false), Counts::Total);
-        assert!(out.contains("Receiver       ○ off\n"), "{out}");
+        assert!(
+            out.contains("Receiver 1     ○ connected to Laptop, off\n"),
+            "{out}"
+        );
         assert!(out.contains("  ignored      42\n"), "{out}");
         assert!(
             out.contains("  Kitchen  192.168.1.20:5004 (off)  "),
@@ -1047,22 +1094,35 @@ Senders
     #[test]
     fn shows_connections() {
         let mut s: Status = serde_json::from_str(STATUS).unwrap();
-        let r = s.receiver.as_mut().unwrap();
-        r.accept = Some("connected".into());
+        let r = &mut s.receivers[0];
         r.output = Some("speaker".into());
+        r.plays_on = Some("Built-in Audio".into());
         r.sender = Some("Laptop".into());
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
-            out.contains("Receiver       ● receiving from Laptop\n"),
+            out.contains("Receiver 0     ● receiving from Laptop\n"),
             "{out}"
         );
-        assert!(out.contains("  accepts      connected senders\n"), "{out}");
-        assert!(out.contains("  output       speaker\n"), "{out}");
-        let r = s.receiver.as_mut().unwrap();
-        r.sender = None;
-        r.enabled = false;
+        assert!(
+            out.contains("  output       speaker (Built-in Audio)\n"),
+            "{out}"
+        );
+        let r = s.receivers[0].stream.as_mut().unwrap();
+        r.ssrc = None;
+        r.peak_dbfs = None;
         let out = render(&s, Paint(false), Counts::Total);
-        assert!(out.contains("Receiver       ○ not connected\n"), "{out}");
+        assert!(
+            out.contains("Receiver 0     ○ connected to Laptop, idle\n"),
+            "{out}"
+        );
+        assert!(out.contains("  level        silence\n"), "{out}");
+        s.receivers[0].sender = None;
+        s.accept = Some("any".into());
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("Receiver 0     ○ free, plays any sender\n"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1071,7 +1131,7 @@ Senders
         s.warnings.push(Warning {
             message: "sender 0: Kitchen is on Wi-Fi; expect dropouts".into(),
         });
-        s.receiver.as_mut().unwrap().jitter_us = Some(4210);
+        s.receivers[0].stream.as_mut().unwrap().jitter_us = Some(4210);
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
             out.contains("\nWarnings\n  ● sender 0: Kitchen is on Wi-Fi; expect dropouts\n"),
@@ -1113,13 +1173,13 @@ Senders
         let outputs: Vec<Output> = serde_json::from_str(
             r#"[
                 {"name":"alsa_output.pci-0000_00_1f.3.analog-stereo","description":"Built-in Audio",
-                 "type":"hifi","detected":"computer","override":"hifi","default":true,"receiver":true},
+                 "type":"hifi","detected":"computer","override":"hifi","default":true,"receivers":[0,2]},
                 {"name":"orpheus.send.0","description":"Kitchen","type":"speaker",
-                 "detected":"speaker","default":false,"receiver":false}
+                 "detected":"speaker","default":false,"receivers":[]}
             ]"#,
         )
         .unwrap();
-        let expected = "  OUTPUT          TYPE        NAME\n  Built-in Audio  hifi (set)  alsa_output.pci-0000_00_1f.3.analog-stereo  receiver, default\n  Kitchen         speaker     orpheus.send.0\n";
+        let expected = "  OUTPUT          TYPE        NAME\n  Built-in Audio  hifi (set)  alsa_output.pci-0000_00_1f.3.analog-stereo  receivers 0, 2, default\n  Kitchen         speaker     orpheus.send.0\n";
         assert_eq!(render_outputs(&outputs, Paint(false)), expected);
         assert_eq!(
             find_output(&outputs, "kitchen").unwrap().name,

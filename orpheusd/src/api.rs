@@ -14,7 +14,7 @@ use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
 use orpheus_core::DeviceId;
 use orpheus_discovery::Discovery;
-use orpheus_engine::{Engine, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
+use orpheus_engine::{Engine, ReceiverId, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
@@ -39,11 +39,8 @@ pub struct Node {
     /// Staged and active routing (IS-05). Lock it before the engine.
     pub connections: Mutex<crate::connection::Connections>,
     pub block_frames: Option<u32>,
-    /// UDP port the receiver listens on unless a connection asks for
-    /// another.
-    pub receiver_port: u16,
-    /// What the receiver plays while no sender is connected.
-    pub accept: Accept,
+    /// The receivers' settings.
+    pub receiver: crate::config::ReceiverConfig,
     /// The user's output types. Lock it last.
     pub outputs: Mutex<crate::outputs::Overrides>,
     /// Warnings about the network paths. Lock it last.
@@ -87,8 +84,10 @@ struct Status {
     clock: ClockInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     loopback: Option<StatsSnapshot>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    receiver: Option<ReceiverEntry>,
+    /// What a free receiver plays.
+    accept: Accept,
+    /// The receivers: one per connection and a free one.
+    receivers: Vec<ReceiverEntry>,
     senders: Vec<SenderEntry>,
     /// Problems with the network paths of the clock and the streams.
     warnings: Vec<crate::health::Warning>,
@@ -96,14 +95,21 @@ struct Status {
 
 #[derive(Serialize, ToSchema)]
 struct ReceiverEntry {
-    #[serde(flatten)]
-    status: ReceiverStatus,
-    /// What it plays while no sender is connected.
-    accept: Accept,
+    #[schema(value_type = u32)]
+    id: ReceiverId,
+    /// NMOS ID.
+    #[schema(value_type = String)]
+    uuid: orpheus_nmos::Uuid,
+    /// The UDP port it listens on, or will once connected.
+    port: u16,
     /// The sender connected to it: the name in its SDP file, else its
     /// address.
     #[serde(skip_serializing_if = "Option::is_none")]
     sender: Option<String>,
+    /// The running stream; absent while the receiver is free (unless
+    /// `accept` is `any`) or switched off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<ReceiverStatus>,
     /// The kind of output it plays on, as announced to other nodes.
     #[schema(value_type = String, example = "speaker")]
     output: OutputType,
@@ -134,8 +140,9 @@ struct OutputEntry {
     overridden: Option<OutputType>,
     /// Streams go here unless moved.
     default: bool,
-    /// The receiver plays here.
-    receiver: bool,
+    /// The receivers whose streams play here.
+    #[schema(value_type = Vec<u32>)]
+    receivers: Vec<ReceiverId>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -253,19 +260,43 @@ pub fn router(node: Arc<Node>) -> Router {
     responses((status = OK, description = "Node status", body = Status)),
 )]
 async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
-    let (sender, mut links) = {
+    let (ports, mut links) = {
         let conns = node.connections.lock().unwrap();
-        (conns.receiver_sender(), conns.peer_links())
+        let ports: Vec<(ReceiverId, u16, Option<String>)> = conns
+            .receiver_ids()
+            .into_iter()
+            .map(|id| {
+                let port = conns
+                    .receiver_active(id)
+                    .and_then(|a| a.transport_params.first()?.destination_port.value())
+                    .unwrap_or_default();
+                (id, port, conns.receiver_sender(id))
+            })
+            .collect();
+        (ports, conns.peer_links())
     };
     let engine = node.engine.as_ref().map(|e| e.lock().unwrap().status());
-    let engine = engine.unwrap_or_default();
+    let mut engine = engine.unwrap_or_default();
     let view = crate::outputs::View::of(&node);
-    let output = crate::outputs::receiver_type(&node);
-    let plays_on = view
-        .receiver
-        .as_deref()
-        .and_then(|n| view.find(n))
-        .map(|o| o.description.clone());
+    let receivers = ports
+        .into_iter()
+        .map(|(id, port, sender)| {
+            let stream = engine
+                .receivers
+                .iter()
+                .position(|(r, _)| *r == id)
+                .map(|i| engine.receivers.remove(i).1);
+            ReceiverEntry {
+                id,
+                uuid: crate::connection::receiver_uuid(&node, id),
+                port,
+                sender,
+                stream,
+                output: view.receiver_type(&node, id),
+                plays_on: view.receiver(id).map(|o| o.description.clone()),
+            }
+        })
+        .collect();
     Json(Status {
         id: node.id.to_string(),
         name: node.name.clone(),
@@ -282,17 +313,8 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
             },
         },
         loopback: engine.loopback,
-        receiver: engine
-            .receivers
-            .into_iter()
-            .next()
-            .map(|(_, status)| ReceiverEntry {
-                status,
-                accept: node.accept,
-                sender,
-                output,
-                plays_on,
-            }),
+        accept: node.receiver.accept,
+        receivers,
         senders: engine
             .senders
             .into_iter()
@@ -459,7 +481,12 @@ async fn outputs(State(node): State<Arc<Node>>) -> Json<Vec<OutputEntry>> {
                     detected,
                     overridden,
                     default: o.default,
-                    receiver: view.receiver.as_deref() == Some(o.name.as_str()),
+                    receivers: view
+                        .receivers
+                        .iter()
+                        .filter(|(_, name)| **name == o.name)
+                        .map(|(&id, _)| id)
+                        .collect(),
                 }
             })
             .collect()

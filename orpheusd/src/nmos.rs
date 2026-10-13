@@ -17,10 +17,11 @@ use axum::{Json, Router};
 use orpheus_clock::Timescale;
 use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
-use orpheus_engine::SenderId;
 use orpheus_engine::sender::PAYLOAD_TYPE;
+use orpheus_engine::{ReceiverId, SenderId};
 use orpheus_nmos::is04::{self, *};
 use orpheus_nmos::is05;
+use orpheus_nmos::is05::ReceiverParams;
 use orpheus_nmos::sdp::{self, RefClock};
 use orpheus_nmos::{Snapshot, Uuid, resource_id};
 
@@ -186,7 +187,11 @@ fn snapshot(node: &Node) -> Snapshot {
         .map(|e| e.lock().unwrap().status())
         .unwrap_or_default();
     let conns = node.connections.lock().unwrap();
-    let receiver_active = conns.receiver_active().cloned();
+    let receivers: Vec<(ReceiverId, ReceiverParams)> = conns
+        .receiver_ids()
+        .into_iter()
+        .filter_map(|id| Some((id, conns.receiver_active(id)?.clone())))
+        .collect();
     let sender_active: Vec<_> = engine
         .senders
         .iter()
@@ -229,13 +234,17 @@ fn snapshot(node: &Node) -> Snapshot {
         receivers: vec![],
     };
 
-    if !engine.receivers.is_empty() {
-        let mut base = Base::new(resource_id(dev, "receiver/0"), &node.name);
+    let view = crate::outputs::View::of(node);
+    for (id, active) in receivers {
+        let mut base = Base {
+            description: format!("receiver {id}"),
+            ..Base::new(resource_id(dev, &format!("receiver/{id}")), &node.name)
+        };
         base.tags.insert(
             TAG_FORM_FACTOR.into(),
-            vec![crate::outputs::receiver_type(node).as_str().into()],
+            vec![view.receiver_type(node, id).as_str().into()],
         );
-        if node.health.lock().unwrap().receiver_jitter() {
+        if node.health.lock().unwrap().receiver_jitter(id) {
             base.tags.insert(TAG_WARNINGS.into(), vec!["jitter".into()]);
         }
         snap.receivers.push(Receiver {
@@ -249,11 +258,8 @@ fn snapshot(node: &Node) -> Snapshot {
             interface_bindings: names.clone(),
             subscription: ReceiverSubscription {
                 // Parked receivers follow no sender.
-                sender_id: receiver_active
-                    .as_ref()
-                    .filter(|a| a.master_enable)
-                    .and_then(|a| a.sender_id),
-                active: receiver_active.as_ref().is_none_or(|a| a.master_enable),
+                sender_id: active.sender_id.filter(|_| active.master_enable),
+                active: active.master_enable,
             },
         });
     }
@@ -338,6 +344,7 @@ fn snapshot(node: &Node) -> Snapshot {
 pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
     let snap = refresh(node);
     let active = node.connections.lock().unwrap().sender_active(id)?.clone();
+    let node_id = node.id.to_string();
     let uuid = resource_id(node.id, &format!("sender/{id}"));
     let sender = snap.senders.iter().find(|s| s.base.id == uuid)?;
     let leg = active.transport_params.first()?;
@@ -370,6 +377,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         clock,
         // RTP timestamps count media-clock frames since the epoch.
         media_clock_offset: 0,
+        node: Some(&node_id),
     };
     Some(session.render())
 }

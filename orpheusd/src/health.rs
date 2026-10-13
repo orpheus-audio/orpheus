@@ -8,14 +8,14 @@
 //! sending node warns too. Wi-Fi further along the way (a wired node behind
 //! a wireless bridge) shows only as spread.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use orpheus_clock::ptp::PtpState;
 use orpheus_discovery::Link;
-use orpheus_engine::SenderId;
+use orpheus_engine::{ReceiverId, SenderId};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -78,13 +78,16 @@ pub struct Warning {
     /// The sender, for warnings on a sender.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sender: Option<SenderId>,
+    /// The receiver, for warnings on a receiver.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<ReceiverId>,
     /// What is wrong and what to do, for people.
     pub message: String,
 }
 
 impl Warning {
-    fn key(&self) -> (WarningKind, Subject, Option<SenderId>) {
-        (self.kind, self.on, self.sender)
+    fn key(&self) -> (WarningKind, Subject, Option<SenderId>, Option<ReceiverId>) {
+        (self.kind, self.on, self.sender, self.receiver)
     }
 }
 
@@ -99,20 +102,20 @@ impl Health {
         self.warnings.clone()
     }
 
-    /// Whether the receiver's packets arrive with a wide spread, which its
-    /// IS-04 resource tells the sending node.
-    pub fn receiver_jitter(&self) -> bool {
+    /// Whether receiver `id`'s packets arrive with a wide spread, which
+    /// its IS-04 resource tells the sending node.
+    pub fn receiver_jitter(&self, id: ReceiverId) -> bool {
         self.warnings
             .iter()
-            .any(|w| w.kind == WarningKind::Jitter && w.on == Subject::Receiver)
+            .any(|w| w.kind == WarningKind::Jitter && w.receiver == Some(id))
     }
 }
 
 /// What the checks remember between rounds.
 #[derive(Default)]
 struct State {
-    /// The receiver's spread over the last seconds, in µs.
-    jitter: VecDeque<i64>,
+    /// Each receiver's spread over the last seconds, in µs.
+    jitter: BTreeMap<ReceiverId, VecDeque<i64>>,
     /// The PTP step counter over the last minute.
     steps: VecDeque<(Instant, u64)>,
     link_checked: Option<Instant>,
@@ -154,18 +157,24 @@ fn check(node: &Node, state: &mut State) {
         .map(|d| d.nodes())
         .unwrap_or_default();
     let mut found = clock(node, state);
-    found.extend(receiver(node, state, &nodes));
+    found.extend(receivers(node, state, &nodes));
     found.extend(senders(node, &nodes));
 
     let mut health = node.health.lock().unwrap();
     for w in &found {
         if !health.warnings.iter().any(|o| o.key() == w.key()) {
-            tracing::warn!(on = ?w.on, sender = w.sender, "{}", w.message);
+            tracing::warn!(on = ?w.on, sender = w.sender, receiver = w.receiver, "{}", w.message);
         }
     }
     for w in &health.warnings {
         if !found.iter().any(|n| n.key() == w.key()) {
-            tracing::info!(on = ?w.on, sender = w.sender, "resolved: {}", w.message);
+            tracing::info!(
+                on = ?w.on,
+                sender = w.sender,
+                receiver = w.receiver,
+                "resolved: {}",
+                w.message
+            );
         }
     }
     health.warnings = found;
@@ -180,6 +189,7 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
         kind,
         on: Subject::Clock,
         sender: None,
+        receiver: None,
         message,
     };
     let mut found = vec![];
@@ -239,87 +249,86 @@ fn node_at(nodes: &[orpheus_discovery::Node], ip: IpAddr) -> Option<&orpheus_dis
     })
 }
 
-fn receiver(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
-    let Some(status) = node
+fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
+    let running = node
         .engine
         .as_ref()
-        .and_then(|e| e.lock().unwrap().status().receivers.into_iter().next())
-        .map(|(_, s)| s)
-    else {
-        return vec![];
-    };
-    let (leg, name) = {
-        let conns = node.connections.lock().unwrap();
-        let leg = conns
-            .receiver_active()
-            .filter(|a| a.master_enable)
-            .and_then(|a| a.transport_params.first().cloned());
-        (leg, conns.receiver_sender())
-    };
-    let warn = |kind, message| Warning {
-        kind,
-        on: Subject::Receiver,
-        sender: None,
-        message,
-    };
+        .map(|e| e.lock().unwrap().status().receivers)
+        .unwrap_or_default();
+    state
+        .jitter
+        .retain(|id, _| running.iter().any(|(r, _)| r == id));
     let mut found = vec![];
-    let from = name.unwrap_or_else(|| "the sender".into());
-    if let Some(leg) = &leg {
-        if let Some(group) = leg.multicast_ip {
-            if let Some(i) = wireless_to(group) {
+    for (id, status) in running {
+        let (leg, name) = {
+            let conns = node.connections.lock().unwrap();
+            let leg = conns
+                .receiver_active(id)
+                .filter(|a| a.master_enable)
+                .and_then(|a| a.transport_params.first().cloned());
+            (leg, conns.receiver_sender(id))
+        };
+        let warn = |kind, message| Warning {
+            kind,
+            on: Subject::Receiver,
+            sender: None,
+            receiver: Some(id),
+            message,
+        };
+        let from = name.unwrap_or_else(|| "the sender".into());
+        if let Some(leg) = &leg {
+            if let Some(group) = leg.multicast_ip {
+                if let Some(i) = wireless_to(group) {
+                    found.push(warn(
+                        WarningKind::MulticastWifi,
+                        format!(
+                            "receiver {id} joins multicast group {group} over Wi-Fi ({i}), \
+                             which the access point sends at its lowest rate to every \
+                             client; use a wired link or unicast"
+                        ),
+                    ));
+                }
+            } else if let Some(source) = leg.source_ip
+                && let Some(i) = wireless_to(source)
+            {
                 found.push(warn(
-                    WarningKind::MulticastWifi,
+                    WarningKind::Wifi,
                     format!(
-                        "the receiver joins multicast group {group} over Wi-Fi ({i}), \
-                         which the access point sends at its lowest rate to every client; \
-                         use a wired link or unicast"
+                        "receiver {id} gets {from} over Wi-Fi ({i}); expect dropouts \
+                         unless link_offset_ms is raised"
                     ),
                 ));
             }
-        } else if let Some(source) = leg.source_ip
-            && let Some(i) = wireless_to(source)
-        {
+            if let Some(peer) = leg
+                .source_ip
+                .and_then(|ip| node_at(nodes, ip))
+                .filter(|n| n.link == Some(Link::Wifi))
+            {
+                found.push(warn(
+                    WarningKind::PeerWifi,
+                    format!("{} sends to receiver {id} from Wi-Fi", peer.name),
+                ));
+            }
+        }
+
+        let jitter = state.jitter.entry(id).or_default();
+        jitter.push_back(status.jitter_us.unwrap_or(0));
+        while jitter.len() > JITTER_WINDOW {
+            jitter.pop_front();
+        }
+        let limit = (JITTER_LIMIT_MS * 1000.0) as i64;
+        let hits = jitter.iter().filter(|&&j| j > limit).count();
+        if hits >= JITTER_HITS {
+            let worst = jitter.iter().max().copied().unwrap_or(0) as f64 / 1000.0;
             found.push(warn(
-                WarningKind::Wifi,
+                WarningKind::Jitter,
                 format!(
-                    "the receiver gets {from} over Wi-Fi ({i}); expect dropouts unless \
-                     link_offset_ms is raised"
+                    "packets from {from} arrive spread over up to {worst:.1} ms, wired it \
+                     is well below {JITTER_LIMIT_MS} ms: Wi-Fi or a congested link on the \
+                     way; raise link_offset_ms if `late` rises"
                 ),
             ));
         }
-        if let Some(peer) = leg
-            .source_ip
-            .and_then(|ip| node_at(nodes, ip))
-            .filter(|n| n.link == Some(Link::Wifi))
-        {
-            found.push(warn(
-                WarningKind::PeerWifi,
-                format!("{} sends to the receiver from Wi-Fi", peer.name),
-            ));
-        }
-    }
-
-    let spread = if status.enabled {
-        status.jitter_us.unwrap_or(0)
-    } else {
-        0
-    };
-    state.jitter.push_back(spread);
-    while state.jitter.len() > JITTER_WINDOW {
-        state.jitter.pop_front();
-    }
-    let limit = (JITTER_LIMIT_MS * 1000.0) as i64;
-    let hits = state.jitter.iter().filter(|&&j| j > limit).count();
-    if hits >= JITTER_HITS {
-        let worst = state.jitter.iter().max().copied().unwrap_or(0) as f64 / 1000.0;
-        found.push(warn(
-            WarningKind::Jitter,
-            format!(
-                "packets from {from} arrive spread over up to {worst:.1} ms, wired it is \
-                 well below {JITTER_LIMIT_MS} ms: Wi-Fi or a congested link on the way; \
-                 raise link_offset_ms if `late` rises"
-            ),
-        ));
     }
     found
 }
@@ -342,6 +351,7 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
             kind,
             on: Subject::Sender,
             sender: Some(id),
+            receiver: None,
             message,
         };
         let dest = s.peer.ip();

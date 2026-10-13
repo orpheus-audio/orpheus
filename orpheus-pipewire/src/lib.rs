@@ -450,6 +450,10 @@ fn create_stream(
             props.insert(*pw::keys::MEDIA_NAME, spec.description.as_str());
             props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
             props.insert(*pw::keys::MEDIA_ROLE, "Music");
+            // The session manager keys what it restores on this first.
+            if let Some(key) = &spec.restore_key {
+                props.insert("application.id", key.as_str());
+            }
             if let Some(icon) = icon {
                 props.insert(*pw::keys::MEDIA_ICON_NAME, icon);
             }
