@@ -179,6 +179,10 @@ struct Link {
     /// What the peer's policy does to the stream, if it holds it back.
     #[serde(skip)]
     held: Option<PolicyState>,
+    /// Another sender took the peer's receiver, and this one has not
+    /// played since: it moves to a free receiver as soon as there is one.
+    #[serde(skip)]
+    displaced: bool,
     /// The kind of output the peer's receiver announces, which the sink
     /// shows unless overridden here.
     #[serde(default)]
@@ -457,7 +461,8 @@ pub fn add_sender(
 
 /// Connects this node to a peer, both ends: picks a free receiver there,
 /// starts a sender to it and connects the receiver to the sender. If the
-/// receiver refuses, the sender goes again.
+/// receiver refuses, the sender goes again. A second connection to the
+/// same peer is refused unless it has another priority.
 pub fn connect(
     node: &Node,
     peer: &str,
@@ -466,23 +471,31 @@ pub fn connect(
     priority: Priority,
 ) -> Result<Connected, Fail> {
     let found = peer::resolve(node, peer)?;
-    let ours: Vec<(SenderId, Uuid)> = node
-        .connections
-        .lock()
-        .unwrap()
-        .senders
-        .keys()
-        .map(|&n| (n, uuid_of(node, PortId::Sender(n))))
-        .collect();
+    let shown = found.name.clone().unwrap_or_else(|| peer.to_owned());
+    let ours: Vec<Uuid> = {
+        let conns = node.connections.lock().unwrap();
+        let same = conns.links.iter().find(|(_, l)| {
+            l.priority == priority && l.receiver.as_ref().is_some_and(|r| r.on(&found))
+        });
+        if let Some((n, _)) = same {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("already connected to {shown} as sender {n}"),
+            ));
+        }
+        conns
+            .senders
+            .keys()
+            .map(|&n| uuid_of(node, PortId::Sender(n)))
+            .collect()
+    };
     let target = peer::find_receiver(&found, &ours, force)?;
     let named = name.is_some();
-    let name = name
-        .or_else(|| found.name.clone())
-        .unwrap_or_else(|| peer.to_owned());
-    let destination = SocketAddr::new(found.ip, target.port);
+    let name = name.unwrap_or(shown);
     let to = PeerReceiver {
         api: found.api.clone(),
         id: target.receiver,
+        node: found.node.clone(),
     };
     let link = Link {
         named,
@@ -490,27 +503,131 @@ pub fn connect(
         state: PeerState::Connecting,
         jitter: false,
         held: None,
+        displaced: false,
         output: target.output,
         receiver: Some(to.clone()),
     };
-    let id = start_sender(node, destination, name.clone(), link)?;
-    let uuid = uuid_of(node, PortId::Sender(id));
-    let connected = nmos::sdp(node, id)
-        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no SDP file".into()))
-        .and_then(|sdp| peer::connect(&to, uuid, &sdp));
-    if let Err(e) = connected {
-        stop_sender(node, id)?;
-        return Err(e);
-    }
+    let id = start_sender(
+        node,
+        SocketAddr::new(found.ip, target.port),
+        name.clone(),
+        link,
+    )?;
+    let attached = attach(node, id, &to).and_then(|took| {
+        if took {
+            return Ok(target);
+        }
+        // Another sender connected the receiver at the same moment.
+        tracing::info!(
+            id,
+            "another sender took the peer's receiver; trying another"
+        );
+        let again = peer::find_receiver(&found, &ours, false)?;
+        let to = PeerReceiver {
+            id: again.receiver,
+            ..to.clone()
+        };
+        retarget(node, id, to.clone(), SocketAddr::new(found.ip, again.port))?;
+        match attach(node, id, &to)? {
+            true => Ok(again),
+            false => Err((
+                StatusCode::CONFLICT,
+                format!("other senders took {name}'s free receivers meanwhile; try again"),
+            )),
+        }
+    });
+    let target = match attached {
+        Ok(t) => t,
+        Err(e) => {
+            stop_sender(node, id)?;
+            return Err(e);
+        }
+    };
     if let Some(link) = node.connections.lock().unwrap().links.get_mut(&id) {
         link.state = PeerState::Connected;
     }
     Ok(Connected {
         id,
         name,
-        destination,
+        destination: SocketAddr::new(found.ip, target.port),
         receiver: target.receiver,
     })
+}
+
+/// Connects the peer's receiver `to` to sender `id`, then asks it whether
+/// it took: another sender may have connected it at the same moment. A
+/// receiver that cannot be asked counts as connected; the peer watch asks
+/// again.
+fn attach(node: &Node, id: SenderId, to: &PeerReceiver) -> Result<bool, Fail> {
+    let uuid = uuid_of(node, PortId::Sender(id));
+    let sdp =
+        nmos::sdp(node, id).ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no SDP file".into()))?;
+    peer::connect(to, uuid, &sdp)?;
+    Ok(peer::playing(to).map_or(true, |p| p.sender == Some(uuid)))
+}
+
+/// Points sender `id` at the peer's receiver `to` at `destination`, until
+/// [`attach`] connects that receiver.
+fn retarget(
+    node: &Node,
+    id: SenderId,
+    to: PeerReceiver,
+    destination: SocketAddr,
+) -> Result<(), Fail> {
+    let mut conns = node.connections.lock().unwrap();
+    let conns = &mut *conns;
+    let mut engine = lock_engine(node)?;
+    let port = conns
+        .senders
+        .get_mut(&id)
+        .ok_or((StatusCode::NOT_FOUND, format!("no sender {id}")))?;
+    port.cancel();
+    let mut params = port.requested.clone();
+    params.receiver_id = Some(to.id);
+    let leg = &mut params.transport_params[0];
+    leg.destination_ip = Auto::Value(destination.ip());
+    leg.destination_port = Auto::Value(destination.port());
+    let mut active = apply_sender(&mut engine, id, &params)?;
+    active.activation = Activation {
+        mode: Some(Mode::ActivateImmediate),
+        requested_time: None,
+        activation_time: Some(nmos::now()),
+    };
+    port.active = active;
+    port.staged = params.clone();
+    port.requested = params;
+    touch(node, PortId::Sender(id));
+    if let Some(link) = conns.links.get_mut(&id) {
+        link.receiver = Some(to);
+        link.state = PeerState::Connecting;
+        link.jitter = false;
+        link.held = None;
+    }
+    conns.save(Some(&engine));
+    Ok(())
+}
+
+/// Connects sender `id` to the peer's receiver `to` at `destination`
+/// instead of the one it had, and resumes it. If that fails, the sender
+/// stays paused, and the peer watch tries again.
+fn move_to(node: &Node, id: SenderId, to: PeerReceiver, destination: SocketAddr) -> bool {
+    let moved = retarget(node, id, to.clone(), destination).and_then(|()| attach(node, id, &to));
+    let ok = matches!(moved, Ok(true));
+    if let Err((_, e)) = &moved {
+        tracing::warn!(id, error = %e, "connecting the peer's receiver");
+    }
+    if let Some(link) = node.connections.lock().unwrap().links.get_mut(&id) {
+        link.displaced &= !ok;
+        link.state = if ok {
+            PeerState::Connected
+        } else {
+            PeerState::Disconnected
+        };
+    }
+    if let Some(engine) = &node.engine {
+        engine.lock().unwrap().pause_sender(id, !ok);
+    }
+    ok
 }
 
 fn start_sender(node: &Node, peer: SocketAddr, name: String, link: Link) -> Result<SenderId, Fail> {
@@ -588,8 +705,18 @@ pub fn update_sink_type(node: &Node, id: SenderId) {
 }
 
 /// How often a peer's receiver is asked anyway, also when discovery
-/// doesn't see the peer.
+/// doesn't see the peer, and how often a receiver's sender is asked whether
+/// it still sends.
 const RECHECK: Duration = Duration::from_secs(30);
+
+/// What the peer watch remembers between rounds.
+#[derive(Default)]
+struct Watch {
+    /// What it last saw of each sender's peer.
+    peers: BTreeMap<SenderId, Seen>,
+    /// When each receiver's sender was last asked.
+    sources: BTreeMap<ReceiverId, Instant>,
+}
 
 /// What the peer watch last saw of a sender's peer.
 #[derive(Default)]
@@ -601,26 +728,32 @@ struct Seen {
 
 /// Follows the peers' receivers the senders are connected to: their output
 /// type goes to the sender's sink, their name too unless the user named the
-/// sink, and a sender pauses while its receiver plays something else.
+/// sink, and a sender pauses while its receiver plays something else. A
+/// sender whose receiver another sender took moves to a free receiver of
+/// the peer if it has one, and a sender follows its peer to a new address.
 ///
 /// Each peer announces a receiver change counter over mDNS; it is asked
 /// again when that, its name or its presence changes, and every 30 seconds
 /// anyway, as mDNS may miss an update and doesn't see every peer.
+///
+/// The other way round, receivers connected to another Orpheus node's
+/// sender are freed once that sender is gone or sends elsewhere: its node
+/// may have dropped it while this node was offline.
 pub async fn watch_peers(node: Arc<Node>) {
-    let mut seen: BTreeMap<SenderId, Seen> = BTreeMap::new();
+    let mut watch = Watch::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let node = node.clone();
         match tokio::task::spawn_blocking(move || {
-            check_peers(&node, &mut seen);
-            seen
+            check_peers(&node, &mut watch);
+            watch
         })
         .await
         {
-            Ok(s) => seen = s,
-            Err(_) => seen = BTreeMap::new(),
+            Ok(w) => watch = w,
+            Err(_) => watch = Watch::default(),
         }
     }
 }
@@ -634,11 +767,17 @@ fn tend_receivers(node: &Node) {
     balance(node, &mut conns, &mut engine.lock().unwrap());
 }
 
-fn check_peers(node: &Node, seen: &mut BTreeMap<SenderId, Seen>) {
+fn check_peers(node: &Node, watch: &mut Watch) {
     tend_receivers(node);
+    let nodes = node
+        .discovery
+        .as_ref()
+        .map(|d| d.nodes())
+        .unwrap_or_default();
+    check_sources(node, &mut watch.sources, &nodes);
     let links: Vec<(SenderId, PeerReceiver)> = {
         let conns = node.connections.lock().unwrap();
-        seen.retain(|id, _| conns.links.contains_key(id));
+        watch.peers.retain(|id, _| conns.links.contains_key(id));
         conns
             .links
             .iter()
@@ -646,42 +785,219 @@ fn check_peers(node: &Node, seen: &mut BTreeMap<SenderId, Seen>) {
             .filter_map(|(&id, l)| Some((id, l.receiver.clone()?)))
             .collect()
     };
-    if links.is_empty() {
-        return;
-    }
-    let nodes = node
-        .discovery
-        .as_ref()
-        .map(|d| d.nodes())
-        .unwrap_or_default();
     for (id, to) in links {
-        let found = nodes.iter().find(|n| peer::serves(n, &to.api));
+        let by_id = to.node.as_ref().and_then(|dev| {
+            nodes
+                .iter()
+                .find(|n| n.online && n.id.as_ref() == Some(dev))
+        });
+        let found = by_id.or_else(|| nodes.iter().find(|n| peer::serves(n, &to.api)));
+        if let Some(n) = by_id.filter(|n| !peer::serves(n, &to.api))
+            && let Some((ip, api)) = peer::address(n)
+        {
+            follow(node, id, PeerReceiver { api, ..to }, ip, &n.name);
+            continue;
+        }
         let announced = found.map(|n| (n.online, n.name.clone(), n.receivers));
-        let last = seen.entry(id).or_default();
+        let last = watch.peers.entry(id).or_default();
         let due = announced != last.announced || last.asked.is_none_or(|t| t.elapsed() >= RECHECK);
         if !due {
             continue;
         }
         last.announced = announced;
         last.asked = Some(Instant::now());
+        if source_moved(node, id) {
+            tracing::info!(id, "this node's address changed; telling the peer");
+            if let Some(dest) = destination_of(node, id) {
+                move_to(node, id, to, dest);
+            }
+            continue;
+        }
         let playing = match found {
             Some(n) if !n.online => {
                 Err((StatusCode::BAD_GATEWAY, format!("{} is offline", n.name)))
             }
             _ => peer::playing(&to),
         };
-        update_link(node, id, &to, playing, found.map(|n| n.name.as_str()));
+        if update_link(node, id, &to, playing, found.map(|n| n.name.as_str())) {
+            reclaim(node, id, &to);
+        }
+    }
+}
+
+/// Where sender `id` sends to.
+fn destination_of(node: &Node, id: SenderId) -> Option<SocketAddr> {
+    let engine = node.engine.as_ref()?.lock().unwrap();
+    let (_, s) = engine
+        .status()
+        .senders
+        .into_iter()
+        .find(|(n, _)| *n == id)?;
+    Some(s.peer)
+}
+
+/// Whether sender `id` would now send from another address than the one
+/// its peer's receiver expects.
+fn source_moved(node: &Node, id: SenderId) -> bool {
+    let (requested, active) = {
+        let conns = node.connections.lock().unwrap();
+        let Some(p) = conns.senders.get(&id) else {
+            return false;
+        };
+        let leg = |p: &SenderParams| p.transport_params.first().map(|l| l.source_ip);
+        (leg(&p.requested), leg(&p.active))
+    };
+    let Some(Auto::Value(was)) = active.filter(|_| requested == Some(Auto::Auto)) else {
+        return false;
+    };
+    destination_of(node, id)
+        .and_then(nmos::route)
+        .is_some_and(|(now, _)| now != was)
+}
+
+/// Follows sender `id`'s peer to its new address.
+fn follow(node: &Node, id: SenderId, to: PeerReceiver, ip: IpAddr, name: &str) {
+    let Some(mut dest) = destination_of(node, id) else {
+        return;
+    };
+    tracing::info!(id, %ip, "{name} moved to another address; following it");
+    dest = SocketAddr::new(ip, dest.port());
+    move_to(node, id, to, dest);
+}
+
+/// Moves sender `id`, whose receiver another sender took, to a free
+/// receiver of the same peer; if it has none, the sender stays paused.
+fn reclaim(node: &Node, id: SenderId, from: &PeerReceiver) {
+    let Some(mut dest) = destination_of(node, id) else {
+        return;
+    };
+    let ours: Vec<Uuid> = node
+        .connections
+        .lock()
+        .unwrap()
+        .senders
+        .keys()
+        .map(|&n| uuid_of(node, PortId::Sender(n)))
+        .collect();
+    let peer = peer::Peer {
+        api: from.api.clone(),
+        ip: dest.ip(),
+        name: None,
+        node: from.node.clone(),
+    };
+    match peer::find_receiver(&peer, &ours, false) {
+        Ok(t) => {
+            dest.set_port(t.port);
+            let to = PeerReceiver {
+                id: t.receiver,
+                ..from.clone()
+            };
+            if move_to(node, id, to, dest) {
+                tracing::info!(id, receiver = %t.receiver, "moved to a free receiver of the peer; resuming");
+            }
+        }
+        Err((_, e)) => tracing::debug!(id, error = %e, "no free receiver to move to"),
+    }
+}
+
+/// Frees receivers whose Orpheus sender is gone or sends elsewhere, asking
+/// each sender's node every [`RECHECK`]. A node that cannot be reached
+/// keeps its receivers: it may be back soon.
+fn check_sources(
+    node: &Node,
+    asked: &mut BTreeMap<ReceiverId, Instant>,
+    nodes: &[orpheus_discovery::Node],
+) {
+    let connected: Vec<(ReceiverId, Uuid, String, Option<IpAddr>)> = {
+        let conns = node.connections.lock().unwrap();
+        conns
+            .receivers
+            .iter()
+            .filter(|(_, p)| p.active.master_enable && p.pending.is_none())
+            .filter_map(|(&id, p)| {
+                let sender = p.active.sender_id?;
+                let from = sdp::parse(p.active.transport_file.data.as_deref()?)
+                    .ok()?
+                    .node?;
+                let source = p.active.transport_params.first()?.source_ip;
+                Some((id, sender, from, source))
+            })
+            .collect()
+    };
+    asked.retain(|id, _| connected.iter().any(|c| c.0 == *id));
+    for (id, sender, from, source) in connected {
+        if asked.get(&id).is_some_and(|t| t.elapsed() < RECHECK) {
+            continue;
+        }
+        asked.insert(id, Instant::now());
+        let Ok(dev) = from.parse() else {
+            continue;
+        };
+        let api = nodes
+            .iter()
+            .find(|n| n.online && n.id.as_deref() == Some(&from))
+            .and_then(peer::address)
+            .map(|(_, api)| api)
+            .or_else(|| source.map(peer::api_at));
+        let Some(api) = api else {
+            continue;
+        };
+        match peer::still_sends(&api, dev, sender, receiver_uuid(node, id)) {
+            Ok(true) => {}
+            Ok(false) => free_receiver(node, id, sender),
+            Err((_, e)) => tracing::debug!(id, error = %e, "asking the receiver's sender"),
+        }
+    }
+}
+
+/// Disconnects receiver `id` from `sender`, unless something else
+/// connected it meanwhile.
+fn free_receiver(node: &Node, id: ReceiverId, sender: Uuid) {
+    let Some(engine) = &node.engine else {
+        return;
+    };
+    let mut conns = node.connections.lock().unwrap();
+    let conns = &mut *conns;
+    let mut engine = engine.lock().unwrap();
+    let Some(port) = conns
+        .receivers
+        .get_mut(&id)
+        .filter(|p| p.active.sender_id == Some(sender) && p.pending.is_none())
+    else {
+        return;
+    };
+    let params = free_params();
+    match apply_receiver(node, &mut engine, id, &params) {
+        Ok(mut active) => {
+            tracing::info!(
+                id,
+                "the receiver's sender is gone or sends elsewhere; freeing it"
+            );
+            active.activation = Activation {
+                mode: Some(Mode::ActivateImmediate),
+                requested_time: None,
+                activation_time: Some(nmos::now()),
+            };
+            port.active = active;
+            port.staged = params.clone();
+            port.requested = params;
+            touch(node, PortId::Receiver(id));
+            balance(node, conns, &mut engine);
+            conns.save(Some(&engine));
+        }
+        Err((_, e)) => tracing::warn!(id, error = %e, "freeing a receiver"),
     }
 }
 
 /// Takes in what a peer's receiver said, or that it couldn't be asked.
+/// True if the sender is displaced and should move to a free receiver.
 fn update_link(
     node: &Node,
     id: SenderId,
     to: &PeerReceiver,
     playing: Result<peer::Playing, Fail>,
     name: Option<&str>,
-) {
+) -> bool {
     let ours = uuid_of(node, PortId::Sender(id));
     let mut conns = node.connections.lock().unwrap();
     let Some(link) = conns
@@ -689,7 +1005,7 @@ fn update_link(
         .get_mut(&id)
         .filter(|l| l.receiver.as_ref() == Some(to) && l.state != PeerState::Connecting)
     else {
-        return;
+        return false;
     };
     let was = link.state;
     let mut changed = false;
@@ -708,6 +1024,13 @@ fn update_link(
                 tracing::info!(id, held = ?p.held, "the peer's policy changed what it does to the stream");
                 link.held = p.held;
             }
+            // A receiver that plays nothing was released on purpose, unless
+            // the sender was displaced before.
+            match p.sender {
+                Some(s) if s == ours => link.displaced = false,
+                Some(_) => link.displaced = true,
+                None => {}
+            }
             link.state = if p.sender == Some(ours) {
                 PeerState::Connected
             } else {
@@ -721,16 +1044,20 @@ fn update_link(
         }
     }
     let state = link.state;
+    let displaced = link.displaced && state == PeerState::Disconnected;
     let rename = name.filter(|_| !link.named).map(str::to_owned);
     let remote = sink_type(node, id, link);
     let Some(engine) = &node.engine else {
-        return;
+        return displaced;
     };
     let mut engine = engine.lock().unwrap();
     if state != was {
         match state {
             PeerState::Disconnected => {
-                tracing::warn!(id, "the peer's receiver plays another sender; pausing")
+                tracing::warn!(
+                    id,
+                    "the peer's receiver plays another sender or none; pausing"
+                )
             }
             PeerState::Connected if was == PeerState::Disconnected => {
                 tracing::info!(id, "the peer's receiver plays the sender again; resuming")
@@ -759,6 +1086,7 @@ fn update_link(
     if changed {
         conns.save(Some(&engine));
     }
+    displaced
 }
 
 /// Stops a sender, here only.

@@ -5,7 +5,9 @@
 //! Wi-Fi is seen directly on this node's own interfaces and through the
 //! link each peer announces over mDNS. Spread is measured by the receiver;
 //! its warning goes into the receiver's IS-04 resource, so that the
-//! sending node warns too. Wi-Fi further along the way (a wired node behind
+//! sending node warns too. It is not checked while the PTP clock settles
+//! or for ten seconds after it stepped, as moving the clock
+//! moves the arrival times measured with it. Wi-Fi further along the way (a wired node behind
 //! a wireless bridge) shows only as spread.
 
 use std::collections::{BTreeMap, VecDeque};
@@ -118,6 +120,8 @@ struct State {
     jitter: BTreeMap<ReceiverId, VecDeque<i64>>,
     /// The PTP step counter over the last minute.
     steps: VecDeque<(Instant, u64)>,
+    /// When the PTP clock was last unsettled or stepped.
+    unsteady: Option<Instant>,
     link_checked: Option<Instant>,
 }
 
@@ -217,6 +221,9 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
     }
 
     let now = Instant::now();
+    if !s.settled || state.steps.back().is_some_and(|(_, n)| *n != s.steps) {
+        state.unsteady = Some(now);
+    }
     state.steps.push_back((now, s.steps));
     while state
         .steps
@@ -258,6 +265,9 @@ fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) 
     state
         .jitter
         .retain(|id, _| running.iter().any(|(r, _)| r == id));
+    let clock_moved = state
+        .unsteady
+        .is_some_and(|t| t.elapsed() < Duration::from_secs(JITTER_WINDOW as u64));
     let mut found = vec![];
     for (id, status) in running {
         let (leg, name) = {
@@ -311,6 +321,11 @@ fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) 
             }
         }
 
+        // A clock that moves shifts the arrival times it measures.
+        if clock_moved {
+            state.jitter.remove(&id);
+            continue;
+        }
         let jitter = state.jitter.entry(id).or_default();
         jitter.push_back(status.jitter_us.unwrap_or(0));
         while jitter.len() > JITTER_WINDOW {

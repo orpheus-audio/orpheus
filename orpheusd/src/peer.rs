@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use orpheus_core::{DeviceId, OutputType};
 use orpheus_nmos::is04::{TAG_FORM_FACTOR, TAG_STATE, TAG_WARNINGS};
-use orpheus_nmos::{Uuid, is05};
+use orpheus_nmos::{Uuid, is05, resource_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -36,6 +36,8 @@ pub struct Peer {
     pub ip: IpAddr,
     /// Its name, if discovery knows it.
     pub name: Option<String>,
+    /// Its Orpheus device ID, if discovery knows it.
+    pub node: Option<String>,
 }
 
 /// One of a peer's receivers, chosen to play a sender of ours.
@@ -54,6 +56,17 @@ pub struct PeerReceiver {
     /// Base URL of the node's API.
     pub api: String,
     pub id: Uuid,
+    /// The node's Orpheus device ID, to find it again when its address
+    /// changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+impl PeerReceiver {
+    /// Whether it is on the node `peer`.
+    pub fn on(&self, peer: &Peer) -> bool {
+        self.api == peer.api || (self.node.is_some() && self.node == peer.node)
+    }
 }
 
 fn agent() -> ureq::Agent {
@@ -87,8 +100,10 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
         let authority = rest.split('/').next().unwrap_or(rest);
         let (host, _) = crate::api::split_host_port(authority)
             .ok_or_else(|| bad(format!("bad URL {peer:?}")))?;
+        let api = peer.trim_end_matches('/').to_owned();
         return Ok(Peer {
-            api: peer.trim_end_matches('/').to_owned(),
+            node: announced_at(node, &api),
+            api,
             ip: lookup(host).map_err(bad)?,
             name: None,
         });
@@ -106,16 +121,13 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
         })
     });
     if let Some(n) = found {
-        // Addresses come IPv4 first, link-local IPv6 last.
-        let ip = n
-            .addresses
-            .iter()
-            .find_map(|a| a.parse::<IpAddr>().ok())
-            .ok_or_else(|| bad(format!("{} has no usable address", n.name)))?;
+        let (ip, api) =
+            address(&n).ok_or_else(|| bad(format!("{} has no usable address", n.name)))?;
         return Ok(Peer {
-            api: format!("http://{}", SocketAddr::new(ip, n.port)),
+            api,
             ip,
             name: Some(n.name),
+            node: n.id,
         });
     }
 
@@ -127,11 +139,32 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
         )));
     }
     let ip = lookup(host).map_err(bad)?;
+    let api = api_at(ip);
     Ok(Peer {
-        api: format!("http://{}", SocketAddr::new(ip, API_PORT)),
+        node: announced_at(node, &api),
+        api,
         ip,
         name: None,
     })
+}
+
+/// The URL of the API of the node at `ip`, if it listens on the usual port.
+pub fn api_at(ip: IpAddr) -> String {
+    format!("http://{}", SocketAddr::new(ip, API_PORT))
+}
+
+/// Where to reach a node discovery sees: its first usable address and the
+/// URL of its API there.
+pub fn address(n: &orpheus_discovery::Node) -> Option<(IpAddr, String)> {
+    // Addresses come IPv4 first, link-local IPv6 last.
+    let ip = n.addresses.iter().find_map(|a| a.parse::<IpAddr>().ok())?;
+    Some((ip, format!("http://{}", SocketAddr::new(ip, n.port))))
+}
+
+/// The device ID of the node discovery sees serving `api`.
+fn announced_at(node: &Node, api: &str) -> Option<String> {
+    let d = node.discovery.as_ref()?;
+    d.nodes().into_iter().find(|n| serves(n, api))?.id
 }
 
 /// A host's address, IPv4 preferred.
@@ -185,9 +218,9 @@ fn patch_receiver(api: &str, receiver: Uuid, body: &Value) -> Result<(), Fail> {
 }
 
 /// Picks a receiver on `peer` that plays our format and has no sender, or
-/// with `force`, one that has. `ours` names our senders, to tell the user
-/// when one of them already holds the receiver.
-pub fn find_receiver(peer: &Peer, ours: &[(u32, Uuid)], force: bool) -> Result<Target, Fail> {
+/// with `force`, one that plays another node's sender. `ours` are our
+/// senders, whose receivers are never taken.
+pub fn find_receiver(peer: &Peer, ours: &[Uuid], force: bool) -> Result<Target, Fail> {
     let receivers = get(&peer.api, "/x-nmos/node/v1.3/receivers")?;
     let receivers = receivers.as_array().cloned().unwrap_or_default();
     let fits = |r: &&Value| {
@@ -201,28 +234,27 @@ pub fn find_receiver(peer: &Peer, ours: &[(u32, Uuid)], force: bool) -> Result<T
     };
     let fitting: Vec<&Value> = receivers.iter().filter(fits).collect();
     let name = peer.name.as_deref().unwrap_or(&peer.api);
+    if fitting.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("{name} has no receiver for L24/48000/2 over RTP"),
+        ));
+    }
     let chosen = match fitting.iter().find(|r| holder(r).is_none()) {
         Some(r) => r,
-        None => {
-            let first = fitting.first().ok_or((
+        None if !force => {
+            return Err((
                 StatusCode::CONFLICT,
-                format!("{name} has no receiver for L24/48000/2 over RTP"),
-            ))?;
-            let held = holder(first);
-            if let Some((n, _)) = ours.iter().find(|(_, u)| Some(*u) == held) {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!("already connected to {name} as sender {n}"),
-                ));
-            }
-            if !force {
-                return Err((
-                    StatusCode::CONFLICT,
-                    format!("{name} is playing another sender; force takes it over"),
-                ));
-            }
-            first
+                format!("{name} is playing another sender; force takes it over"),
+            ));
         }
+        None => fitting
+            .iter()
+            .find(|r| holder(r).is_none_or(|h| !ours.contains(&h)))
+            .ok_or((
+                StatusCode::CONFLICT,
+                format!("all of {name}'s receivers play senders of this node"),
+            ))?,
     };
     let receiver: Uuid = chosen["id"]
         .as_str()
@@ -293,6 +325,27 @@ pub fn playing(of: &PeerReceiver) -> Result<Playing, Fail> {
     })
 }
 
+/// Whether a node's sender `sender` still sends to our receiver `ours`:
+/// false once the sender is gone or connected to another receiver.
+/// `node` is the sending node's device ID; the node at `api` must be it.
+pub fn still_sends(api: &str, node: DeviceId, sender: Uuid, ours: Uuid) -> Result<bool, Fail> {
+    let this = get(api, "/x-nmos/node/v1.3/self")?;
+    if this["id"].as_str().and_then(|i| i.parse().ok()) != Some(resource_id(node, "node")) {
+        return Err(gateway(api, format!("not node {node}")));
+    }
+    let url = format!("{api}/x-nmos/node/v1.3/senders/{sender}");
+    let mut r = agent().get(&url).call().map_err(|e| unreachable(api, e))?;
+    if r.status() == StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !r.status().is_success() {
+        return Err(gateway(&url, r.status()));
+    }
+    let s: Value = r.body_mut().read_json().map_err(|e| gateway(&url, e))?;
+    let receiver = s["subscription"]["receiver_id"].as_str();
+    Ok(receiver.is_none_or(|r| r.parse() == Ok(ours)))
+}
+
 /// Whether discovery's `node` is the node whose API is at `api`.
 pub fn serves(node: &orpheus_discovery::Node, api: &str) -> bool {
     node.addresses
@@ -340,4 +393,28 @@ pub fn release(from: &PeerReceiver, sender: Uuid) -> Result<(), Fail> {
             "transport_params": [{"source_ip": null, "multicast_ip": null}],
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receivers_belong_to_their_node_at_any_address() {
+        let peer = |api: &str, node: Option<&str>| Peer {
+            api: api.into(),
+            ip: [10, 0, 0, 2].into(),
+            name: None,
+            node: node.map(Into::into),
+        };
+        let r = |node: Option<&str>| PeerReceiver {
+            api: "http://10.0.0.2:7480".into(),
+            id: Uuid::nil(),
+            node: node.map(Into::into),
+        };
+        assert!(r(None).on(&peer("http://10.0.0.2:7480", None)));
+        assert!(r(Some("B73AQ0P0")).on(&peer("http://10.0.0.9:7480", Some("B73AQ0P0"))));
+        assert!(!r(Some("B73AQ0P0")).on(&peer("http://10.0.0.9:7480", Some("C00000P0"))));
+        assert!(!r(None).on(&peer("http://10.0.0.9:7480", None)));
+    }
 }

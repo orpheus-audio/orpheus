@@ -378,7 +378,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
     responses(
         (status = CREATED, description = "Sender started", body = Created),
         (status = BAD_REQUEST, description = "The peer does not resolve", body = String, content_type = "text/plain"),
-        (status = CONFLICT, description = "The peer has no free receiver", body = String, content_type = "text/plain"),
+        (status = CONFLICT, description = "The peer has no free receiver, or this node is already connected to it with the same priority", body = String, content_type = "text/plain"),
         (status = BAD_GATEWAY, description = "The peer cannot be reached or refused the connection", body = String, content_type = "text/plain"),
         (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
         (status = INTERNAL_SERVER_ERROR, description = "Creating the sink failed", body = String, content_type = "text/plain"),
