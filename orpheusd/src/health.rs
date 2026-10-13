@@ -243,7 +243,8 @@ fn receiver(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) -
     let Some(status) = node
         .engine
         .as_ref()
-        .and_then(|e| e.lock().unwrap().status().receiver)
+        .and_then(|e| e.lock().unwrap().status().receivers.into_iter().next())
+        .map(|(_, s)| s)
     else {
         return vec![];
     };

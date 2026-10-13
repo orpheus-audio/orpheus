@@ -282,13 +282,17 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
             },
         },
         loopback: engine.loopback,
-        receiver: engine.receiver.map(|status| ReceiverEntry {
-            status,
-            accept: node.accept,
-            sender,
-            output,
-            plays_on,
-        }),
+        receiver: engine
+            .receivers
+            .into_iter()
+            .next()
+            .map(|(_, status)| ReceiverEntry {
+                status,
+                accept: node.accept,
+                sender,
+                output,
+                plays_on,
+            }),
         senders: engine
             .senders
             .into_iter()

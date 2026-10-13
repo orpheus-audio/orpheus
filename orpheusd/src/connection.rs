@@ -306,7 +306,7 @@ pub fn restore(node: &Node) {
     };
     let mut engine = engine.lock().unwrap();
 
-    if engine.status().receiver.is_some() {
+    if !engine.status().receivers.is_empty() {
         let params = saved.receiver.unwrap_or_else(|| ReceiverParams {
             sender_id: None,
             master_enable: true,
@@ -765,15 +765,17 @@ fn apply_receiver(
 ) -> Result<ReceiverParams, Fail> {
     let leg = &p.transport_params[0];
     let port = leg.destination_port.value().unwrap_or(node.receiver_port);
-    engine.set_receiver_port(port).map_err(|e| {
+    engine.set_receiver_port(0, port).map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("listening on port {port}: {e}"),
         )
     })?;
-    let status = engine
+    let (_, status) = engine
         .status()
-        .receiver
+        .receivers
+        .into_iter()
+        .next()
         .ok_or((StatusCode::NOT_FOUND, "no receiver".to_string()))?;
     let stream = match &p.transport_file.data {
         Some(data) => Some(sdp::parse(data).map_err(bad)?),
@@ -796,14 +798,17 @@ fn apply_receiver(
         interface: interface_ip,
     });
     engine
-        .set_receiver_filter(Filter {
-            enabled: p.master_enable
-                && leg.rtp_enabled
-                && (connected || node.accept == Accept::Any),
-            source: leg.source_ip,
-            payload_type,
-            group,
-        })
+        .set_receiver_filter(
+            0,
+            Filter {
+                enabled: p.master_enable
+                    && leg.rtp_enabled
+                    && (connected || node.accept == Accept::Any),
+                source: leg.source_ip,
+                payload_type,
+                group,
+            },
+        )
         .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -814,7 +819,7 @@ fn apply_receiver(
     let name = stream
         .map(|s| s.name)
         .filter(|n| connected && !n.is_empty() && n != "-");
-    engine.set_receiver_description(name.as_deref());
+    engine.set_receiver_description(0, name.as_deref());
     let interface_ip = interface_ip.unwrap_or(status.listen.ip());
     Ok(ReceiverParams {
         transport_params: vec![ReceiverTransport {

@@ -8,6 +8,12 @@
 //! sender plays at the same time everywhere; the link offset must cover
 //! packetization, network delay and the error between the nodes' clocks.
 //!
+//! Before the resampler, the audio passes a gain, which fades over
+//! [`RAMP_MS`] to the target set with [`Receiver::set_gain`], and a meter,
+//! which notes when the stream last carried sound (above
+//! [`SOUND_THRESHOLD`]), so that the node can decide which of its receivers
+//! to hear.
+//!
 //! The receiver follows one stream (SSRC) at a time and switches to another
 //! once the current one has been quiet for [`SWITCH_AFTER_MS`]. A [`Filter`]
 //! limits it to one source and payload type, or switches it off. Listening
@@ -15,7 +21,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -38,6 +44,12 @@ const BUFFER_MS: u32 = 4;
 
 pub const SWITCH_AFTER_MS: u64 = 1000;
 
+/// How long a gain change takes from silence to full volume.
+pub const RAMP_MS: u32 = 30;
+
+/// The peak level that counts as sound, -60 dBFS.
+pub const SOUND_THRESHOLD: f32 = 0.001;
+
 const NO_MARGIN: i64 = i64::MAX;
 const NO_SSRC: u64 = u64::MAX;
 
@@ -54,6 +66,8 @@ pub struct ReceiverConfig {
     /// Playout delay after the media-clock time in the RTP timestamp.
     pub link_offset_ms: u32,
     pub block_frames: Option<u32>,
+    /// The gain to start with, 0 to 1.
+    pub gain: f32,
 }
 
 /// Which packets the receiver plays.
@@ -137,6 +151,10 @@ struct Counters {
     jitter_us: AtomicI64,
     /// `f64` bits.
     asrc_ppm: AtomicU64,
+    /// Peak over the last second, `f32` bits.
+    peak: AtomicU32,
+    /// Clock time of the last block with sound; 0 for never.
+    sound_ns: AtomicU64,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -176,6 +194,14 @@ pub struct ReceiverStatus {
     pub asrc_ppm: f64,
     /// The buffer between the RX thread and the playback stream.
     pub buffer: StatsSnapshot,
+    /// Peak level over the last second, before the gain, in dBFS; `None`
+    /// for digital silence.
+    pub peak_dbfs: Option<f32>,
+    /// Time since the stream last carried sound, in milliseconds; `None`
+    /// if it never did.
+    pub silent_ms: Option<u64>,
+    /// The gain the receiver fades to, 0 to 1.
+    pub gain: f32,
 }
 
 /// Binds the receive socket. `[::]` also accepts IPv4 (as IPv4-mapped
@@ -204,6 +230,9 @@ pub(crate) struct Receiver {
     socket: Mutex<UdpSocket>,
     counters: Arc<Counters>,
     buffer: Arc<PortStats>,
+    /// Target gain, `f32` bits.
+    gain: Arc<AtomicU32>,
+    clock: Arc<dyn Clock>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     playback: StreamHandle,
@@ -245,14 +274,17 @@ impl Receiver {
             margin_us: AtomicI64::new(NO_MARGIN),
             jitter_us: AtomicI64::new(NO_MARGIN),
             asrc_ppm: AtomicU64::new(0f64.to_bits()),
+            peak: AtomicU32::new(0f32.to_bits()),
+            sound_ns: AtomicU64::new(0),
         });
+        let gain = Arc::new(AtomicU32::new(cfg.gain.to_bits()));
         let stop = Arc::new(AtomicBool::new(false));
         let filter = Arc::new(SharedFilter::default());
         let offset = format.frames_in_ms(cfg.link_offset_ms) as u64;
         let rx = Rx {
             port: capture,
             socket,
-            clock,
+            clock: clock.clone(),
             format,
             encoding: cfg.encoding,
             media: MediaClock::new(format.rate),
@@ -278,6 +310,10 @@ impl Receiver {
             ),
             buffer: buffer.clone(),
             counters: counters.clone(),
+            target_gain: gain.clone(),
+            gain: cfg.gain,
+            gain_step: 1.0 / format.frames_in_ms(RAMP_MS) as f32,
+            peak: 0.0,
         };
         let thread = thread::Builder::new().name("orpheus-rx".into()).spawn({
             let stop = stop.clone();
@@ -291,6 +327,8 @@ impl Receiver {
             socket: Mutex::new(membership),
             counters,
             buffer,
+            gain,
+            clock,
             stop,
             thread: Some(thread),
             playback,
@@ -318,6 +356,11 @@ impl Receiver {
     pub fn describe(&self, description: Option<&str>) {
         self.playback
             .describe(description.unwrap_or(&self.description));
+    }
+
+    /// Fades to `gain` (0 to 1) over up to [`RAMP_MS`].
+    pub fn set_gain(&self, gain: f32) {
+        self.gain.store(gain.clamp(0.0, 1.0).to_bits(), Relaxed);
     }
 
     /// The output the playback stream plays on, if known.
@@ -354,6 +397,8 @@ impl Receiver {
         let ssrc = c.ssrc.load(Relaxed);
         let margin = c.margin_us.load(Relaxed);
         let jitter = c.jitter_us.load(Relaxed);
+        let peak = f32::from_bits(c.peak.load(Relaxed));
+        let sound = c.sound_ns.load(Relaxed);
         ReceiverStatus {
             listen: self.listen(),
             link_offset_ms: self.link_offset_ms,
@@ -370,6 +415,9 @@ impl Receiver {
             jitter_us: (jitter != NO_MARGIN).then_some(jitter),
             asrc_ppm: f64::from_bits(c.asrc_ppm.load(Relaxed)),
             buffer: self.buffer.snapshot(),
+            peak_dbfs: (peak > 0.0).then(|| 20.0 * peak.log10()),
+            silent_ms: (sound != 0).then(|| self.clock.now_ns().saturating_sub(sound) / 1_000_000),
+            gain: f32::from_bits(self.gain.load(Relaxed)),
         }
     }
 }
@@ -411,6 +459,13 @@ struct Rx {
     asrc: Asrc,
     buffer: Arc<PortStats>,
     counters: Arc<Counters>,
+    target_gain: Arc<AtomicU32>,
+    /// The gain applied to the last frame.
+    gain: f32,
+    /// How far the gain moves per frame.
+    gain_step: f32,
+    /// Peak over the current one-second window.
+    peak: f32,
 }
 
 impl Rx {
@@ -441,6 +496,8 @@ impl Rx {
             }
             let ts = grid.next().wrapping_sub(self.offset) as u32;
             self.jitter.read(ts, &mut block);
+            self.meter(&block, now);
+            self.apply_gain(&mut block);
             let n = self.asrc.process(&block, &mut resampled);
             self.port.push(&resampled[..n * ch]);
             self.asrc.control(
@@ -452,7 +509,7 @@ impl Rx {
                 .asrc_ppm
                 .store(self.asrc.correction_ppm().to_bits(), Relaxed);
             grid.advance();
-            self.publish_margin(now);
+            self.publish_window(now);
         }
     }
 
@@ -551,7 +608,35 @@ impl Rx {
         self.counters.ssrc.store(NO_SSRC, Relaxed);
     }
 
-    fn publish_margin(&mut self, now: u64) {
+    /// Notes the block's peak and whether it carries sound.
+    fn meter(&mut self, block: &[f32], now: u64) {
+        let peak = block.iter().fold(0.0f32, |p, s| p.max(s.abs()));
+        self.peak = self.peak.max(peak);
+        if peak > SOUND_THRESHOLD {
+            self.counters.sound_ns.store(now.max(1), Relaxed);
+        }
+    }
+
+    /// Applies the gain, moving it towards the target frame by frame.
+    fn apply_gain(&mut self, block: &mut [f32]) {
+        let target = f32::from_bits(self.target_gain.load(Relaxed));
+        if self.gain == target && target == 1.0 {
+            return;
+        }
+        let ch = self.format.channels as usize;
+        for frame in block.chunks_exact_mut(ch) {
+            self.gain = if self.gain < target {
+                (self.gain + self.gain_step).min(target)
+            } else {
+                (self.gain - self.gain_step).max(target)
+            };
+            for s in frame {
+                *s *= self.gain;
+            }
+        }
+    }
+
+    fn publish_window(&mut self, now: u64) {
         if now.saturating_sub(self.window.start_ns) < 1_000_000_000 {
             return;
         }
@@ -562,6 +647,9 @@ impl Rx {
             .map_or(NO_MARGIN, |(min, max)| (max - min) / 1000);
         self.counters.margin_us.store(margin, Relaxed);
         self.counters.jitter_us.store(jitter, Relaxed);
+        self.counters
+            .peak
+            .store(std::mem::take(&mut self.peak).to_bits(), Relaxed);
         self.window.start_ns = now;
     }
 }

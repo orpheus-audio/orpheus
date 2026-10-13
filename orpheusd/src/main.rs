@@ -274,15 +274,19 @@ fn start_engine(
     if rx.enabled {
         let listen = SocketAddr::from(([0u16; 8], rx.port));
         engine
-            .start_receiver(&ReceiverConfig {
-                name: "orpheus.receive".into(),
-                description: "Orpheus".into(),
-                format: AudioFormat::AES67,
-                encoding: Encoding::L24,
-                listen,
-                link_offset_ms: rx.link_offset_ms,
-                block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
-            })
+            .start_receiver(
+                0,
+                &ReceiverConfig {
+                    name: "orpheus.receive".into(),
+                    description: "Orpheus".into(),
+                    format: AudioFormat::AES67,
+                    encoding: Encoding::L24,
+                    listen,
+                    link_offset_ms: rx.link_offset_ms,
+                    block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
+                    gain: 1.0,
+                },
+            )
             .map_err(|e| anyhow!(e))
             .with_context(|| format!("starting receiver on {listen}"))?;
         tracing::info!(%listen, link_offset_ms = rx.link_offset_ms, "receiver running");

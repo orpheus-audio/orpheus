@@ -13,7 +13,7 @@ pub mod receiver;
 pub mod sender;
 
 pub use backend::{AudioBackend, BackendError, Output, StreamControl, StreamHandle, StreamSpec};
-pub use engine::{Engine, EngineStatus, LoopbackConfig, SenderId};
+pub use engine::{Engine, EngineStatus, LoopbackConfig, ReceiverId, SenderId};
 pub use port::{CapturePort, PlaybackPort, PortStats, StatsSnapshot, port_pair};
-pub use receiver::{Filter, Group, ReceiverConfig, ReceiverStatus};
+pub use receiver::{Filter, Group, RAMP_MS, ReceiverConfig, ReceiverStatus, SOUND_THRESHOLD};
 pub use sender::{Route, SenderConfig, SenderStatus};

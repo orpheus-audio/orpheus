@@ -11,7 +11,7 @@
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
 | M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl`, output types | done, except interop tests |
-| M5 | Receiver pool and policy: one receiver per connection, mixing policies (mix, first sender wins, last sender wins) and ducking; pinned peers, aliases, route restore on reconnect, per-sender gains; sample-rate changes | planned |
+| M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes | in progress |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
 After M6 the API should be stable enough for the web UI.
@@ -220,20 +220,37 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 ### Receiver pool and policies
 
-Planned for M5:
+Planned for M5. The receiving node decides what it plays: a sender always
+connects to a free receiver, and the node's policy only sets each stream's
+volume. Connections are never refused or taken over because of the policy.
 
 - **One receiver per connection.** A node advertises one NMOS receiver more
-  than it has connections, so there is always a free one, up to about
-  eight. Each listens on its own port (5004, 5006, …; firewalls should allow
+  than it has connections, so there is always a free one, up to `[receiver]
+  max` (8). Receiver *k* listens on port 5004 + 2*k* (firewalls should allow
   5004–5018) and has its own playback stream, named after its sender and
-  created only while it is connected. PipeWire sums the streams, so mixing
-  costs nothing extra, and an idle node keeps no stream running.
-- **Policies**, set per node: `mix` plays every connection; `first` (first
-  sender wins) refuses new connections while one plays; `last` (last sender
-  wins) mutes or drops the older one. Implemented as per-stream volumes, so
-  ducking (lowering the others while one plays) fits the same model.
-- With `accept = "any"`, the free receiver also plays unconnected streams,
-  as the single receiver does now.
+  running only while it is connected (with `accept = "any"`, the free
+  receiver runs too and plays unconnected streams). PipeWire sums the
+  streams, so mixing costs nothing extra. WirePlumber remembers each stream's
+  volume and output per sending node.
+- **Policies**, set per node with `[receiver] policy`: `last` (the default)
+  plays whoever started playing most recently and fades the others out; when
+  it stops, the one before comes back. `first` keeps playing whoever started
+  first until it stops. `mix` plays everything. "Playing" means sound above
+  -60 dBFS within the last 5 s, not merely a connection, so a paused phone
+  doesn't block the speaker. A muted sender shows `muted by policy`.
+- **Ducking.** A connection can have priority `high` (`connect --priority
+  high`, for a doorbell or announcements). While a high-priority stream
+  plays, all others are lowered by `[receiver] duck_db`; the policy applies
+  among the normal ones.
+- **Following peers.** A sender follows its peer by node ID when its
+  address changes, takes a free receiver again when its own was taken over,
+  and checks after connecting that it won a race for the receiver. A
+  receiver whose sender no longer exists is freed.
+- **Pins and aliases.** A node can pin peers, which stay listed while
+  offline, and give them local names, which name their sinks.
+
+Sample-rate changes come with the AES67 extended mode (44.1, 96 kHz), as the
+native format is fixed.
 
 ### Graphs
 

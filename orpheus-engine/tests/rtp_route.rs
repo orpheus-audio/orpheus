@@ -50,17 +50,21 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
     let fake = FakeBackend::default();
     let mut engine = Engine::new(Box::new(fake.clone()), clock);
     engine
-        .start_receiver(&ReceiverConfig {
-            name: "rx".into(),
-            description: "rx".into(),
-            format,
-            encoding: Encoding::L24,
-            listen: "127.0.0.1:0".parse().unwrap(),
-            link_offset_ms: LINK_OFFSET_MS,
-            block_frames: Some(QUANTUM as u32),
-        })
+        .start_receiver(
+            0,
+            &ReceiverConfig {
+                name: "rx".into(),
+                description: "rx".into(),
+                format,
+                encoding: Encoding::L24,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                link_offset_ms: LINK_OFFSET_MS,
+                block_frames: Some(QUANTUM as u32),
+                gain: 1.0,
+            },
+        )
         .unwrap();
-    let listen = engine.status().receiver.unwrap().listen;
+    let listen = engine.status().receivers[0].1.listen;
     engine
         .add_sender(&SenderConfig {
             name: "tx".into(),
@@ -117,7 +121,7 @@ fn audio_arrives_intact_and_on_time() {
     assert!(first > 0);
 
     let status = engine.status();
-    let rx = status.receiver.unwrap();
+    let rx = status.receivers[0].1;
     assert_eq!(rx.lost, 0);
     assert_eq!(rx.late, 0);
     assert!(rx.packets > 1000);
@@ -137,7 +141,7 @@ fn drift_is_absorbed() {
     let (engine, played) = play_ramp(Arc::new(clock), cycles);
 
     let status = engine.status();
-    let rx = status.receiver.unwrap();
+    let rx = status.receivers[0].1;
     let tx = &status.senders[0].1;
     eprintln!("tx {tx:?}\nrx {rx:?}");
     // Both sides converge on the skew: the sender takes less from its port
@@ -162,7 +166,7 @@ fn drift_is_absorbed() {
 
 /// Packets the receiver took and ignored over `ms`.
 fn counts_over(engine: &Engine, ms: u64) -> (u64, u64) {
-    let rx = |e: &Engine| e.status().receiver.unwrap();
+    let rx = |e: &Engine| e.status().receivers[0].1;
     let before = rx(engine);
     thread::sleep(Duration::from_millis(ms));
     let after = rx(engine);
@@ -177,17 +181,21 @@ fn routes_and_filters_change_at_runtime() {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
     let mut engine = Engine::new(Box::new(FakeBackend::default()), clock);
     engine
-        .start_receiver(&ReceiverConfig {
-            name: "rx".into(),
-            description: "rx".into(),
-            format: AudioFormat::AES67,
-            encoding: Encoding::L24,
-            listen: "127.0.0.1:0".parse().unwrap(),
-            link_offset_ms: LINK_OFFSET_MS,
-            block_frames: Some(QUANTUM as u32),
-        })
+        .start_receiver(
+            0,
+            &ReceiverConfig {
+                name: "rx".into(),
+                description: "rx".into(),
+                format: AudioFormat::AES67,
+                encoding: Encoding::L24,
+                listen: "127.0.0.1:0".parse().unwrap(),
+                link_offset_ms: LINK_OFFSET_MS,
+                block_frames: Some(QUANTUM as u32),
+                gain: 1.0,
+            },
+        )
         .unwrap();
-    let listen = engine.status().receiver.unwrap().listen;
+    let listen = engine.status().receivers[0].1.listen;
     let id = engine
         .add_sender(&SenderConfig {
             name: "tx".into(),
@@ -217,7 +225,7 @@ fn routes_and_filters_change_at_runtime() {
             ..Filter::default()
         },
     ] {
-        engine.set_receiver_filter(filter).unwrap();
+        engine.set_receiver_filter(0, filter).unwrap();
         let (taken, ignored) = counts_over(&engine, 100);
         assert!(taken <= 1 && ignored > 50, "{filter:?}: {taken} {ignored}");
     }
@@ -226,7 +234,7 @@ fn routes_and_filters_change_at_runtime() {
         payload_type: Some(sender::PAYLOAD_TYPE),
         ..Filter::default()
     };
-    engine.set_receiver_filter(own).unwrap();
+    engine.set_receiver_filter(0, own).unwrap();
     let (taken, _) = counts_over(&engine, 100);
     assert!(taken > 50, "{taken}");
 
@@ -238,8 +246,8 @@ fn routes_and_filters_change_at_runtime() {
     assert!(taken <= 1 && ignored == 0, "{taken} {ignored}");
 
     // Both move to another port, the sender also to another source port.
-    engine.set_receiver_port(0).unwrap();
-    let listen = engine.status().receiver.unwrap().listen;
+    engine.set_receiver_port(0, 0).unwrap();
+    let listen = engine.status().receivers[0].1.listen;
     let mut route = Route::to(listen);
     route.source = "127.0.0.1:0".parse().unwrap();
     engine.set_sender_route(id, route).unwrap();
@@ -247,4 +255,79 @@ fn routes_and_filters_change_at_runtime() {
     let (taken, _) = counts_over(&engine, 100);
     assert!(taken > 50, "{taken}");
     assert!(!engine.set_sender_route(id + 1, route).unwrap());
+}
+
+/// Two receivers, one muted: the muted one plays silence but still hears
+/// the sound, the idle one hears nothing; unmuted, the sound fades in.
+#[test]
+fn gain_mutes_and_the_meter_hears_through_it() {
+    let format = AudioFormat::AES67;
+    let fake = FakeBackend::default();
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let mut engine = Engine::new(Box::new(fake.clone()), clock);
+    for (id, gain) in [(0, 0.0), (1, 1.0)] {
+        engine
+            .start_receiver(
+                id,
+                &ReceiverConfig {
+                    name: format!("rx{id}"),
+                    description: "rx".into(),
+                    format,
+                    encoding: Encoding::L24,
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    link_offset_ms: LINK_OFFSET_MS,
+                    block_frames: Some(QUANTUM as u32),
+                    gain,
+                },
+            )
+            .unwrap();
+    }
+    let listen = engine.status().receivers[0].1.listen;
+    engine
+        .add_sender(&SenderConfig {
+            name: "tx".into(),
+            description: "tx".into(),
+            format,
+            encoding: Encoding::L24,
+            peer: listen,
+            remote: OutputType::Generic,
+            block_frames: Some(QUANTUM as u32),
+        })
+        .unwrap();
+    let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
+    let mut playback = fake.playbacks.lock().unwrap().remove(0);
+
+    // Plays a 1 kHz sine at -6 dBFS for `cycles` and returns the last
+    // cycle's peak output.
+    let mut run = |cycles: usize| {
+        let mut out = vec![0.0f32; QUANTUM * 2];
+        let start = Instant::now();
+        for cycle in 0..cycles {
+            let input: Vec<f32> = (0..QUANTUM)
+                .map(|i| (cycle * QUANTUM + i) as f32 * std::f32::consts::TAU / 48.0)
+                .flat_map(|phase| [0.5 * phase.sin(); 2])
+                .collect();
+            sink.push(&input);
+            playback.fill(&mut out);
+            let due = start + Duration::from_millis(5 * (cycle as u64 + 1));
+            thread::sleep(due.saturating_duration_since(Instant::now()));
+        }
+        out.iter().fold(0.0f32, |p, s| p.max(s.abs()))
+    };
+
+    let muted = run(300);
+    let status = engine.status();
+    let (rx, idle) = (&status.receivers[0].1, &status.receivers[1].1);
+    assert!(muted < 1e-6, "muted output {muted}");
+    assert!(rx.silent_ms.is_some_and(|ms| ms < 100), "{rx:?}");
+    let peak = rx.peak_dbfs.unwrap();
+    assert!((peak + 6.0).abs() < 1.0, "peak {peak} dBFS");
+    assert_eq!(idle.silent_ms, None);
+    assert_eq!(idle.peak_dbfs, None);
+
+    assert!(engine.set_receiver_gain(0, 1.0));
+    let unmuted = run(100);
+    assert!((unmuted - 0.5).abs() < 0.05, "unmuted output {unmuted}");
+    assert_eq!(engine.status().receivers[0].1.gain, 1.0);
+    assert!(!engine.set_receiver_gain(2, 1.0));
 }

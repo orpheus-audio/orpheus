@@ -85,8 +85,9 @@ impl View {
         let outputs = engine.outputs();
         let receiver = engine
             .status()
-            .receiver
-            .and_then(|_| engine.receiver_output())
+            .receivers
+            .first()
+            .and_then(|&(id, _)| engine.receiver_output(id))
             .or_else(|| outputs.iter().find(|o| o.default).map(|o| o.name.clone()));
         Self { outputs, receiver }
     }

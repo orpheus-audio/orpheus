@@ -33,20 +33,21 @@ struct Loopback {
 }
 
 pub type SenderId = u32;
+pub type ReceiverId = u32;
 
 /// A snapshot of everything the engine runs.
 #[derive(Debug, Clone, Default)]
 pub struct EngineStatus {
     pub loopback: Option<StatsSnapshot>,
     pub senders: Vec<(SenderId, SenderStatus)>,
-    pub receiver: Option<ReceiverStatus>,
+    pub receivers: Vec<(ReceiverId, ReceiverStatus)>,
 }
 
 pub struct Engine {
     // Routes go before the backend they live in.
     senders: BTreeMap<SenderId, Sender>,
     next_sender: SenderId,
-    receiver: Option<Receiver>,
+    receivers: BTreeMap<ReceiverId, Receiver>,
     loopback: Option<Loopback>,
     clock: Arc<dyn Clock>,
     backend: Box<dyn AudioBackend>,
@@ -57,7 +58,7 @@ impl Engine {
         Self {
             senders: BTreeMap::new(),
             next_sender: 0,
-            receiver: None,
+            receivers: BTreeMap::new(),
             loopback: None,
             clock,
             backend,
@@ -102,15 +103,21 @@ impl Engine {
         Ok(())
     }
 
-    /// Starts receiving, replacing a running receiver.
-    pub fn start_receiver(&mut self, cfg: &ReceiverConfig) -> Result<(), BackendError> {
-        self.receiver = None;
-        self.receiver = Some(Receiver::start(
-            self.backend.as_mut(),
-            self.clock.clone(),
-            cfg,
-        )?);
+    /// Starts receiver `id`, replacing a running one with that ID.
+    pub fn start_receiver(
+        &mut self,
+        id: ReceiverId,
+        cfg: &ReceiverConfig,
+    ) -> Result<(), BackendError> {
+        self.receivers.remove(&id);
+        let receiver = Receiver::start(self.backend.as_mut(), self.clock.clone(), cfg)?;
+        self.receivers.insert(id, receiver);
         Ok(())
+    }
+
+    /// Stops a receiver; returns whether it existed.
+    pub fn remove_receiver(&mut self, id: ReceiverId) -> bool {
+        self.receivers.remove(&id).is_some()
     }
 
     /// The ID the next sender will get, for naming it.
@@ -143,30 +150,35 @@ impl Engine {
         }
     }
 
-    /// Moves the receiver to another UDP port; `Ok(false)` if there is no
-    /// receiver.
-    pub fn set_receiver_port(&mut self, port: u16) -> std::io::Result<bool> {
-        match &self.receiver {
+    /// Moves a receiver to another UDP port; `Ok(false)` if there is no
+    /// such receiver.
+    pub fn set_receiver_port(&mut self, id: ReceiverId, port: u16) -> std::io::Result<bool> {
+        match self.receivers.get(&id) {
             Some(r) => r.set_port(port).map(|()| true),
             None => Ok(false),
         }
     }
 
-    /// Sets which packets the receiver plays; `Ok(false)` if there is no
+    /// Sets which packets a receiver plays; `Ok(false)` if there is no such
     /// receiver.
-    pub fn set_receiver_filter(&mut self, filter: Filter) -> std::io::Result<bool> {
-        match &self.receiver {
+    pub fn set_receiver_filter(&mut self, id: ReceiverId, filter: Filter) -> std::io::Result<bool> {
+        match self.receivers.get(&id) {
             Some(r) => r.set_filter(filter).map(|()| true),
             None => Ok(false),
         }
     }
 
-    /// Shows the receiver's playback stream under `description`, or under
+    /// Shows a receiver's playback stream under `description`, or under
     /// its configured one for `None`.
-    pub fn set_receiver_description(&mut self, description: Option<&str>) {
-        if let Some(r) = &self.receiver {
+    pub fn set_receiver_description(&mut self, id: ReceiverId, description: Option<&str>) {
+        if let Some(r) = self.receivers.get(&id) {
             r.describe(description);
         }
+    }
+
+    /// Fades a receiver to `gain` (0 to 1); returns whether it exists.
+    pub fn set_receiver_gain(&mut self, id: ReceiverId, gain: f32) -> bool {
+        self.receivers.get(&id).map(|r| r.set_gain(gain)).is_some()
     }
 
     /// The audio system's outputs.
@@ -174,9 +186,9 @@ impl Engine {
         self.backend.outputs()
     }
 
-    /// The output the receiver plays on, if its stream is linked to one.
-    pub fn receiver_output(&self) -> Option<String> {
-        self.receiver.as_ref().and_then(Receiver::output)
+    /// The output a receiver plays on, if its stream is linked to one.
+    pub fn receiver_output(&self, id: ReceiverId) -> Option<String> {
+        self.receivers.get(&id).and_then(Receiver::output)
     }
 
     /// Changes the kind of output a sender's sink shows; returns whether
@@ -213,7 +225,11 @@ impl Engine {
                 .iter()
                 .map(|(id, s)| (*id, s.status()))
                 .collect(),
-            receiver: self.receiver.as_ref().map(Receiver::status),
+            receivers: self
+                .receivers
+                .iter()
+                .map(|(id, r)| (*id, r.status()))
+                .collect(),
         }
     }
 }

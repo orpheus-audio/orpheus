@@ -229,7 +229,7 @@ fn snapshot(node: &Node) -> Snapshot {
         receivers: vec![],
     };
 
-    if engine.receiver.is_some() {
+    if !engine.receivers.is_empty() {
         let mut base = Base::new(resource_id(dev, "receiver/0"), &node.name);
         base.tags.insert(
             TAG_FORM_FACTOR.into(),
