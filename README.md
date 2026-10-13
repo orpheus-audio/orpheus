@@ -1,5 +1,5 @@
 <div align="center">
-  <h1><img src="docs/logo/orpheus-styx.svg" alt="Orpheus" width="560"></h1>
+  <h1><img src="docs/logo/orpheus.svg" alt="Orpheus" width="560"></h1>
   <p><b>O</b>pen <b>R</b>ealtime <b>P</b>eer-to-peer <b>H</b>ome <b>E</b>thernet <b>U</b>nicast <b>S</b>treaming</p>
 </div>
 
