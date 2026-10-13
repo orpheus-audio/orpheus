@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     connection::restore(&node);
 
     let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));
-    let peers = tokio::spawn(connection::follow_peers(node.clone()));
+    let peers = tokio::spawn(connection::watch_peers(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));

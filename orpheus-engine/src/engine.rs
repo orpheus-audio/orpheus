@@ -188,6 +188,18 @@ impl Engine {
             .is_some()
     }
 
+    /// Shows a sender's sink under another name; returns whether the
+    /// sender exists.
+    pub fn rename_sender(&mut self, id: SenderId, name: &str) -> bool {
+        self.senders.get_mut(&id).map(|s| s.rename(name)).is_some()
+    }
+
+    /// Holds a sender's packets back, or lets them go again, whatever its
+    /// route says; returns whether the sender exists.
+    pub fn pause_sender(&mut self, id: SenderId, paused: bool) -> bool {
+        self.senders.get(&id).map(|s| s.pause(paused)).is_some()
+    }
+
     /// Stops a sender; returns whether it existed.
     pub fn remove_sender(&mut self, id: SenderId) -> bool {
         self.senders.remove(&id).is_some()

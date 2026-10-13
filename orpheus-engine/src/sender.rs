@@ -84,6 +84,9 @@ struct Link {
     /// `None` only while a failed rebind could not get the old one back.
     socket: Option<UdpSocket>,
     route: Route,
+    /// Held back regardless of the route, e.g. while the peer's receiver
+    /// plays another sender.
+    paused: bool,
 }
 
 impl Link {
@@ -91,6 +94,7 @@ impl Link {
         Ok(Self {
             socket: Some(bind(route.source)?),
             route,
+            paused: false,
         })
     }
 
@@ -175,6 +179,17 @@ impl Sender {
         self.sink.set_remote(remote);
     }
 
+    /// Shows the sink under another name.
+    pub fn rename(&mut self, name: &str) {
+        self.sink.describe(name);
+        self.name = name.to_owned();
+    }
+
+    /// Stops or resumes sending, whatever the route says.
+    pub fn pause(&self, paused: bool) {
+        self.link.lock().unwrap().paused = paused;
+    }
+
     pub fn start(
         backend: &mut dyn AudioBackend,
         clock: Arc<dyn Clock>,
@@ -249,7 +264,7 @@ impl Sender {
         SenderStatus {
             name: self.name.clone(),
             peer: link.route.peer,
-            enabled: link.route.enabled,
+            enabled: link.route.enabled && !link.paused,
             source_port: link
                 .socket
                 .as_ref()
@@ -332,6 +347,7 @@ impl Tx {
             self.encoding.encode(&samples, &mut packet[HEADER_LEN..]);
             let link = self.link.lock().unwrap();
             if link.route.enabled
+                && !link.paused
                 && let Some(socket) = &link.socket
             {
                 match socket.send_to(&packet, link.route.peer) {

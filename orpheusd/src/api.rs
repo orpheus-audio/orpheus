@@ -167,6 +167,9 @@ struct SenderEntry {
     id: SenderId,
     #[serde(flatten)]
     status: SenderStatus,
+    /// The peer's receiver connected to it; absent if it only sends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver: Option<crate::connection::PeerLink>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -246,7 +249,10 @@ pub fn router(node: Arc<Node>) -> Router {
     responses((status = OK, description = "Node status", body = Status)),
 )]
 async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
-    let sender = node.connections.lock().unwrap().receiver_sender();
+    let (sender, mut links) = {
+        let conns = node.connections.lock().unwrap();
+        (conns.receiver_sender(), conns.peer_links())
+    };
     let engine = node.engine.as_ref().map(|e| e.lock().unwrap().status());
     let engine = engine.unwrap_or_default();
     let view = crate::outputs::View::of(&node);
@@ -282,7 +288,11 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
         senders: engine
             .senders
             .into_iter()
-            .map(|(id, status)| SenderEntry { id, status })
+            .map(|(id, status)| SenderEntry {
+                id,
+                status,
+                receiver: links.remove(&id),
+            })
             .collect(),
     })
 }

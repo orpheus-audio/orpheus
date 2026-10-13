@@ -195,8 +195,19 @@ sink the receiver's stream is linked to. `outputs.rs` adds the user's types
 from `outputs.json`; the IS-04 receiver carries the result. A sender writes
 its peer's type (or the user's) into its sink's `device.form-factor` and
 icon, and PipeWire reports the change like any other sink's, which is how
-types pass along chains of nodes. `connection.rs` polls each peer's
-receiver every 5 seconds for changes.
+types pass along chains of nodes.
+
+`connection.rs` watches the peers' receivers the senders are connected to.
+Discovery keeps each node's receiver change counter (`ver_rcv` in its mDNS
+TXT record), which the peer's NMOS store bumps when a receiver's resource
+changes: its type tag or its subscription. Once a second the watch
+compares, for each connected sender, the peer's announcement (online,
+name, counter) with the last one seen, and asks the receiver again through
+IS-04 when it changed or 30 seconds have passed; peers that discovery
+doesn't see (reached by URL, or mDNS blocked) get only the 30-second check.
+The answer updates the sink's type and name and the link's state; a
+receiver that plays another sender pauses the sender in the engine,
+separately from its IS-05 route, so activations don't undo the pause.
 
 ## Identity
 

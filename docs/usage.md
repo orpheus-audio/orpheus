@@ -57,6 +57,19 @@ and names the holder; `--force` takes the receiver over. The receiver's
 playback stream is named after the sending node, so mixers show where the
 audio comes from.
 
+A connected sender follows its peer's receiver. Each node announces a
+change counter for its receivers over mDNS; when the peer's changes, or
+every 30 seconds anyway, the sender asks the receiver again, so changes
+arrive within a few seconds:
+
+- The sink shows the peer's [output type](#output-types).
+- The sink is renamed when the peer is, unless `--name` named it.
+- If someone else connects the receiver, the sender pauses and `status`
+  shows it as `disconnected, paused`. It resumes when the receiver is
+  connected to it again, for example over IS-05; `disconnect` removes it.
+- While the peer is offline or doesn't answer, `status` shows the sender as
+  `unreachable`. It keeps sending, so the audio is back when the peer is.
+
 With `--send-only`, `PEER` is a host name or address with an optional
 port (default 5004). IPv6 addresses with a port need brackets:
 
@@ -209,7 +222,7 @@ to it with a matching icon and PipeWire form factor.
 - **Detected type:** PipeWire's form factor of the output (`internal` counts
   as `computer`), or `tv` for HDMI and DisplayPort profiles, else
   `generic`. A sink to another node has the type that node's receiver
-  announces; senders ask their peer every 5 seconds and update the sink.
+  announces; senders [follow it](#connecting).
 - **Set type:** `orpheusctl set-type` overrides the detected type of one
   output, kept in `outputs.json` in the [state
   directory](configuration.md#files). Use it where detection is wrong, for

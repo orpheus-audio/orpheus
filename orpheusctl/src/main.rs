@@ -182,6 +182,13 @@ struct Sender {
     #[serde(default)]
     asrc_ppm: f64,
     buffer: Buffer,
+    /// The peer's receiver connected to it; absent if it only sends.
+    receiver: Option<PeerLink>,
+}
+
+#[derive(Clone, Deserialize)]
+struct PeerLink {
+    state: String,
 }
 
 /// Another node, as found over mDNS.
@@ -780,10 +787,11 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             [
                 t.id.to_string(),
                 t.name.clone(),
-                if t.enabled {
-                    t.peer.clone()
-                } else {
-                    format!("{} (off)", t.peer)
+                match t.receiver.as_ref().map(|r| r.state.as_str()) {
+                    Some("disconnected") => format!("{} (disconnected, paused)", t.peer),
+                    Some(s @ ("unreachable" | "connecting")) => format!("{} ({s})", t.peer),
+                    _ if !t.enabled => format!("{} (off)", t.peer),
+                    _ => t.peer.clone(),
                 },
                 c.packets(t.packets),
                 format!("{} frames", t.buffer.level_frames),
@@ -989,6 +997,15 @@ Senders
         assert!(out.contains("  ignored      42\n"), "{out}");
         assert!(
             out.contains("  Kitchen  192.168.1.20:5004 (off)  "),
+            "{out}"
+        );
+
+        s.senders[0].receiver = Some(PeerLink {
+            state: "disconnected".into(),
+        });
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("  Kitchen  192.168.1.20:5004 (disconnected, paused)  "),
             "{out}"
         );
     }

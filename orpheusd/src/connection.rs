@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -144,6 +144,12 @@ struct SavedSender {
 /// The other end of a sender.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Link {
+    /// The user named the sink; otherwise it follows the peer's name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    named: bool,
+    /// Whether the peer's receiver plays the sender, as far as we know.
+    #[serde(skip)]
+    state: PeerState,
     /// The kind of output the peer's receiver announces, which the sink
     /// shows unless overridden here.
     #[serde(default)]
@@ -152,6 +158,33 @@ struct Link {
     /// goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receiver: Option<PeerReceiver>,
+}
+
+/// How a sender's connection to a peer's receiver stands.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerState {
+    /// Being connected.
+    Connecting,
+    /// The receiver plays the sender.
+    #[default]
+    Connected,
+    /// The peer is offline or doesn't answer; the sender keeps sending, so
+    /// that the stream plays again when the peer is back.
+    Unreachable,
+    /// The receiver plays another sender, or none: someone else connected
+    /// it. The sender pauses until the receiver is connected to it again.
+    Disconnected,
+}
+
+/// The peer's receiver a sender is connected to.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct PeerLink {
+    /// Base URL of the peer's API.
+    pub api: String,
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    pub state: PeerState,
 }
 
 /// A sender connected to a peer's receiver.
@@ -184,6 +217,24 @@ impl Connections {
     /// The type each sender's peer announces.
     pub fn peer_types(&self) -> BTreeMap<SenderId, OutputType> {
         self.links.iter().map(|(&id, l)| (id, l.output)).collect()
+    }
+
+    /// The peers' receivers the senders are connected to.
+    pub fn peer_links(&self) -> BTreeMap<SenderId, PeerLink> {
+        self.links
+            .iter()
+            .filter_map(|(&id, l)| {
+                let r = l.receiver.as_ref()?;
+                Some((
+                    id,
+                    PeerLink {
+                        api: r.api.clone(),
+                        id: r.id,
+                        state: l.state,
+                    },
+                ))
+            })
+            .collect()
     }
 
     /// Who the receiver is connected to: the name in the sender's SDP
@@ -320,7 +371,11 @@ fn destination(p: &SenderParams) -> Option<SocketAddr> {
 /// Starts a sender to `peer` and activates that destination, without
 /// telling the peer.
 pub fn add_sender(node: &Node, peer: SocketAddr, name: String) -> Result<SenderId, Fail> {
-    start_sender(node, peer, name, Link::default())
+    let link = Link {
+        named: true,
+        ..Link::default()
+    };
+    start_sender(node, peer, name, link)
 }
 
 /// Connects this node to a peer, both ends: picks a free receiver there,
@@ -342,6 +397,7 @@ pub fn connect(
         .map(|&n| (n, uuid_of(node, PortId::Sender(n))))
         .collect();
     let target = peer::find_receiver(&found, &ours, force)?;
+    let named = name.is_some();
     let name = name
         .or_else(|| found.name.clone())
         .unwrap_or_else(|| peer.to_owned());
@@ -351,6 +407,8 @@ pub fn connect(
         id: target.receiver,
     };
     let link = Link {
+        named,
+        state: PeerState::Connecting,
         output: target.output,
         receiver: Some(to.clone()),
     };
@@ -362,6 +420,9 @@ pub fn connect(
     if let Err(e) = connected {
         stop_sender(node, id)?;
         return Err(e);
+    }
+    if let Some(link) = node.connections.lock().unwrap().links.get_mut(&id) {
+        link.state = PeerState::Connected;
     }
     Ok(Connected {
         id,
@@ -445,48 +506,160 @@ pub fn update_sink_type(node: &Node, id: SenderId) {
     }
 }
 
-/// Every few seconds, asks the peers' receivers we are connected to what
-/// they play on, and passes changes on to the senders' sinks.
-pub async fn follow_peers(node: Arc<Node>) {
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+/// How often a peer's receiver is asked anyway, also when discovery
+/// doesn't see the peer.
+const RECHECK: Duration = Duration::from_secs(30);
+
+/// What the peer watch last saw of a sender's peer.
+#[derive(Default)]
+struct Seen {
+    /// The peer as discovery announced it: online, name, receiver counter.
+    announced: Option<(bool, String, Option<u8>)>,
+    asked: Option<Instant>,
+}
+
+/// Follows the peers' receivers the senders are connected to: their output
+/// type goes to the sender's sink, their name too unless the user named the
+/// sink, and a sender pauses while its receiver plays something else.
+///
+/// Each peer announces a receiver change counter over mDNS; it is asked
+/// again when that, its name or its presence changes, and every 30 seconds
+/// anyway, as mDNS may miss an update and doesn't see every peer.
+pub async fn watch_peers(node: Arc<Node>) {
+    let mut seen: BTreeMap<SenderId, Seen> = BTreeMap::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let node = node.clone();
-        let _ = tokio::task::spawn_blocking(move || refresh_peers(&node)).await;
+        match tokio::task::spawn_blocking(move || {
+            check_peers(&node, &mut seen);
+            seen
+        })
+        .await
+        {
+            Ok(s) => seen = s,
+            Err(_) => seen = BTreeMap::new(),
+        }
     }
 }
 
-fn refresh_peers(node: &Node) {
-    let peers: Vec<(SenderId, PeerReceiver, OutputType)> = node
-        .connections
-        .lock()
-        .unwrap()
-        .links
-        .iter()
-        .filter_map(|(&id, l)| Some((id, l.receiver.clone()?, l.output)))
-        .collect();
-    for (id, to, known) in peers {
-        let now = match peer::output_type(&to) {
-            Ok(t) => t,
-            Err((_, e)) => {
-                tracing::debug!(id, error = %e, "asking the peer for its output type");
-                continue;
-            }
-        };
-        if now == known {
+fn check_peers(node: &Node, seen: &mut BTreeMap<SenderId, Seen>) {
+    let links: Vec<(SenderId, PeerReceiver)> = {
+        let conns = node.connections.lock().unwrap();
+        seen.retain(|id, _| conns.links.contains_key(id));
+        conns
+            .links
+            .iter()
+            .filter(|(_, l)| l.state != PeerState::Connecting)
+            .filter_map(|(&id, l)| Some((id, l.receiver.clone()?)))
+            .collect()
+    };
+    if links.is_empty() {
+        return;
+    }
+    let nodes = node
+        .discovery
+        .as_ref()
+        .map(|d| d.nodes())
+        .unwrap_or_default();
+    for (id, to) in links {
+        let found = nodes.iter().find(|n| peer::serves(n, &to.api));
+        let announced = found.map(|n| (n.online, n.name.clone(), n.receivers));
+        let last = seen.entry(id).or_default();
+        let due = announced != last.announced || last.asked.is_none_or(|t| t.elapsed() >= RECHECK);
+        if !due {
             continue;
         }
-        tracing::info!(id, output = %now, "peer's output changed");
-        {
-            let mut conns = node.connections.lock().unwrap();
-            let Some(link) = conns.links.get_mut(&id) else {
-                continue;
-            };
-            link.output = now;
-            conns.save(node.engine.as_ref().map(|e| e.lock().unwrap()).as_deref());
+        last.announced = announced;
+        last.asked = Some(Instant::now());
+        let playing = match found {
+            Some(n) if !n.online => {
+                Err((StatusCode::BAD_GATEWAY, format!("{} is offline", n.name)))
+            }
+            _ => peer::playing(&to),
+        };
+        update_link(node, id, &to, playing, found.map(|n| n.name.as_str()));
+    }
+}
+
+/// Takes in what a peer's receiver said, or that it couldn't be asked.
+fn update_link(
+    node: &Node,
+    id: SenderId,
+    to: &PeerReceiver,
+    playing: Result<peer::Playing, Fail>,
+    name: Option<&str>,
+) {
+    let ours = uuid_of(node, PortId::Sender(id));
+    let mut conns = node.connections.lock().unwrap();
+    let Some(link) = conns
+        .links
+        .get_mut(&id)
+        .filter(|l| l.receiver.as_ref() == Some(to) && l.state != PeerState::Connecting)
+    else {
+        return;
+    };
+    let was = link.state;
+    let mut changed = false;
+    match playing {
+        Err((_, e)) => {
+            if was != PeerState::Unreachable {
+                tracing::warn!(id, error = %e, "peer unreachable");
+            }
+            link.state = PeerState::Unreachable;
         }
-        update_sink_type(node, id);
+        Ok(p) => {
+            link.state = if p.sender == Some(ours) {
+                PeerState::Connected
+            } else {
+                PeerState::Disconnected
+            };
+            if p.output != link.output {
+                tracing::info!(id, output = %p.output, "peer's output changed");
+                link.output = p.output;
+                changed = true;
+            }
+        }
+    }
+    let state = link.state;
+    let rename = name.filter(|_| !link.named).map(str::to_owned);
+    let remote = sink_type(node, id, link);
+    let Some(engine) = &node.engine else {
+        return;
+    };
+    let mut engine = engine.lock().unwrap();
+    if state != was {
+        match state {
+            PeerState::Disconnected => {
+                tracing::warn!(id, "the peer's receiver plays another sender; pausing")
+            }
+            PeerState::Connected if was == PeerState::Disconnected => {
+                tracing::info!(id, "the peer's receiver plays the sender again; resuming")
+            }
+            PeerState::Connected if was == PeerState::Unreachable => {
+                tracing::info!(id, "peer reachable again")
+            }
+            _ => {}
+        }
+        engine.pause_sender(id, state == PeerState::Disconnected);
+    }
+    if changed {
+        engine.set_sender_remote(id, remote);
+    }
+    let current = engine
+        .status()
+        .senders
+        .into_iter()
+        .find(|(n, _)| *n == id)
+        .map(|(_, s)| s.name);
+    if let Some(name) = rename.filter(|n| current.as_ref().is_some_and(|c| c != n)) {
+        tracing::info!(id, %name, "peer renamed; renaming its sink");
+        engine.rename_sender(id, &name);
+        changed = true;
+    }
+    if changed {
+        conns.save(Some(&engine));
     }
 }
 

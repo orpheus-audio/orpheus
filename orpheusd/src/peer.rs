@@ -198,12 +198,6 @@ pub fn find_receiver(peer: &Peer, ours: &[(u32, Uuid)], force: bool) -> Result<T
                 .as_array()
                 .is_none_or(|m| m.iter().any(|t| t == "audio/L24"))
     };
-    let holder = |r: &Value| {
-        let s = &r["subscription"];
-        (s["active"] != false)
-            .then(|| s["sender_id"].as_str()?.parse::<Uuid>().ok())
-            .flatten()
-    };
     let fitting: Vec<&Value> = receivers.iter().filter(fits).collect();
     let name = peer.name.as_deref().unwrap_or(&peer.api);
     let chosen = match fitting.iter().find(|r| holder(r).is_none()) {
@@ -252,6 +246,14 @@ pub fn find_receiver(peer: &Peer, ours: &[(u32, Uuid)], force: bool) -> Result<T
     })
 }
 
+/// The sender a receiver resource is connected to.
+fn holder(r: &Value) -> Option<Uuid> {
+    let s = &r["subscription"];
+    (s["active"] != false)
+        .then(|| s["sender_id"].as_str()?.parse::<Uuid>().ok())
+        .flatten()
+}
+
 /// The output type a receiver resource announces.
 fn form_factor(receiver: &Value) -> OutputType {
     receiver["tags"][TAG_FORM_FACTOR][0]
@@ -260,9 +262,30 @@ fn form_factor(receiver: &Value) -> OutputType {
         .unwrap_or_default()
 }
 
-/// The output type a peer's receiver announces now.
-pub fn output_type(of: &PeerReceiver) -> Result<OutputType, Fail> {
-    get(&of.api, &format!("/x-nmos/node/v1.3/receivers/{}", of.id)).map(|r| form_factor(&r))
+/// What a peer's receiver says about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Playing {
+    /// The kind of output it plays on.
+    pub output: OutputType,
+    /// The sender it is connected to, if any.
+    pub sender: Option<Uuid>,
+}
+
+/// Asks a peer's receiver what it plays and on what.
+pub fn playing(of: &PeerReceiver) -> Result<Playing, Fail> {
+    let r = get(&of.api, &format!("/x-nmos/node/v1.3/receivers/{}", of.id))?;
+    Ok(Playing {
+        output: form_factor(&r),
+        sender: holder(&r),
+    })
+}
+
+/// Whether discovery's `node` is the node whose API is at `api`.
+pub fn serves(node: &orpheus_discovery::Node, api: &str) -> bool {
+    node.addresses
+        .iter()
+        .filter_map(|a| a.parse::<IpAddr>().ok())
+        .any(|ip| api == format!("http://{}", SocketAddr::new(ip, node.port)))
 }
 
 /// Connects a peer's receiver to our sender `sender`, described by `sdp`.

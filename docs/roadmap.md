@@ -44,9 +44,11 @@ and Bluetooth inputs.
 - A receiver stays connected to a sender that vanished without
   disconnecting (its node died or lost its state). The next `connect` needs
   `--force`.
-- After a restart a sender resumes sending without checking that the peer's
-  receiver is still connected to it; if it isn't, the packets are ignored
-  there.
+- Senders find their peer in discovery by the address they send to; a
+  peer that changes its address is not followed, and the sender shows it as
+  unreachable.
+- A sender whose peer's receiver was taken over stays paused until the
+  receiver is connected to it again; it doesn't ask for it back.
 - Two nodes connecting to the same peer at the same moment can both pick
   its receiver; the later one wins.
 - `connect` accepts a peer with an NMOS API but no `[receiver]` of the right
@@ -89,8 +91,7 @@ and Bluetooth inputs.
 - Output types are detected from PipeWire's form factor and profile name
   only; the active port of a sound card (headphone jack or speakers) is not
   looked at. Outputs are matched by their PipeWire name, so a type set for a
-  USB device is lost if its name changes. Senders poll their peer's type
-  every 5 seconds instead of following its IS-04 change counter.
+  USB device is lost if its name changes.
 
 ## Future work
 

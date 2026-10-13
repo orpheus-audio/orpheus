@@ -61,6 +61,10 @@ pub struct Node {
     pub port: u16,
     /// False once the node said goodbye or its announcement expired.
     pub online: bool,
+    /// The node's receiver change counter (`ver_rcv`): it changes whenever
+    /// one of its receivers does, for example what it plays or on what.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub receivers: Option<u8>,
 }
 
 /// Announces this node and keeps a list of the others. Says goodbye on drop.
@@ -206,6 +210,7 @@ fn node(s: &ResolvedService) -> Node {
         addresses: addresses.into_iter().map(|(_, text)| text).collect(),
         port: s.port,
         online: true,
+        receivers: txt("ver_rcv").and_then(|v| v.parse().ok()),
     }
 }
 
@@ -310,6 +315,7 @@ mod tests {
             addresses: vec!["10.0.0.1".into()],
             port: 7480,
             online: true,
+            receivers: Some(0),
         }
     }
 

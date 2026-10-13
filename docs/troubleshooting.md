@@ -79,6 +79,9 @@ affected.
   `--force`. A node that died without disconnecting keeps the receiver
   busy in the same way.
 - `409 already connected … as sender N`: this node already sends there.
+  If `status` shows that sender as `disconnected, paused`, someone else
+  connected the peer's receiver meanwhile; `disconnect` it and connect
+  again, with `--force` to take the receiver back.
 - `502 … no answer`: the peer's API is unreachable: wrong name or address,
   the node is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
   whether the node was discovered and under which address.
