@@ -40,7 +40,7 @@ Linux.
 |---|---|
 | `orpheus-core` | Platform-independent types shared by all nodes, including the planned ESP32 firmware: device ID, audio format, RTP packets, jitter buffer, media-clock arithmetic. |
 | `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of statime. |
-| `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, the receiver, ASRC, the `AudioBackend` trait. |
+| `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their gains and level meters, ASRC, the `AudioBackend` trait. |
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
 | `orpheusd` | The node daemon: config, home directory, HTTP API, NMOS APIs, connecting to other nodes. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
@@ -53,7 +53,7 @@ A route from node A to node B:
 
 ```text
 Node A                                          Node B
-app ─▶ sink "B"                                 receiver (UDP 5004)
+app ─▶ sink "B"                                 receiver k (UDP 5004 + 2k)
         │ PipeWire RT callback                    │ RX thread
         ▼                                         ▼
       port (lock-free ring)                     jitter buffer
@@ -77,8 +77,10 @@ media-clock time of its first frame.
 by RTP timestamp. Out-of-order, duplicate and late packets are handled there;
 missing audio becomes silence. On the media-clock grid, the thread takes out
 the audio whose timestamp is the current time minus the link offset,
-resamples it to the sound card's clock and hands it to a playback stream
-through a port.
+passes it through a gain, which fades over 30 ms to the volume the
+[policy](#receiver-pool-and-policy) sets, and a level meter, resamples it
+to the sound card's clock and hands it to the receiver's own playback
+stream through a port. PipeWire mixes the playback streams.
 
 **Ports.** A port is a single-producer, single-consumer ring of `f32`
 samples. Both ends are realtime-safe: no allocation, locks or syscalls. The
@@ -104,12 +106,12 @@ time instead of catching up ("realign").
 
 | Thread | Work |
 |---|---|
-| main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
+| main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
 | `orpheus-ptp` | PTP: sockets, timers, statime |
 | TX, one per sender | Pacing, ASRC, RTP send |
-| RX | RTP receive, jitter buffer, ASRC |
+| RX, one per running receiver | RTP receive, jitter buffer, gain and level meter, ASRC |
 | mDNS | mdns-sd's daemon, plus `mdns-monitor` (renames on name conflicts) and `mdns-browse` (the node list) |
 
 The TX, RX and PTP threads run at normal priority for now.
@@ -120,7 +122,7 @@ The TX, RX and PTP threads run at normal priority for now.
 |---|---|---|
 | 319/udp | PTP event messages | multicast, IPv4 or IPv6 |
 | 320/udp | PTP general messages | multicast, IPv4 or IPv6 |
-| 5004/udp | RTP (by default; connections can pick other ports) | unicast; multicast only for interop, IPv4 and IPv6 |
+| 5004–5018/udp | RTP: receiver *k* on 5004 + 2*k*, up to `[receiver] max` (by default; connections can pick other ports) | unicast; multicast only for interop, IPv4 and IPv6 |
 | 5353/udp | mDNS | multicast, IPv4 and IPv6 |
 | 7480/tcp | HTTP API | IPv4 and IPv6 |
 
@@ -133,7 +135,7 @@ since the PTP epoch, so the SDP says `mediaclk:direct=0`.
 
 ## NMOS
 
-A node is one NMOS device. Its receiver and senders are NMOS resources:
+A node is one NMOS device. Its receivers and senders are NMOS resources:
 each sender is a source, a flow and a sender. `orpheusd` rebuilds the
 resources from the engine once a second and whenever the API is asked; a
 resource gets a new version when its content changes. The node then
@@ -151,14 +153,14 @@ of a removed sender is used again only after a restart.
 
 ## Connections
 
-Routing goes through IS-05: every sender and the receiver has staged and
+Routing goes through IS-05: every sender and receiver has staged and
 active parameters. Activating them changes the engine at runtime without
 restarting streams:
 
 - A sender sends to another address or port, from another source address
   or port (the socket is reopened), or pauses. Multicast destinations need
   nothing special when sending.
-- The receiver filters what it plays by source address and payload type (from
+- A receiver filters what it plays by source address and payload type (from
   the sender's SDP), joins and leaves multicast groups, and moves to another
   UDP port. A new filter drops the stream played so far, so the next one
   starts at once.
@@ -172,9 +174,13 @@ name).
 peer's APIs (`peer.rs`, blocking HTTP without holding any lock): it reads
 the peer's IS-04 receivers, picks one without a sender, reads its port
 from IS-05, starts the sender, and PATCHes the receiver with the sender's
-SDP file. If that fails the sender is removed again. The peer's receiver
-is kept with the sender, so `disconnect` can release it, but only if it
-still names this sender.
+SDP file. Then it reads the receiver's IS-04 subscription back: if another
+node's PATCH came in between, it tries once more with another free
+receiver, and else stops the sender with `409`. If the PATCH fails the
+sender is removed again. The peer's receiver is kept with the sender, by
+its API, its ID and the peer's node ID, so `disconnect` can release it,
+but only if it still names this sender. A second connection to the same
+peer (by API or node ID) with the same priority is refused.
 
 An activation gives the IS-04 resource a new version even where its content
 stays the same, as NMOS asks. Scheduled activations run on a timer; while
@@ -210,6 +216,62 @@ The answer updates the sink's type and name and the link's state; a
 receiver that plays another sender pauses the sender in the engine,
 separately from its IS-05 route, so activations don't undo the pause.
 
+The watch also keeps a connection whole when things move:
+
+- **Follow.** If discovery's node with the stored node ID no longer
+  serves the stored API, the peer has a new address; the sender is
+  retargeted to the receiver's port at the new address and the receiver
+  PATCHed again. If the route to the peer now leaves from another source
+  address than the receiver was given (`source_ip` `auto`), the receiver
+  is PATCHed with the new one.
+- **Reclaim.** A link notes when its receiver was taken by another sender
+  (`displaced`, not saved). While displaced and disconnected, the sender
+  asks the peer for a free receiver on every check and moves there:
+  retarget, PATCH, verify. A receiver that plays nothing, without having
+  been taken, was released on purpose, and the sender stays paused.
+- **Check back.** On the receiving side, each connected receiver whose SDP
+  names an Orpheus node (`a=x-orpheus-node`) asks that node every 30
+  seconds, at its discovered API or at port 7480 of the source address,
+  whether its `/self` is still that node, the sender exists (`404` means
+  no) and the sender's subscription names this receiver. If not, the
+  receiver is freed and the pool shrinks.
+
+## Receiver pool and policy
+
+The engine runs any number of receivers, each with its own socket, RX
+thread and playback stream. `connection.rs` keeps the pool: slot *k* has
+NMOS ID `receiver/k` and port `[receiver] port + 2k`; there is always one
+free slot more than connected ones, up to `max`. A slot saved for a
+connection in `routes.json` is never handed to another, and free slots
+beyond the lowest go after 60 seconds, so that a controller that just saw
+one can still use it. A receiver runs in the engine only while it is
+connected, or while free with `accept = "any"`. Its PipeWire stream has
+`node.name` `orpheus.receive.<k>` and `application.id`
+`orpheus.from.<node ID>`, under which WirePlumber restores volume and
+output per sending node; the description is the alias or the SDP's `s=`.
+
+`policy.rs` runs every 50 ms. It reads each receiver's last sound from the
+engine's meter (peak above -60 dBFS, measured before the gain) and the
+connection's priority from the SDP (`a=x-orpheus-priority`), and a pure
+function `decide` gives each receiver its state (`silent`, `playing`,
+`muted`, `ducked`) and gain. A stream plays until 5 s after its last
+sound. High-priority streams are always heard and duck the normal ones by
+`duck_db`; among the normal ones, `last`, `first` or `mix` decide. A
+silent stream gets the gain it would get on starting, so its first sound
+is not cut. States other than `silent` and `playing` go into the IS-04 tag
+`urn:x-orpheus:state`, which the senders' peer watch reads.
+
+## Peers
+
+`peers.rs` keeps what this node remembers about others by node ID, in
+`peers.json`: an alias, a pin, and for pinned peers how they were last
+seen (name, version, host, addresses, port), so that `GET /nodes` can list
+them offline after a restart. The peer watch updates the last-seen record.
+Aliases are looked up wherever a peer is shown: in `peer::resolve` (before
+name, ID, host and address), in the names of sinks not named by the user,
+and in the receivers' stream names. Changing an alias renames these at
+once. Lock order: connections, engine, peers.
+
 ## Health
 
 `health.rs` checks the network paths once a second and keeps a list of
@@ -221,7 +283,9 @@ and, for the other end, in the link each node announces over mDNS
 
 The receiver measures, per second, the spread of the packets' arrival
 margins: the latest minus the earliest relative to their timestamps. That
-catches Wi-Fi and congestion anywhere on the way. A receiver that warns
+catches Wi-Fi and congestion anywhere on the way. While PTP is settling,
+and for 10 seconds after it steps, the check is skipped and its history
+cleared, because the clock's own corrections spread the margins too. A receiver that warns
 about it adds the tag `urn:x-orpheus:warnings: ["jitter"]` to its IS-04
 resource; the new version bumps `ver_rcv`, the senders' peer watch asks
 the receiver again and warns on its side too. The clock warns about a

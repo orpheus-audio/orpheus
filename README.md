@@ -45,12 +45,13 @@ orpheusctl nodes           # other nodes on the network
 orpheusctl connect Kitchen
 ```
 
-This creates a sink "Kitchen" on the first machine and connects the second
-machine's receiver to it. Whatever is played into the sink comes out of the
-second machine's default output.
+This creates a sink "Kitchen" on the first machine and connects a free
+receiver of the second machine to it. Whatever is played into the sink comes
+out of the second machine's default output. A node plays several streams at
+once; which ones are heard is its [policy](docs/usage.md#several-streams).
 
 ```sh
-orpheusctl status          # clock, receiver and senders
+orpheusctl status          # clock, receivers and senders
 orpheusctl status --watch  # the same, refreshed every second
 orpheusctl disconnect 0    # stop sender 0, disconnect the receiver
 ```

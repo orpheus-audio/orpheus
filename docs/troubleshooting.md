@@ -42,14 +42,16 @@ The log line `PTP unavailable; using the system clock` gives the reason.
 ## PTP runs but never settles
 
 - **Firewall.** PTP needs UDP 319 and 320 in both directions; RTP needs UDP
-  5004, mDNS UDP 5353, and the API TCP 7480. With firewalld:
+  5004 to 5018 (one port in two per receiver, up to `[receiver] max`; see
+  [configuration](configuration.md#receiver)), mDNS UDP 5353, and the API
+  TCP 7480. With firewalld:
 
   ```sh
-  sudo firewall-cmd --permanent --add-port=319-320/udp --add-port=5004/udp --add-port=7480/tcp --add-service=mdns
+  sudo firewall-cmd --permanent --add-port=319-320/udp --add-port=5004-5018/udp --add-port=7480/tcp --add-service=mdns
   sudo firewall-cmd --reload
   ```
 
-  With ufw: `sudo ufw allow 319:320/udp`, `sudo ufw allow 5004/udp`,
+  With ufw: `sudo ufw allow 319:320/udp`, `sudo ufw allow 5004:5018/udp`,
   `sudo ufw allow 5353/udp`, `sudo ufw allow 7480/tcp`.
 - **Every node is master.** If each node reports `master` and itself as
   grandmaster, they don't hear each other's announce messages. Check the
@@ -82,14 +84,16 @@ affected.
 
 ## `connect` fails
 
-- `409 … is playing another sender`: the peer's receiver is connected to
-  another node. Disconnect that one, or take the receiver over with
-  `--force`. A node that died without disconnecting keeps the receiver
-  busy in the same way.
-- `409 already connected … as sender N`: this node already sends there.
-  If `status` shows that sender as `disconnected, paused`, someone else
-  connected the peer's receiver meanwhile; `disconnect` it and connect
-  again, with `--force` to take the receiver back.
+- `409 … is playing another sender`: all of the peer's receivers are
+  connected (`[receiver] max` on the peer). Disconnect one of them, raise
+  `max` there, or take one over with `--force`. A receiver whose sender
+  vanished is freed within 30 seconds once the sending node is back; if it
+  stays away, use `--force`.
+- `409 already connected to … as sender N`: this node already sends there
+  with the same priority. If `status` shows that sender as `disconnected,
+  paused`, it takes the next free receiver of the peer by itself.
+- `409 other senders took …'s free receivers meanwhile`: other nodes
+  connected at the same moment; try again.
 - `502 … no answer`: the peer's API is unreachable: wrong name or address,
   the node is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
   whether the node was discovered and under which address.
@@ -103,12 +107,17 @@ affected.
 
 1. On the receiving node, `orpheusctl status` should show `receiving from …`
    and a rising packet count.
-   - `not connected`: no sender is connected to it, and by default a
+   - only `free, port …`: no sender is connected, and by default a
      receiver plays only a connected sender. Connect with `orpheusctl
      connect` (not `--send-only`), or set `[receiver] accept = "any"`.
    - `connected to …, idle`: the sender points to the wrong address or port
-     (the `PEER` column on the sending node), or a firewall blocks UDP 5004;
-   - no receiver at all: it is disabled in `[receiver]`.
+     (the `PEER` column on the sending node), or a firewall blocks the
+     receiver's port (5004 to 5018);
+   - `receiving from …, muted`: another stream plays and the
+     [policy](usage.md#several-streams) gives it precedence. With the
+     default `last`, the stream is heard again once the other one has been
+     quiet for 5 seconds; set `[receiver] policy = "mix"` to hear all.
+   - no receiver at all: they are disabled in `[receiver]`.
 
    On the sending node, a sender shown as `(disconnected, paused)` or
    `(off)` sends nothing; see [reading the
@@ -119,7 +128,8 @@ affected.
    into the sink named after the peer, for example chosen in `pavucontrol` or with
    `wpctl set-default`.
 4. Check where the receiver plays: the default output unless its stream was
-   moved in `pavucontrol` or with `wpctl`.
+   moved in `pavucontrol` or with `wpctl`, and its volume there.
+   WirePlumber keeps both per sending node.
 5. Check the receiver's connection: `orpheusctl status` shows `off` if it was
    switched off, and `ignored` packets if it only takes another sender. A
    stream sent to it with `--send-only` is ignored while another sender is

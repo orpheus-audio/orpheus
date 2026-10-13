@@ -41,6 +41,8 @@ Two nodes on one machine need separate network namespaces: each needs its own
 ports, and PTP multicast doesn't loop back. Without namespaces, two nodes can
 still share one machine with PTP disabled: give them separate `ORPHEUS_HOME`
 directories and different `[api] listen` and `[receiver] port` values.
+The receivers take every second port from `port` on, so keep the two
+`port` values at least `2 × max` apart, for example 5004 and 5104.
 
 The debug variables `ORPHEUS_DEBUG_CLOCK_SKEW_PPM` and
 `ORPHEUS_DEBUG_CLOCK_OFFSET_MS` skew a node's view of the system clock, so

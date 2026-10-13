@@ -9,7 +9,7 @@ A node keeps its files where the XDG base directory specification says:
 ~/.local/state/orpheus/id       device ID, created on first start
 ~/.local/state/orpheus/routes.json  senders and connections, kept across restarts
 ~/.local/state/orpheus/outputs.json types set for outputs (`orpheusctl set-type`)
-~/.local/state/orpheus/         later also peers, aliases and gains
+~/.local/state/orpheus/peers.json   aliases and pins of other nodes
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
 ```
 
@@ -56,8 +56,11 @@ listen = "[::]:7480"
 [receiver]
 enabled = true
 port = 5004
+max = 8
 link_offset_ms = 10
 accept = "connected"
+policy = "last"
+duck_db = 20
 
 [ptp]
 enabled = true
@@ -128,14 +131,19 @@ the [roadmap](roadmap.md#known-limitations)).
 
 ### `[receiver]`
 
-Every node has one receiver. It plays the RTP stream sent to it on its output.
+A node has a receiver per connection and one free receiver more, so that
+another node can always connect. Each plays the RTP stream sent to it on
+an output; see [several streams](usage.md#several-streams).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Run the receiver. |
-| `port` | `5004` | UDP port for RTP, over IPv4 and IPv6, unless a connection asks for another. |
+| `enabled` | `true` | Run receivers. |
+| `port` | `5004` | UDP port of the first receiver, over IPv4 and IPv6. Receiver *k* listens on `port + 2k`, unless a connection asks for another port. |
+| `max` | `8` | Most receivers, and so most streams played at once: 1 to 32. With the defaults the receivers use ports 5004 to 5018. Once `max` receivers are connected, there is no free one, and another node can connect only with `--force`. |
 | `link_offset_ms` | `10` | Playout delay after the sender's timestamp. It must cover packetization (1 ms), network delay, and the clock error between the nodes. Every receiver of a stream should use the same value so that they play in sync. |
-| `accept` | `"connected"` | What the receiver plays while no sender is connected to it: `"connected"` plays nothing, `"any"` plays any stream sent to its port. |
+| `accept` | `"connected"` | What the free receiver plays: `"connected"` plays nothing, `"any"` plays any stream sent to its port. |
+| `policy` | `"last"` | Which streams are heard when several play at once: `"last"` the one that started most recently, `"first"` the one that started first, `"mix"` all. See [several streams](usage.md#several-streams). |
+| `duck_db` | `20` | How far the other streams are turned down while a high-priority stream plays, in dB: 0 to 96. |
 
 Orpheus connects both ends of a stream: `orpheusctl connect` connects the
 peer's receiver to the new sender through [IS-05](usage.md#connections-is-05),
@@ -145,12 +153,12 @@ for example from `orpheusctl connect --send-only` or an AES67 device sending
 to it. Such a receiver follows one stream at a time: a second sender is
 ignored until the first has been quiet for a second.
 
-The receiver plays on the default output. To play on another one, move its
-stream (named after the connected sender's node, else "Orpheus") in
-`pavucontrol` or with `wpctl`; WirePlumber remembers the choice. Other
-nodes are told what kind of device that output is; see
-[output types](usage.md#output-types). Types are set per output over the
-API, not in this file.
+Receivers play on the default output. To play a stream on another one,
+move it (named after the sending node, else "Orpheus") in `pavucontrol`
+or with `wpctl`; WirePlumber remembers the output and the volume per
+sending node. Other nodes are told what kind of device that output is;
+see [output types](usage.md#output-types). Types are set per output over
+the API, not in this file.
 
 Which streams go where is routing, which belongs to the API, not to this
 file: senders and connections are kept in `routes.json` in the state

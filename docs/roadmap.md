@@ -11,7 +11,7 @@
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
 | M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl`, output types | done, except interop tests |
-| M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes | in progress |
+| M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes (through WirePlumber) | done, except the two-box test |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
 After M6 the API should be stable enough for the web UI.
@@ -28,10 +28,13 @@ and Bluetooth inputs.
 - The stream format is fixed: L24, 48 kHz, stereo, 1 ms packets, payload type
   97. A receiver refuses SDP files for other formats; without an SDP file it
   accepts any payload type.
-- One receiver per node, so a node plays one connection at a time; a second
-  `connect` to it fails unless forced. M5 gives each connection its own
-  receiver (and port), always keeping one free, and mixes them; see
-  [below](#receiver-pool-and-policies).
+- At most `[receiver] max` (8, up to 32) streams per node; the next
+  `connect` needs `--force`.
+- The policy decides by sound, not by what a stream is: a stream of near
+  silence (below -60 dBFS) counts as stopped, and background noise above
+  it counts as playing.
+- Ducking has two levels, `normal` and `high`. Priorities are set by the
+  sender per connection, not by the receiving node.
 - Only `POST /x-orpheus/v1/senders` creates senders; IS-05 can redirect,
   pause and resume them, not create them.
 - IPv6 multicast groups are joined on the system's default interface, so a
@@ -40,15 +43,11 @@ and Bluetooth inputs.
   and the other way round; only `orpheusctl connect` (and `disconnect`) set
   up both ends.
 - A receiver stays connected to a sender that vanished without
-  disconnecting (its node died or lost its state). The next `connect` needs
-  `--force`.
-- Senders find their peer in discovery by the address they send to; a
-  peer that changes its address is not followed, and the sender shows it as
-  unreachable.
-- A sender whose peer's receiver was taken over stays paused until the
-  receiver is connected to it again; it doesn't ask for it back.
-- Two nodes connecting to the same peer at the same moment can both pick
-  its receiver; the later one wins.
+  disconnecting until the sending node is back and says so, or for good if
+  it never comes back or is not an Orpheus node. It costs a receiver, not
+  sound.
+- A peer that changes its address is followed only while discovery sees
+  it; one reached by URL or address is not.
 - `connect` accepts a peer with an NMOS API but no `[receiver]` of the right
   format only with `--send-only`.
 - The sender sizes its buffer from the configured block (`[audio]
@@ -56,8 +55,8 @@ and Bluetooth inputs.
   the block the audio system really runs, and the status doesn't show it.
 - The receiver path has two buffers in a row (its port, then PipeWire's
   cycle). Playing out directly in the realtime callback would save a cycle.
-- The receiver's playback stream runs even when nothing is sent to it, which
-  keeps the PipeWire graph awake.
+- A connected receiver's playback stream runs even when nothing is sent to
+  it, which keeps the PipeWire graph awake.
 - The latency a sender reports to PipeWire covers only its own buffer and the
   resampler, not the link offset and the remote playout.
 - The resampler always runs, even at ratio 1. Its CPU cost has not been
@@ -220,37 +219,19 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 ### Receiver pool and policies
 
-Planned for M5. The receiving node decides what it plays: a sender always
-connects to a free receiver, and the node's policy only sets each stream's
-volume. Connections are never refused or taken over because of the policy.
+Done in M5, see [usage](usage.md#several-streams). The receiving node
+decides what it plays: a sender always connects to a free receiver, and
+the node's policy only sets each stream's volume. Open ideas:
 
-- **One receiver per connection.** A node advertises one NMOS receiver more
-  than it has connections, so there is always a free one, up to `[receiver]
-  max` (8). Receiver *k* listens on port 5004 + 2*k* (firewalls should allow
-  5004–5018) and has its own playback stream, named after its sender and
-  running only while it is connected (with `accept = "any"`, the free
-  receiver runs too and plays unconnected streams). PipeWire sums the
-  streams, so mixing costs nothing extra. WirePlumber remembers each stream's
-  volume and output per sending node.
-- **Policies**, set per node with `[receiver] policy`: `last` (the default)
-  plays whoever started playing most recently and fades the others out; when
-  it stops, the one before comes back. `first` keeps playing whoever started
-  first until it stops. `mix` plays everything. "Playing" means sound above
-  -60 dBFS within the last 5 s, not merely a connection, so a paused phone
-  doesn't block the speaker. A muted sender shows `muted by policy`.
-- **Ducking.** A connection can have priority `high` (`connect --priority
-  high`, for a doorbell or announcements). While a high-priority stream
-  plays, all others are lowered by `[receiver] duck_db`; the policy applies
-  among the normal ones.
-- **Following peers.** A sender follows its peer by node ID when its
-  address changes, takes a free receiver again when its own was taken over,
-  and checks after connecting that it won a race for the receiver. A
-  receiver whose sender no longer exists is freed.
-- **Pins and aliases.** A node can pin peers, which stay listed while
-  offline, and give them local names, which name their sinks.
-
-Sample-rate changes come with the AES67 extended mode (44.1, 96 kHz), as the
-native format is fixed.
+- Priorities and policies set by the receiving node per sending node or
+  per source type (a doorbell always high, the TV never ducked), instead
+  of only by the sender.
+- More than two priority levels, and ducking by a configurable amount per
+  connection.
+- A policy by output: streams on different outputs of one node (kitchen
+  speaker, headphones) need not compete.
+- Sample-rate changes come with the AES67 extended mode (44.1, 96 kHz), as
+  the native format is fixed.
 
 ### Graphs
 

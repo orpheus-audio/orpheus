@@ -207,7 +207,8 @@ pub enum PeerState {
     /// that the stream plays again when the peer is back.
     Unreachable,
     /// The receiver plays another sender, or none: someone else connected
-    /// it. The sender pauses until the receiver is connected to it again.
+    /// it. The sender pauses until the receiver is connected to it again,
+    /// or, if another sender took it, until the peer has a free one.
     Disconnected,
 }
 
