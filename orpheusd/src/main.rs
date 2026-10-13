@@ -5,6 +5,8 @@ mod config;
 mod connection;
 mod home;
 mod nmos;
+mod outputs;
+mod peer;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -92,10 +94,15 @@ async fn main() -> Result<()> {
         )),
         quantum: config.audio.quantum,
         receiver_port: config.receiver.port,
+        accept: config.receiver.accept,
+        outputs: Mutex::new(outputs::Overrides::load(
+            home.state_dir().join("outputs.json"),
+        )),
     });
     connection::restore(&node);
 
     let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));
+    let peers = tokio::spawn(connection::follow_peers(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -103,7 +110,9 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown())
         .await?;
     refresh.abort();
+    peers.abort();
     let _ = refresh.await;
+    let _ = peers.await;
     drop(node);
     tracing::info!("stopped");
     Ok(())

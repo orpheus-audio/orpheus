@@ -12,7 +12,7 @@ pub mod port;
 pub mod receiver;
 pub mod sender;
 
-pub use backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
+pub use backend::{AudioBackend, BackendError, Output, StreamControl, StreamHandle, StreamSpec};
 pub use engine::{Engine, EngineStatus, LoopbackConfig, SenderId};
 pub use port::{CapturePort, PlaybackPort, PortStats, StatsSnapshot, port_pair};
 pub use receiver::{Filter, Group, ReceiverConfig, ReceiverStatus};

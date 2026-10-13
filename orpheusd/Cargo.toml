@@ -27,6 +27,7 @@ utoipa-axum = "0.3"
 timestamped-socket = { version = "0.3", default-features = false }
 tower = "0.5"
 serde_json = "1"
+ureq = { version = "3", default-features = false, features = ["json"] }
 tower-http = { version = "0.6", features = ["cors", "normalize-path"] }
 
 [dev-dependencies]

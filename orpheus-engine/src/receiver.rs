@@ -188,6 +188,8 @@ fn bind(listen: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 pub(crate) struct Receiver {
+    /// The configured description of the playback stream.
+    description: String,
     /// The address to listen on, with whatever port.
     bind_ip: IpAddr,
     link_offset_ms: u32,
@@ -198,7 +200,7 @@ pub(crate) struct Receiver {
     buffer: Arc<PortStats>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    _playback: StreamHandle,
+    playback: StreamHandle,
 }
 
 impl Receiver {
@@ -275,6 +277,7 @@ impl Receiver {
             move || rx.run(&stop)
         })?;
         Ok(Self {
+            description: cfg.description.clone(),
             bind_ip: cfg.listen.ip(),
             link_offset_ms: cfg.link_offset_ms,
             filter,
@@ -283,7 +286,7 @@ impl Receiver {
             buffer,
             stop,
             thread: Some(thread),
-            _playback: playback,
+            playback,
         })
     }
 
@@ -302,6 +305,17 @@ impl Receiver {
         *current = filter;
         self.filter.generation.fetch_add(1, Relaxed);
         Ok(())
+    }
+
+    /// Renames the playback stream; `None` gives it its configured name.
+    pub fn describe(&self, description: Option<&str>) {
+        self.playback
+            .describe(description.unwrap_or(&self.description));
+    }
+
+    /// The output the playback stream plays on, if known.
+    pub fn output(&self) -> Option<String> {
+        self.playback.output()
     }
 
     /// Moves to another UDP port, keeping the group joined.

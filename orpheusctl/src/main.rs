@@ -29,19 +29,42 @@ enum Command {
         #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1")]
         watch: Option<f64>,
     },
-    /// Send the node's audio to a peer: creates a sink "<name>"
-    /// whose audio is streamed to the peer.
+    /// Send the node's audio to a peer: creates a sink "<name>" whose
+    /// audio is streamed to a free receiver of the peer, and connects that
+    /// receiver to it.
     Connect {
-        /// Peer: host name or address, optionally with :port (default 5004);
-        /// IPv6 with a port as [addr]:port.
+        /// Peer: its name or ID (see `nodes`), host name or address, or the
+        /// URL of its API. With --send-only: host name or address,
+        /// optionally with :port (default 5004); IPv6 with a port as
+        /// [addr]:port.
         peer: String,
-        /// Name shown in the sink; defaults to the peer address.
+        /// Name shown in the sink; defaults to the peer's name.
         #[arg(long)]
         name: Option<String>,
+        /// Only send; don't connect a receiver on the peer (for receivers
+        /// without an NMOS API, or set to accept any stream).
+        #[arg(long)]
+        send_only: bool,
+        /// Take over the peer's receiver even if another sender is
+        /// connected to it.
+        #[arg(long)]
+        force: bool,
     },
     /// List the other nodes on the network.
     Nodes,
-    /// Stop a sender started with `connect`.
+    /// List the node's outputs and their types.
+    Outputs,
+    /// Set what kind of device an output is, which other nodes show.
+    SetType {
+        /// The output: its name or description, or a unique part of either.
+        output: String,
+        /// speaker, headphones, headset, tv, hifi, computer, portable,
+        /// phone or generic; `auto` goes back to the detected type.
+        #[arg(name = "TYPE")]
+        kind: String,
+    },
+    /// Stop a sender started with `connect` and disconnect the peer's
+    /// receiver.
     Disconnect {
         /// Sender ID, as shown by `status`.
         id: u32,
@@ -121,6 +144,27 @@ struct Receiver {
     #[serde(default)]
     asrc_ppm: f64,
     buffer: Buffer,
+    /// `connected` or `any`; missing from older nodes.
+    accept: Option<String>,
+    /// The connected sender's name or address.
+    sender: Option<String>,
+    /// The kind of output; missing from older nodes.
+    output: Option<String>,
+    /// Description of the output it plays on.
+    plays_on: Option<String>,
+}
+
+/// An output of a node.
+#[derive(Clone, Deserialize)]
+struct Output {
+    name: String,
+    description: String,
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "override")]
+    overridden: Option<String>,
+    default: bool,
+    receiver: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -155,11 +199,17 @@ struct Node {
 struct NewSender {
     peer: String,
     name: Option<String>,
+    send_only: bool,
+    force: bool,
 }
 
 #[derive(Deserialize)]
 struct Created {
     id: u32,
+    /// Missing from older nodes.
+    name: Option<String>,
+    destination: Option<String>,
+    receiver: Option<String>,
 }
 
 impl Status {
@@ -230,19 +280,36 @@ fn main() -> Result<()> {
             anyhow::ensure!(secs >= 0.1, "--watch needs at least 0.1 seconds");
             watch(base, Duration::from_secs_f64(secs), cli.json)?;
         }
-        Command::Connect { peer, name } => {
+        Command::Connect {
+            peer,
+            name,
+            send_only,
+            force,
+        } => {
             let url = format!("{base}/x-orpheus/v1/senders");
-            let created: Created = ureq::post(&url)
-                .send_json(NewSender {
+            let raw = post(
+                &url,
+                NewSender {
                     peer: peer.clone(),
                     name,
-                })
-                .and_then(|mut r| r.body_mut().read_json())
-                .with_context(|| format!("connecting to {peer} via {url}"))?;
+                    send_only,
+                    force,
+                },
+            )
+            .with_context(|| format!("connecting to {peer} via {url}"))?;
             if cli.json {
-                println!("{}", serde_json::json!({ "id": created.id }));
+                println!("{}", raw.trim_end());
             } else {
-                println!("sender {} → {peer}", created.id);
+                let c: Created = serde_json::from_str(&raw)
+                    .with_context(|| format!("reading the reply from {url}"))?;
+                let name = c.name.as_deref().unwrap_or(&peer);
+                let to = c.destination.as_deref().unwrap_or(&peer);
+                let how = if c.receiver.is_some() {
+                    "receiver connected"
+                } else {
+                    "send only"
+                };
+                println!("sender {} \"{name}\" → {to} ({how})", c.id);
             }
         }
         Command::Nodes => {
@@ -259,6 +326,33 @@ fn main() -> Result<()> {
                 print!("{}", render_nodes(&nodes, Paint::detect()));
             }
         }
+        Command::Outputs => {
+            let raw = get(&format!("{base}/x-orpheus/v1/outputs"))?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let outputs: Vec<Output> =
+                    serde_json::from_str(&raw).context("reading the outputs")?;
+                print!("{}", render_outputs(&outputs, Paint::detect()));
+            }
+        }
+        Command::SetType { output, kind } => {
+            let outputs: Vec<Output> =
+                serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
+                    .context("reading the outputs")?;
+            let o = find_output(&outputs, &output)?;
+            let url = format!("{base}/x-orpheus/v1/outputs/{}", encode(&o.name));
+            if kind == "auto" {
+                match ureq::delete(&url).call() {
+                    Ok(_) | Err(ureq::Error::StatusCode(404)) => {}
+                    Err(e) => return Err(e).with_context(|| format!("resetting via {url}")),
+                }
+            } else {
+                ureq::put(&url)
+                    .send_json(serde_json::json!({ "type": kind }))
+                    .with_context(|| format!("setting {kind} via {url}"))?;
+            }
+        }
         Command::Disconnect { id } => {
             let url = format!("{base}/x-orpheus/v1/senders/{id}");
             ureq::delete(&url)
@@ -267,6 +361,68 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// GETs a body as text.
+fn get(url: &str) -> Result<String> {
+    ureq::get(url)
+        .call()
+        .and_then(|mut r| r.body_mut().read_to_string())
+        .with_context(|| format!("querying {url}"))
+}
+
+/// The output `query` names: by name, by description, or by a part of
+/// either that only one has.
+fn find_output<'a>(outputs: &'a [Output], query: &str) -> Result<&'a Output> {
+    let q = query.to_lowercase();
+    if let Some(o) = outputs
+        .iter()
+        .find(|o| o.name == query || o.description.to_lowercase() == q)
+    {
+        return Ok(o);
+    }
+    let found: Vec<&Output> = outputs
+        .iter()
+        .filter(|o| o.name.to_lowercase().contains(&q) || o.description.to_lowercase().contains(&q))
+        .collect();
+    match found[..] {
+        [o] => Ok(o),
+        [] => anyhow::bail!("no output matches {query:?}; see `orpheusctl outputs`"),
+        _ => anyhow::bail!(
+            "{query:?} matches {}; be more specific",
+            found
+                .iter()
+                .map(|o| format!("{:?}", o.description))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Percent-encodes a path segment.
+fn encode(segment: &str) -> String {
+    segment
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+/// POSTs JSON; an error status becomes an error with the node's message.
+fn post(url: &str, body: impl Serialize) -> Result<String> {
+    let mut r = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+        .post(url)
+        .send_json(body)?;
+    let text = r.body_mut().read_to_string()?;
+    anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
+    Ok(text)
 }
 
 /// The status as the node sent it, and parsed.
@@ -546,13 +702,32 @@ fn clock(o: &mut String, p: Paint, t: &Ptp) {
 }
 
 fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
-    let mark = match r.ssrc {
+    let waiting = r.sender.is_none() && r.accept.as_deref() == Some("connected");
+    let mark = match (r.ssrc, &r.sender) {
+        _ if !r.enabled && waiting => p.mark(Level::Off, "not connected"),
         _ if !r.enabled => p.mark(Level::Off, "off"),
-        Some(ssrc) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
-        None => p.mark(Level::Off, "idle"),
+        (Some(_), Some(from)) => p.mark(Level::Good, &format!("receiving from {from}")),
+        (Some(ssrc), None) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
+        (None, Some(from)) => p.mark(Level::Off, &format!("connected to {from}, idle")),
+        (None, None) => p.mark(Level::Off, "idle"),
     };
     heading(o, p, "Receiver", Some(mark));
     row(o, p, "listen", &r.listen);
+    if let Some(accept) = &r.accept {
+        let accept = match accept.as_str() {
+            "connected" => "connected senders",
+            "any" => "any sender",
+            other => other,
+        };
+        row(o, p, "accepts", accept);
+    }
+    if let Some(output) = &r.output {
+        let output = match &r.plays_on {
+            Some(on) => format!("{output} ({on})"),
+            None => output.clone(),
+        };
+        row(o, p, "output", &output);
+    }
     row(o, p, "link offset", &format!("{} ms", r.link_offset_ms));
     let margin = match r.margin_us {
         Some(m) => {
@@ -649,10 +824,44 @@ fn table<const N: usize>(
         }
         l
     };
-    let _ = writeln!(o, "{}", p.dim(&line(header)));
+    let _ = writeln!(o, "{}", p.dim(line(header).trim_end()));
     for r in rows {
-        let _ = writeln!(o, "{}", line(r.each_ref().map(String::as_str)));
+        let _ = writeln!(o, "{}", line(r.each_ref().map(String::as_str)).trim_end());
     }
+}
+
+/// A node's outputs.
+fn render_outputs(outputs: &[Output], p: Paint) -> String {
+    let mut o = String::new();
+    if outputs.is_empty() {
+        let _ = writeln!(o, "{}", p.mark(Level::Off, "no outputs"));
+        return o;
+    }
+    let rows: Vec<[String; 4]> = outputs
+        .iter()
+        .map(|out| {
+            let kind = match &out.overridden {
+                Some(_) => format!("{} (set)", out.kind),
+                None => out.kind.clone(),
+            };
+            let mut notes = Vec::new();
+            if out.receiver {
+                notes.push("receiver");
+            }
+            if out.default {
+                notes.push("default");
+            }
+            [
+                out.description.clone(),
+                kind,
+                out.name.clone(),
+                notes.join(", "),
+            ]
+        })
+        .collect();
+    let header = ["OUTPUT", "TYPE", "NAME", ""];
+    table(&mut o, p, header, [false; 4], &rows);
+    o
 }
 
 /// The nodes a node found on the network.
@@ -785,6 +994,27 @@ Senders
     }
 
     #[test]
+    fn shows_connections() {
+        let mut s: Status = serde_json::from_str(STATUS).unwrap();
+        let r = s.receiver.as_mut().unwrap();
+        r.accept = Some("connected".into());
+        r.output = Some("speaker".into());
+        r.sender = Some("Laptop".into());
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("Receiver       ● receiving from Laptop\n"),
+            "{out}"
+        );
+        assert!(out.contains("  accepts      connected senders\n"), "{out}");
+        assert!(out.contains("  output       speaker\n"), "{out}");
+        let r = s.receiver.as_mut().unwrap();
+        r.sender = None;
+        r.enabled = false;
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(out.contains("Receiver       ○ not connected\n"), "{out}");
+    }
+
+    #[test]
     fn colour_stays_out_of_alignment() {
         let s: Status = serde_json::from_str(STATUS).unwrap();
         let plain = render(&s, Paint(false), Counts::Total);
@@ -801,6 +1031,32 @@ Senders
             })
             .collect::<String>();
         assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn outputs() {
+        let outputs: Vec<Output> = serde_json::from_str(
+            r#"[
+                {"name":"alsa_output.pci-0000_00_1f.3.analog-stereo","description":"Built-in Audio",
+                 "type":"hifi","detected":"computer","override":"hifi","default":true,"receiver":true},
+                {"name":"orpheus.send.0","description":"Kitchen","type":"speaker",
+                 "detected":"speaker","default":false,"receiver":false}
+            ]"#,
+        )
+        .unwrap();
+        let expected = "  OUTPUT          TYPE        NAME\n  Built-in Audio  hifi (set)  alsa_output.pci-0000_00_1f.3.analog-stereo  receiver, default\n  Kitchen         speaker     orpheus.send.0\n";
+        assert_eq!(render_outputs(&outputs, Paint(false)), expected);
+        assert_eq!(
+            find_output(&outputs, "kitchen").unwrap().name,
+            "orpheus.send.0"
+        );
+        assert_eq!(
+            find_output(&outputs, "pci").unwrap().description,
+            "Built-in Audio"
+        );
+        assert!(find_output(&outputs, "i").is_err());
+        assert!(find_output(&outputs, "nope").is_err());
+        assert_eq!(encode("a b/c"), "a%20b%2Fc");
     }
 
     #[test]

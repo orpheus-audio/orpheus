@@ -98,6 +98,8 @@ impl Session<'_> {
 /// What a receiver needs from an SDP file: the first audio stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stream {
+    /// The session name (`s=`), which names the sender.
+    pub name: String,
     /// Where packets come from: the source filter, else the origin.
     pub source: Option<IpAddr>,
     /// The connection address: unicast to the receiver, or a group.
@@ -113,6 +115,7 @@ pub struct Stream {
 /// Reads the first `m=audio` section with RTP/AVP.
 pub fn parse(sdp: &str) -> Result<Stream, String> {
     let mut origin = None;
+    let mut name = String::new();
     let mut session_c = None;
     // Inside the first audio section: connection, port, payload type.
     let mut media: Option<(Option<IpAddr>, u16, u8)> = None;
@@ -138,6 +141,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
                 }
             }
             _ if done => {}
+            "s" if media.is_none() => name = value.trim().to_owned(),
             "o" => origin = value.split_whitespace().nth(5).and_then(|a| a.parse().ok()),
             "c" => {
                 let addr = connection(value).ok_or_else(|| format!("bad connection {line:?}"))?;
@@ -173,6 +177,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
     let destination = c.or(session_c).ok_or("no connection address")?;
     let (encoding, rate, channels) = rtpmap.ok_or("no rtpmap for the payload type")?;
     Ok(Stream {
+        name,
         source: filter.or(origin).filter(|ip: &IpAddr| !ip.is_unspecified()),
         destination,
         port,
@@ -264,6 +269,7 @@ mod tests {
         assert_eq!(
             parse(&sdp),
             Ok(Stream {
+                name: "Living room".into(),
                 source: Some("192.168.1.10".parse().unwrap()),
                 destination: "192.168.1.20".parse().unwrap(),
                 port: 5004,
@@ -282,6 +288,7 @@ mod tests {
                    m=video 5000 RTP/AVP 96\na=rtpmap:96 raw/90000\n\
                    m=audio 5006 RTP/AVP 96\na=rtpmap:96 L16/44100\n";
         let s = parse(sdp).unwrap();
+        assert_eq!(s.name, "x");
         assert_eq!(s.source, Some("10.0.0.9".parse().unwrap()));
         assert_eq!(s.destination, "239.1.2.3".parse::<IpAddr>().unwrap());
         assert_eq!((s.port, s.payload_type), (5006, 96));

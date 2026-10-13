@@ -1093,6 +1093,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "ureq",
  "utoipa",
  "utoipa-axum",
 ]

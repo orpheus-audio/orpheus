@@ -10,8 +10,8 @@
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
-| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04, SDP, IS-05 done |
-| M5 | Memory and policy: pinned peers, aliases, route restore on reconnect, per-sender gains; mixing policies and ducking; sample-rate changes | planned |
+| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04, SDP, IS-05, connecting both ends done; docs open |
+| M5 | Receiver pool and policy: one receiver per connection, mixing policies (mix, first sender wins, last sender wins) and ducking; pinned peers, aliases, route restore on reconnect, per-sender gains; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
 After M6 the API should be stable enough for the web UI.
@@ -28,16 +28,29 @@ and Bluetooth inputs.
 - The stream format is fixed: L24, 48 kHz, stereo, 1 ms packets, payload type
   97. A receiver refuses SDP files for other formats; without an SDP file it
   accepts any payload type.
-- One receiver per node, following one stream at a time. Mixing comes in M5.
+- One receiver per node, so a node plays one connection at a time; a second
+  `connect` to it fails unless forced. M5 gives each connection its own
+  receiver (and port), always keeping one free, and mixes them; see
+  [below](#receiver-pool-and-policies).
 - Only `POST /x-orpheus/v1/senders` creates senders; IS-05 can redirect,
   pause and resume them, not create them.
 - Multicast (interop only) has no guard rails yet: nothing warns when a
   multicast stream runs over Wi-Fi. `orpheusctl status` and the log should.
 - IPv6 multicast groups are joined on the system's default interface, so a
   node without an IPv6 default route can't join them.
-- A connection made on a receiver doesn't reach the sender, and the other
-  way round: a controller patches both, or `orpheusctl connect` patches the
-  sender only.
+- A connection made on a receiver through IS-05 doesn't reach the sender,
+  and the other way round; only `orpheusctl connect` (and `disconnect`) set
+  up both ends.
+- A receiver stays connected to a sender that vanished without
+  disconnecting (its node died or lost its state). The next `connect` needs
+  `--force`.
+- After a restart a sender resumes sending without checking that the peer's
+  receiver is still connected to it; if it isn't, the packets are ignored
+  there.
+- Two nodes connecting to the same peer at the same moment can both pick
+  its receiver; the later one wins.
+- `connect` accepts a peer with an NMOS API but no `[receiver]` of the right
+  format only with `--send-only`.
 - The sender sizes its buffer from `[audio] quantum` (or assumes 1024 frames)
   instead of reading the real quantum.
 - The receiver path has two buffers in a row (its port, then PipeWire's
@@ -69,13 +82,15 @@ and Bluetooth inputs.
 **Control**
 
 - The HTTP API has no authentication.
-- Nodes are discovered, but peers are still addressed by host name or IP.
 - NMOS: peer-to-peer discovery only; nodes don't register with an NMOS
   registry. Interfaces don't name the switch port they are attached to
   (`attached_network_device`), and receivers have no BCP-004 capabilities
   yet.
-- The output type of a node's own output is not detected yet; its receiver
-  announces `generic`.
+- Output types are detected from PipeWire's form factor and profile name
+  only; the active port of a sound card (headphone jack or speakers) is not
+  looked at. Outputs are matched by their PipeWire name, so a type set for a
+  USB device is lost if its name changes. Senders poll their peer's type
+  every 5 seconds instead of following its IS-04 change counter.
 
 ## Future work
 
@@ -161,15 +176,13 @@ network delay, and no jitter or loss. Expected problems on real networks:
   offsets, clock settings in M6) relate to the file, for example the file as
   defaults that the API overrides, with the API showing where each value
   comes from.
-- **Connecting by name** (M4): `orpheusctl connect Kitchen`, resolved through
-  discovery by the node's announced name or ID instead of a host name.
 - **Output types** (M4). Each output of a device announces a type, and other
   nodes show its sink with a matching icon and PipeWire `device.form-factor`.
   Outputs are typed separately, so an AV receiver's zones can differ. The
   owning device announces the type (detected from its own output where
-  possible, otherwise set by config or API); like names, every other node can
-  override it locally. Announced as an NMOS IS-04 tag such as
-  `urn:x-orpheus:form-factor`.
+  possible, otherwise set over the API); like names, every other node can
+  override it locally. Announced as the NMOS IS-04 tag
+  `urn:x-orpheus:form-factor`. Done in M4, see [usage](usage.md#output-types).
 
   | Type | form-factor | Icon |
   |---|---|---|
@@ -190,12 +203,27 @@ network delay, and no jitter or loss. Expected problems on real networks:
   `hicolor` fallback theme and look like Adwaita in every theme. The table is
   configurable in `[icons]`; the type itself and the form-factor are not.
 
-  For now, every network sink is `generic`.
-
-  Later (M4/M5), stored in the state directory like aliases: a local type
-  override per sink, and as an advanced option a raw icon name per sink.
+  `--send-only` sinks are `generic` unless set. Later, as an advanced
+  option, a raw icon name per sink.
 - **Source types** (todo): the same for inputs, such as microphone, turntable
   or TV audio.
+
+### Receiver pool and policies
+
+Planned for M5, after connecting both ends (M4):
+
+- **One receiver per connection.** A node advertises one NMOS receiver more
+  than it has connections, so there is always a free one, up to about
+  eight. Each listens on its own port (5004, 5006, …; firewalls should allow
+  5004–5018) and has its own playback stream, named after its sender and
+  created only while it is connected. PipeWire sums the streams, so mixing
+  costs nothing extra, and an idle node keeps no stream running.
+- **Policies**, set per node: `mix` plays every connection; `first` (first
+  sender wins) refuses new connections while one plays; `last` (last sender
+  wins) mutes or drops the older one. Implemented as per-stream volumes, so
+  ducking (lowering the others while one plays) fits the same model.
+- With `accept = "any"`, the free receiver also plays unconnected streams,
+  as the single receiver does now.
 
 ### Graphs
 

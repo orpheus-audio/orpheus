@@ -8,6 +8,7 @@ A node keeps its files where the XDG base directory specification says:
 ~/.config/orpheus/config.toml   configuration, optional, hand-edited
 ~/.local/state/orpheus/id       device ID, created on first start
 ~/.local/state/orpheus/routes.json  senders and connections, kept across restarts
+~/.local/state/orpheus/outputs.json types set for outputs (`orpheusctl set-type`)
 ~/.local/state/orpheus/         later also peers, aliases and gains
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
 ```
@@ -56,6 +57,7 @@ listen = "[::]:7480"
 enabled = true
 port = 5004
 link_offset_ms = 10
+accept = "connected"
 
 [ptp]
 enabled = true
@@ -99,15 +101,22 @@ Every node has one receiver. It plays the RTP stream sent to it on its output.
 | `enabled` | `true` | Run the receiver. |
 | `port` | `5004` | UDP port for RTP, over IPv4 and IPv6, unless a connection asks for another. |
 | `link_offset_ms` | `10` | Playout delay after the sender's timestamp. It must cover packetization (1 ms), network delay, and the clock error between the nodes. Every receiver of a stream should use the same value so that they play in sync. |
+| `accept` | `"connected"` | What the receiver plays while no sender is connected to it: `"connected"` plays nothing, `"any"` plays any stream sent to its port. |
 
-The receiver follows one stream at a time. If a second sender streams to the
-same node, it is ignored until the first one has been quiet for a second. A
-connection made over [IS-05](usage.md#connections-is-05) can limit it to one
-sender, or switch it off.
+Orpheus connects both ends of a stream: `orpheusctl connect` connects the
+peer's receiver to the new sender through [IS-05](usage.md#connections-is-05),
+and the receiver then plays only that sender. With `accept = "any"` a
+receiver without a connection also plays streams that nobody connected,
+for example from `orpheusctl connect --send-only` or an AES67 device sending
+to it. Such a receiver follows one stream at a time: a second sender is
+ignored until the first has been quiet for a second.
 
 The receiver plays on the default output. To play on another one, move its
-stream (named after the node) in `pavucontrol` or with `wpctl`; WirePlumber
-remembers the choice.
+stream (named after the connected sender's node, else "Orpheus") in
+`pavucontrol` or with `wpctl`; WirePlumber remembers the choice. Other
+nodes are told what kind of device that output is; see
+[output types](usage.md#output-types). Types are set per output over the
+API, not in this file.
 
 Which streams go where is routing, which belongs to the API, not to this
 file: senders and connections are kept in `routes.json` in the state

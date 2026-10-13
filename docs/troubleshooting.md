@@ -72,14 +72,32 @@ Fix it on the switch or router: enable an IGMP querier (MLD querier for
 IPv6), or disable snooping. Unmanaged switches don't snoop and are not
 affected.
 
+## `connect` fails
+
+- `409 … is playing another sender`: the peer's receiver is connected to
+  another node. Disconnect that one, or take the receiver over with
+  `--force`. A node that died without disconnecting keeps the receiver
+  busy in the same way.
+- `409 already connected … as sender N`: this node already sends there.
+- `502 … no answer`: the peer's API is unreachable: wrong name or address,
+  the node is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
+  whether the node was discovered and under which address.
+- `502 … refused`: the peer's receiver rejected the connection; the message
+  says why.
+- `400 … the peer's receiver chooses the port`: a port goes only with
+  `--send-only`. To reach a node whose API is on another port, give its URL,
+  for example `http://192.168.1.20:7481`.
+
 ## No sound
 
-1. On the receiving node, `orpheusctl status` should show `receiving ssrc …`
-   and a rising packet count. If it stays `idle`:
-   - the sender points to the wrong address or port (the `PEER` column on
-     the sending node);
-   - a firewall blocks UDP 5004;
-   - the receiver is disabled, or `[receiver] port` differs.
+1. On the receiving node, `orpheusctl status` should show `receiving from …`
+   and a rising packet count.
+   - `not connected`: no sender is connected to it, and by default a
+     receiver plays only a connected sender. Connect with `orpheusctl
+     connect` (not `--send-only`), or set `[receiver] accept = "any"`.
+   - `connected to …, idle`: the sender points to the wrong address or port
+     (the `PEER` column on the sending node), or a firewall blocks UDP 5004;
+   - no receiver at all: it is disabled in `[receiver]`.
 2. If packets arrive but count as `late` or `early`, the clocks disagree. See
    the next section.
 3. Check that the sender's sink actually gets audio: the application must play
@@ -88,7 +106,9 @@ affected.
 4. Check where the receiver plays: the default output unless its stream was
    moved in `pavucontrol` or with `wpctl`.
 5. Check the receiver's connection: `orpheusctl status` shows `off` if it was
-   switched off, and `ignored` packets if it only takes another sender:
+   switched off, and `ignored` packets if it only takes another sender. A
+   stream sent to it with `--send-only` is ignored while another sender is
+   connected, or with `accept = "connected"`:
 
    ```sh
    curl -s localhost:7480/x-nmos/connection/v1.1/single/receivers/ | jq

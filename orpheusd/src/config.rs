@@ -9,7 +9,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use orpheus_clock::ptp::PtpTransport;
 use orpheus_core::OutputType;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -63,6 +64,8 @@ pub struct ReceiverConfig {
     /// Playout delay after the sender's timestamp. Covers network delay and
     /// the clock error between the nodes.
     pub link_offset_ms: u32,
+    /// What the receiver plays while no sender is connected to it.
+    pub accept: Accept,
 }
 
 impl Default for ReceiverConfig {
@@ -71,8 +74,21 @@ impl Default for ReceiverConfig {
             enabled: true,
             port: RTP_PORT,
             link_offset_ms: 10,
+            accept: Accept::default(),
         }
     }
+}
+
+/// Which streams a receiver plays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Accept {
+    /// Only a sender connected to it (through IS-05, which `orpheusctl
+    /// connect` does on both ends).
+    #[default]
+    Connected,
+    /// Also any stream sent to its port while no sender is connected.
+    Any,
 }
 
 /// Clock synchronization with the other nodes (and AES67 devices). Without
@@ -215,8 +231,12 @@ mod tests {
         let c = Config::default();
         assert!(c.receiver.enabled);
         assert_eq!(c.receiver.port, 5004);
+        assert_eq!(c.receiver.accept, Accept::Connected);
         let c: Config = toml::from_str("[receiver]\nlink_offset_ms = 3").unwrap();
         assert_eq!(c.receiver.link_offset_ms, 3);
         assert_eq!(c.receiver.port, 5004);
+        let c: Config = toml::from_str("[receiver]\naccept = \"any\"").unwrap();
+        assert_eq!(c.receiver.accept, Accept::Any);
+        assert!(toml::from_str::<Config>("[receiver]\naccept = \"all\"").is_err());
     }
 }

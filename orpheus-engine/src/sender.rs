@@ -43,6 +43,8 @@ pub struct SenderConfig {
     pub format: AudioFormat,
     pub encoding: Encoding,
     pub peer: SocketAddr,
+    /// The kind of output at the other end, which the sink shows.
+    pub remote: OutputType,
     /// Frames per audio-system cycle, as configured.
     pub quantum: Option<u32>,
 }
@@ -164,10 +166,15 @@ pub(crate) struct Sender {
     buffer: Arc<PortStats>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
-    _sink: StreamHandle,
+    sink: StreamHandle,
 }
 
 impl Sender {
+    /// Changes the kind of output the sink shows.
+    pub fn set_remote(&self, remote: OutputType) {
+        self.sink.set_remote(remote);
+    }
+
     pub fn start(
         backend: &mut dyn AudioBackend,
         clock: Arc<dyn Clock>,
@@ -192,7 +199,7 @@ impl Sender {
                 description: cfg.description.clone(),
                 format,
                 group: None,
-                remote: Some(OutputType::Generic),
+                remote: Some(cfg.remote),
                 quantum: cfg.quantum,
                 process_latency: (target + asrc.delay()) as u32,
             },
@@ -222,7 +229,7 @@ impl Sender {
             buffer,
             stop,
             thread: Some(thread),
-            _sink: sink,
+            sink,
         })
     }
 

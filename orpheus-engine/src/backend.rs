@@ -49,18 +49,78 @@ pub trait AudioBackend: Send {
         spec: &StreamSpec,
         port: PlaybackPort,
     ) -> Result<StreamHandle, BackendError>;
+
+    /// The audio system's outputs.
+    fn outputs(&self) -> Vec<Output> {
+        Vec::new()
+    }
+}
+
+/// An output of the audio system, such as a sound card or another node's
+/// sink.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Output {
+    /// Stable machine name.
+    pub name: String,
+    /// Name shown to the user.
+    pub description: String,
+    /// What the audio system says it is.
+    pub kind: OutputType,
+    /// Whether streams go here unless moved.
+    pub default: bool,
+}
+
+/// What a backend can do with a running stream besides removing it.
+pub trait StreamControl: Send {
+    /// Changes the name shown to the user.
+    fn describe(&self, _description: &str) {}
+    /// Changes the kind of output at the other end (for sinks to other
+    /// nodes).
+    fn set_remote(&self, _remote: OutputType) {}
+    /// For a playback stream: the name of the output it plays on, if it
+    /// is linked to one.
+    fn output(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Keeps a backend stream alive; dropping it removes the stream.
 pub struct StreamHandle {
     close: Option<Box<dyn FnOnce() + Send>>,
+    control: Option<Box<dyn StreamControl>>,
 }
 
 impl StreamHandle {
     pub fn new(close: impl FnOnce() + Send + 'static) -> Self {
         Self {
             close: Some(Box::new(close)),
+            control: None,
         }
+    }
+
+    /// Lets the running stream be changed through `control`.
+    pub fn with_control(mut self, control: impl StreamControl + 'static) -> Self {
+        self.control = Some(Box::new(control));
+        self
+    }
+
+    /// Changes the name shown to the user, where the backend can.
+    pub fn describe(&self, description: &str) {
+        if let Some(c) = &self.control {
+            c.describe(description);
+        }
+    }
+
+    /// Changes the kind of output at the other end, where the backend can.
+    pub fn set_remote(&self, remote: OutputType) {
+        if let Some(c) = &self.control {
+            c.set_remote(remote);
+        }
+    }
+
+    /// The output a playback stream plays on, where the backend knows.
+    pub fn output(&self) -> Option<String> {
+        self.control.as_ref().and_then(|c| c.output())
     }
 }
 

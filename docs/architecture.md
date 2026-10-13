@@ -42,7 +42,7 @@ Linux.
 | `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of statime. |
 | `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, the receiver, ASRC, the `AudioBackend` trait. |
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
-| `orpheusd` | The node daemon: config, home directory, HTTP API. |
+| `orpheusd` | The node daemon: config, home directory, HTTP API, NMOS APIs, connecting to other nodes. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
 | `orpheus-discovery` | Announces the node over mDNS and keeps the list of other nodes. |
 | `orpheus-nmos` | NMOS IS-04 resources, IDs and versions; IS-05 parameters; writing and reading SDP. |
@@ -105,7 +105,7 @@ time instead of catching up ("realign").
 | Thread | Work |
 |---|---|
 | main | tokio runtime: HTTP API, signals |
-| PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`. The engine talks to it through a channel. |
+| PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
 | `orpheus-ptp` | PTP: sockets, timers, statime |
 | TX, one per sender | Pacing, ASRC, RTP send |
@@ -162,16 +162,41 @@ restarting streams:
   UDP port. A new filter drops the stream played so far, so the next one
   starts at once.
 
+A receiver without a source address or group plays nothing, unless
+`[receiver] accept = "any"`. Its playback stream takes the name in the
+connected sender's SDP file (`s=`, which Orpheus fills with the node's
+name).
+
+`orpheusctl connect` (`POST /x-orpheus/v1/senders`) is a client of the
+peer's APIs (`peer.rs`, blocking HTTP without holding any lock): it reads
+the peer's IS-04 receivers, picks one without a sender, reads its port
+from IS-05, starts the sender, and PATCHes the receiver with the sender's
+SDP file. If that fails the sender is removed again. The peer's receiver
+is kept with the sender, so `disconnect` can release it, but only if it
+still names this sender.
+
 An activation gives the IS-04 resource a new version even where its content
 stays the same, as NMOS asks. Scheduled activations run on a timer; while
 one is pending, the staged parameters are locked (`423`) until it fires or is
 cancelled.
 
 `routes.json` in the state directory keeps, for each sender, its number,
-name and last destination, and for each port the parameters last activated
+name, last destination, the peer's output type and receiver, and for each port the parameters last activated
 as requested, `auto` included. At start the node recreates the senders and
 activates these again, so `auto` is resolved afresh (a source port, for
 example, need not be free any more).
+
+## Output types
+
+The PipeWire thread follows the audio sinks, the default one (from the
+`default` metadata) and the links into them, and keeps a copy for the other
+threads. Each of our streams notes its node ID, so the engine can ask which
+sink the receiver's stream is linked to. `outputs.rs` adds the user's types
+from `outputs.json`; the IS-04 receiver carries the result. A sender writes
+its peer's type (or the user's) into its sink's `device.form-factor` and
+icon, and PipeWire reports the change like any other sink's, which is how
+types pass along chains of nodes. `connection.rs` polls each peer's
+receiver every 5 seconds for changes.
 
 ## Identity
 

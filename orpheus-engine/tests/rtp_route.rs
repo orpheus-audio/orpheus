@@ -6,8 +6,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use orpheus_clock::{Clock, SystemClock, Timescale};
-use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
+use orpheus_core::{AudioFormat, OutputType};
 use orpheus_engine::*;
 
 #[derive(Default, Clone)]
@@ -68,6 +68,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
             format,
             encoding: Encoding::L24,
             peer: listen,
+            remote: OutputType::Generic,
             quantum: Some(QUANTUM as u32),
         })
         .unwrap();
@@ -194,6 +195,7 @@ fn routes_and_filters_change_at_runtime() {
             format: AudioFormat::AES67,
             encoding: Encoding::L24,
             peer: listen,
+            remote: OutputType::Generic,
             quantum: Some(QUANTUM as u32),
         })
         .unwrap();

@@ -15,12 +15,15 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `status` | Shows the node's ID, name, version, clock, receiver and senders. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
 | `nodes` | Lists the other nodes the node found on the network, with ID, address and version. Nodes that stopped stay listed as offline. |
-| `connect PEER [--name NAME]` | Sends the node's audio to `PEER`. This creates a sink called `NAME` (the peer if no name is given), marked with a network icon. Whatever is played into the sink goes to the peer's receiver. The sender is kept across restarts. |
-| `disconnect ID` | Stops a sender and removes its sink. The ID is shown by `connect` and `status`. |
+| `connect PEER [--name NAME] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a sink called `NAME` (the peer's name if none is given), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. The connection is kept across restarts. |
+| `connect PEER --send-only [--name NAME]` | Only sends; the peer's receiver is left alone. For devices without NMOS, and receivers set to accept any stream. |
+| `disconnect ID` | Stops a sender, removes its sink and disconnects the peer's receiver. The ID is shown by `connect` and `status`. |
+| `outputs` | Lists the node's outputs with their [types](#output-types), and which one the receiver plays on. |
+| `set-type OUTPUT TYPE` | Sets what kind of device an output is; `auto` goes back to the detected type. `OUTPUT` is the name or description from `outputs`, or a part of either that only one output has. |
 
 `--json` prints the node's JSON responses instead of text: the status as the
-[HTTP API](#http-api) returns it, the node list, and `{"id": 0}` after
-`connect`. Scripts
+[HTTP API](#http-api) returns it, the node list, the outputs, and after `connect` the new sender (`id`, `name`,
+`destination`, and the peer's `receiver`). Scripts
 should use it, because the text output may change. With `--watch` it prints
 one line per sample:
 
@@ -29,14 +32,42 @@ orpheusctl --json status | jq .clock.ptp.offset_ns
 orpheusctl --json status --watch 5 >> status.jsonl
 ```
 
-`PEER` is a host name or address with an optional port; the default port is
-5004. IPv6 addresses with a port need brackets:
+### Connecting
+
+A connection has two ends, and `connect` sets up both. It finds the peer,
+asks it for a receiver that has no sender, starts a sender to that
+receiver's port, and connects the receiver to the sender through the peer's
+[IS-05 API](#connections-is-05), handing it the sender's SDP file. If the
+receiver refuses, the sender is removed again. `disconnect` undoes both
+ends; the peer's receiver is left alone if another sender has taken it
+over meanwhile, and the sender goes even if the peer can't be reached.
+
+`PEER` is one of:
+
+```text
+Kitchen                  a name, as `orpheusctl nodes` lists it
+TAPXPNPX                 a node ID
+kitchen.local            a host name or address; its API on port 7480
+192.168.1.20
+http://192.168.1.20:7481 the URL of the node's API
+```
+
+If the peer's receiver plays another sender, `connect` fails with `409`
+and names the holder; `--force` takes the receiver over. The receiver's
+playback stream is named after the sending node, so mixers show where the
+audio comes from.
+
+With `--send-only`, `PEER` is a host name or address with an optional
+port (default 5004). IPv6 addresses with a port need brackets:
 
 ```text
 kitchen.local            192.168.1.20:5006
 fd00::20                 [fd00::20]:5006
 fe80::20%enp3s0          [fe80::20%enp3s0]:5006
 ```
+
+A receiver plays only the sender connected to it, unless it is set to
+[accept any stream](configuration.md#receiver).
 
 A host name that resolves to both IPv4 and IPv6 is reached over IPv4, which
 every receiver listens on.
@@ -100,10 +131,18 @@ last interval instead, so `problems` shows only what is going wrong now.
 
 **Receiver**
 
-- `receiving ssrc …`: the stream being played; `idle` if none, `off` if a
-  [connection](#connections-is-05) switched the receiver off.
-- `ignored`: packets turned away because the receiver is connected to
-  another sender or switched off. Shown only when there are any.
+- `receiving from …`: the connected sender, by its node's name, and
+  audio arrives; `connected to …, idle` if nothing arrives.
+  `receiving ssrc …` is an unconnected receiver that accepts any stream.
+  `not connected` means no sender is connected and the receiver plays
+  nothing; `idle` that it would play any stream but none arrives; `off`
+  that a [connection](#connections-is-05) switched it off.
+- `accepts`: `connected senders`, or `any sender` (see
+  [configuration](configuration.md#receiver)).
+- `output`: the kind of output it plays on, which other nodes show, and
+  that output (see [output types](#output-types)).
+- `ignored`: packets turned away because they are not from the connected
+  sender, or the receiver plays nothing. Shown only when there are any.
 - `margin`: the smallest time between a packet's arrival and its playout over
   the last second. It should stay well above zero. If it gets close to zero,
   raise `link_offset_ms`.
@@ -140,9 +179,12 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | Method and path | Effect |
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows). |
-| `POST /x-orpheus/v1/senders` | Starts a sender and connects it to the peer through [IS-05](#connections-is-05). Body: `{"peer": "192.168.1.20", "name": "Kitchen"}`; `name` is optional. Returns `201` with `{"id": 0}`. |
-| `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender. Returns `204`, or `404` if there is no such sender. |
+| `POST /x-orpheus/v1/senders` | Starts a sender and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": 0, "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver, `502` if it can't be reached or refuses. |
+| `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender and disconnects the peer's receiver. Returns `204`, or `404` if there is no such sender. |
 | `GET /x-orpheus/v1/senders/{id}/sdp` | The sender's stream as an SDP file (`application/sdp`). |
+| `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receiver` if the receiver plays there. |
+| `PUT /x-orpheus/v1/outputs/{name}` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
+| `DELETE /x-orpheus/v1/outputs/{name}` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows). Returns `503` if mDNS could not start. |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
 
@@ -151,8 +193,38 @@ The same OpenAPI document is printed by `orpheusd --openapi`.
 ```sh
 curl -s localhost:7480/x-orpheus/v1/status | jq .clock
 curl -s -X POST localhost:7480/x-orpheus/v1/senders \
-  -H 'content-type: application/json' -d '{"peer": "192.168.1.20"}'
+  -H 'content-type: application/json' -d '{"peer": "Kitchen"}'
 ```
+
+## Output types
+
+Every output has a type: `speaker`, `headphones`, `headset`, `tv`, `hifi`,
+`computer`, `portable`, `phone` or `generic`. A node announces the type of
+the output its receiver plays on, and nodes connected to it show their sink
+to it with a matching icon and PipeWire form factor.
+
+- **Which output:** the one the receiver's stream is linked to in PipeWire,
+  so moving the stream in `pavucontrol` changes the announced type; while
+  it is not linked, the default output.
+- **Detected type:** PipeWire's form factor of the output (`internal` counts
+  as `computer`), or `tv` for HDMI and DisplayPort profiles, else
+  `generic`. A sink to another node has the type that node's receiver
+  announces; senders ask their peer every 5 seconds and update the sink.
+- **Set type:** `orpheusctl set-type` overrides the detected type of one
+  output, kept in `outputs.json` in the [state
+  directory](configuration.md#files). Use it where detection is wrong, for
+  example a line output that feeds an amplifier:
+
+  ```sh
+  orpheusctl outputs
+  orpheusctl set-type "Built-in Audio" hifi
+  orpheusctl set-type Kitchen tv      # a sink to another node, here only
+  orpheusctl set-type Kitchen auto
+  ```
+
+Because a sink to another node is an output like any other, types pass
+along chains: if node B plays what it receives into its sink to node C, B
+announces C's type, unless B has a type set for that sink.
 
 ## Discovery
 
@@ -192,11 +264,13 @@ curl -s localhost:7480/x-orpheus/v1/senders/0/sdp
 ```
 
 Without PTP the SDP names the sender's own clock (`ts-refclk:localmac=…`).
+The session name (`s=`) is the node's name; receivers name their playback
+stream after it.
 
 Resource IDs are derived from the node ID, so they stay the same across
 restarts. The receiver carries the tag `urn:x-orpheus:form-factor` with the
-output type (always `generic` for now). Nodes don't register with an NMOS
-registry; they only use peer-to-peer discovery.
+[type](#output-types) of the output it plays on. Nodes don't register with
+an NMOS registry; they only use peer-to-peer discovery.
 
 ### Connections (IS-05)
 
@@ -215,8 +289,9 @@ values are resolved in the active parameters.
   sender: it then only plays packets from the sender's address with its
   payload type, and joins its multicast group if it has one. `source_ip`,
   `multicast_ip` and `destination_port` can also be set directly.
-  `master_enable: false` switches it off. Without a connection it plays
-  whatever arrives on its port.
+  `master_enable: false` switches it off. Without a source address or
+  group it plays nothing, or, if it [accepts any
+  stream](configuration.md#receiver), whatever arrives on its port.
 
 For example, to connect this node's receiver to a sender of another node:
 
@@ -230,8 +305,8 @@ jq -n --arg sdp "$SDP" '{master_enable: true,
   curl -s -X PATCH $C/receivers/$RX/staged -H 'content-type: application/json' -d @-
 ```
 
-`orpheusctl connect` creates a sender and activates its destination the
-same way; it doesn't touch the peer's receiver yet. The node saves what was
+`orpheusctl connect` does the same from the sending node, after
+activating its sender's destination. The node saves what was
 last activated, as requested (with `auto`), in `routes.json` in its
 [state directory](configuration.md#files) and activates it again at start.
 

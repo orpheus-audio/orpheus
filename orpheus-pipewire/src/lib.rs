@@ -10,12 +10,13 @@ use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
 use orpheus_core::{AudioFormat, OutputType};
 use orpheus_engine::{
-    AudioBackend, BackendError, CapturePort, PlaybackPort, StreamHandle, StreamSpec,
+    AudioBackend, BackendError, CapturePort, Output, PlaybackPort, StreamControl, StreamHandle,
+    StreamSpec,
 };
 use pipewire::{self as pw, properties::properties, spa};
 use spa::param::audio::{AudioFormat as SpaFormat, AudioInfoRaw, MAX_CHANNELS};
@@ -102,6 +103,10 @@ enum Command {
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     Destroy(u64),
+    /// Renames a stream.
+    Describe(u64, String),
+    /// Changes the kind of output a sink leads to: its icon name and type.
+    SetRemote(u64, Option<String>, OutputType),
     Quit,
 }
 
@@ -117,6 +122,8 @@ pub struct PipeWireBackend {
     thread: Option<JoinHandle<()>>,
     next_id: u64,
     icons: Icons,
+    /// The outputs and links, kept up to date by the PipeWire thread.
+    graph: Arc<Mutex<Graph>>,
 }
 
 impl PipeWireBackend {
@@ -125,15 +132,20 @@ impl PipeWireBackend {
     pub fn connect(icons: Icons) -> Result<Self, BackendError> {
         let (tx, rx) = pw::channel::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let graph = Arc::new(Mutex::new(Graph::default()));
         let thread = thread::Builder::new()
             .name("orpheus-pipewire".into())
-            .spawn(move || run(rx, ready_tx))?;
+            .spawn({
+                let graph = graph.clone();
+                move || run(rx, ready_tx, graph)
+            })?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
                 tx,
                 thread: Some(thread),
                 next_id: 0,
                 icons,
+                graph,
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -160,10 +172,43 @@ impl PipeWireBackend {
             .recv()
             .map_err(|_| "PipeWire thread is gone")?
             .map_err(|e| format!("creating PipeWire stream {}: {e}", spec.name))?;
-        let tx = self.tx.clone();
+        let close = self.tx.clone();
         Ok(StreamHandle::new(move || {
-            let _ = tx.send(Command::Destroy(id));
+            let _ = close.send(Command::Destroy(id));
+        })
+        .with_control(Control {
+            id,
+            tx: self.tx.clone(),
+            icons: self.icons.clone(),
+            graph: self.graph.clone(),
         }))
+    }
+}
+
+/// Changes one stream from outside the PipeWire thread.
+struct Control {
+    id: u64,
+    tx: pw::channel::Sender<Command>,
+    icons: Icons,
+    graph: Arc<Mutex<Graph>>,
+}
+
+impl StreamControl for Control {
+    fn describe(&self, description: &str) {
+        let _ = self
+            .tx
+            .send(Command::Describe(self.id, description.to_owned()));
+    }
+
+    fn set_remote(&self, remote: OutputType) {
+        let icon = self.icons.get(remote).to_owned();
+        let _ = self
+            .tx
+            .send(Command::SetRemote(self.id, Some(icon), remote));
+    }
+
+    fn output(&self) -> Option<String> {
+        self.graph.lock().unwrap().linked_sink(self.id)
     }
 }
 
@@ -182,6 +227,10 @@ impl AudioBackend for PipeWireBackend {
         port: PlaybackPort,
     ) -> Result<StreamHandle, BackendError> {
         self.create(spec, Kind::Playback(port))
+    }
+
+    fn outputs(&self) -> Vec<Output> {
+        self.graph.lock().unwrap().outputs()
     }
 }
 
@@ -252,7 +301,11 @@ struct SinkData {
 }
 
 /// Body of the PipeWire thread.
-fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), String>>) {
+fn run(
+    rx: pw::channel::Receiver<Command>,
+    ready: mpsc::SyncSender<Result<(), String>>,
+    graph: Arc<Mutex<Graph>>,
+) {
     pw::init();
     let setup = || -> Result<_, pw::Error> {
         let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -265,6 +318,13 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
         Err(e) => {
             let _ = ready.send(Err(e.to_string()));
             return;
+        }
+    };
+    let _outputs = match watch_graph(&core, graph.clone()) {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::warn!(error = %e, "cannot follow the outputs; announcing a generic one");
+            None
         }
     };
 
@@ -295,15 +355,37 @@ fn run(rx: pw::channel::Receiver<Command>, ready: mpsc::SyncSender<Result<(), St
                     icon.as_deref(),
                     kind,
                     &mut groups.borrow_mut(),
+                    (id, graph.clone()),
                 );
                 let _ = reply.send(result.map(|live| {
                     streams.borrow_mut().insert(id, live);
                 }));
             }
             Command::Destroy(id) => {
+                graph.lock().unwrap().streams.remove(&id);
                 let live = streams.borrow_mut().remove(&id);
                 if let Some(group) = live.as_ref().and_then(|l| l.group.as_ref()) {
                     groups.borrow_mut().remove(group);
+                }
+            }
+            Command::Describe(id, description) => {
+                if let Some(live) = streams.borrow().get(&id) {
+                    let d = Some(description.as_str());
+                    update_properties(
+                        &live.stream,
+                        &[(*pw::keys::NODE_DESCRIPTION, d), (*pw::keys::MEDIA_NAME, d)],
+                    );
+                }
+            }
+            Command::SetRemote(id, icon, remote) => {
+                if let Some(live) = streams.borrow().get(&id) {
+                    update_properties(
+                        &live.stream,
+                        &[
+                            (*pw::keys::DEVICE_ICON_NAME, icon.as_deref()),
+                            (*pw::keys::DEVICE_FORM_FACTOR, form_factor(remote)),
+                        ],
+                    );
                 }
             }
             Command::Quit => mainloop.quit(),
@@ -326,6 +408,7 @@ fn create_stream(
     icon: Option<&str>,
     kind: Kind,
     groups: &mut Groups,
+    (id, graph): (u64, Arc<Mutex<Graph>>),
 ) -> Result<Live, String> {
     let channels = spec.format.channels.to_string();
     let mut props = properties! {
@@ -363,6 +446,8 @@ fn create_stream(
             )
         }
         Kind::Playback(_) => {
+            // What mixers show for a stream.
+            props.insert(*pw::keys::MEDIA_NAME, spec.description.as_str());
             props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
             props.insert(*pw::keys::MEDIA_ROLE, "Music");
             if let Some(icon) = icon {
@@ -389,7 +474,7 @@ fn create_stream(
                     port,
                     trigger: group.map(|g| g.playback.clone()),
                 })
-                .state_changed(log_state(name))
+                .state_changed(on_state(name, id, graph))
                 .process(process_sink)
                 .register()
                 .map_err(|e| e.to_string())?,
@@ -397,7 +482,7 @@ fn create_stream(
         Kind::Playback(port) => Box::new(
             stream
                 .add_local_listener_with_user_data(port)
-                .state_changed(log_state(name))
+                .state_changed(on_state(name, id, graph))
                 .param_changed({
                     let link = latency_link.clone();
                     move |_, _, id, param| {
@@ -454,6 +539,240 @@ fn create_stream(
         stream,
         group,
     })
+}
+
+/// Sets or, for `None`, removes properties of a running stream.
+fn update_properties(stream: &pw::stream::Stream, props: &[(&str, Option<&str>)]) {
+    use std::ffi::CString;
+    let strings: Vec<(CString, Option<CString>)> = props
+        .iter()
+        .filter_map(|(k, v)| {
+            let v = match v {
+                Some(v) => Some(CString::new(*v).ok()?),
+                None => None,
+            };
+            Some((CString::new(*k).ok()?, v))
+        })
+        .collect();
+    let items: Vec<spa_sys::spa_dict_item> = strings
+        .iter()
+        .map(|(k, v)| spa_sys::spa_dict_item {
+            key: k.as_ptr(),
+            value: v.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+        })
+        .collect();
+    let dict = spa_sys::spa_dict {
+        flags: 0,
+        n_items: items.len() as u32,
+        items: items.as_ptr(),
+    };
+    // SAFETY: the stream is alive, and the dict and its strings outlive the
+    // call, which copies them. A null value removes the key.
+    let res = unsafe { pw::sys::pw_stream_update_properties(stream.as_raw_ptr(), &dict) };
+    if res < 0 {
+        tracing::warn!(res, "updating stream properties");
+    }
+}
+
+/// What the PipeWire thread knows about the graph, for other threads.
+#[derive(Default)]
+struct Graph {
+    /// Audio sinks by node ID.
+    sinks: HashMap<u32, Sink>,
+    /// The default sink's node name.
+    default: Option<String>,
+    /// Links by ID: output node, input node.
+    links: HashMap<u32, (u32, u32)>,
+    /// Node IDs of our streams, by stream ID.
+    streams: HashMap<u64, u32>,
+}
+
+#[derive(Default)]
+struct Sink {
+    name: String,
+    description: String,
+    kind: OutputType,
+}
+
+impl Graph {
+    fn outputs(&self) -> Vec<Output> {
+        let mut out: Vec<Output> = self
+            .sinks
+            .values()
+            .filter(|s| !s.name.is_empty())
+            .map(|s| Output {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                kind: s.kind,
+                default: self.default.as_deref() == Some(s.name.as_str()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.description.cmp(&b.description).then(a.name.cmp(&b.name)));
+        out
+    }
+
+    /// The sink stream `id` is linked to.
+    fn linked_sink(&self, id: u64) -> Option<String> {
+        let node = self.streams.get(&id)?;
+        self.links
+            .values()
+            .filter(|(out, _)| out == node)
+            .find_map(|(_, input)| self.sinks.get(input))
+            .map(|s| s.name.clone())
+    }
+}
+
+/// Follows the audio sinks, the default one and the links into them,
+/// writing them to `graph`. Keep the result alive for as long as that
+/// should go on.
+fn watch_graph(
+    core: &pw::core::CoreRc,
+    graph: Arc<Mutex<Graph>>,
+) -> Result<Box<dyn Any>, pw::Error> {
+    let registry = core.get_registry_rc()?;
+    // Proxies and their listeners, which only this thread may touch.
+    let proxies: Rc<RefCell<HashMap<u32, Box<dyn Any>>>> = Rc::default();
+    let listener = registry
+        .add_listener_local()
+        .global({
+            let registry = registry.downgrade();
+            let proxies = proxies.clone();
+            let graph = graph.clone();
+            move |global| {
+                let Some(registry) = registry.upgrade() else {
+                    return;
+                };
+                let props = global.props;
+                let get = |key: &str| props.and_then(|p| p.get(key));
+                let id = global.id;
+                match global.type_ {
+                    pw::types::ObjectType::Link => {
+                        let node = |k| get(k).and_then(|v: &str| v.parse().ok());
+                        if let (Some(out), Some(input)) =
+                            (node("link.output.node"), node("link.input.node"))
+                        {
+                            graph.lock().unwrap().links.insert(id, (out, input));
+                        }
+                    }
+                    pw::types::ObjectType::Node
+                        if get(*pw::keys::MEDIA_CLASS) == Some("Audio/Sink") =>
+                    {
+                        let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
+                            return;
+                        };
+                        let listener = node
+                            .add_listener_local()
+                            .info({
+                                let graph = graph.clone();
+                                move |info| {
+                                    // Other changes come without the properties.
+                                    if !info.change_mask().contains(pw::node::NodeChangeMask::PROPS)
+                                    {
+                                        return;
+                                    }
+                                    let Some(props) = info.props() else {
+                                        return;
+                                    };
+                                    let get = |k| props.get(k).unwrap_or_default().to_owned();
+                                    let sink = Sink {
+                                        name: get(*pw::keys::NODE_NAME),
+                                        description: get(*pw::keys::NODE_DESCRIPTION),
+                                        kind: output_type(|k| props.get(k)),
+                                    };
+                                    graph.lock().unwrap().sinks.insert(id, sink);
+                                }
+                            })
+                            .register();
+                        graph.lock().unwrap().sinks.insert(id, Sink::default());
+                        proxies.borrow_mut().insert(id, Box::new((node, listener)));
+                    }
+                    pw::types::ObjectType::Metadata if get("metadata.name") == Some("default") => {
+                        let Ok(metadata) = registry.bind::<pw::metadata::Metadata, _>(global)
+                        else {
+                            return;
+                        };
+                        let listener = metadata
+                            .add_listener_local()
+                            .property({
+                                let graph = graph.clone();
+                                move |subject, key, _, value| {
+                                    if subject == 0 && key.is_none_or(|k| k == "default.audio.sink")
+                                    {
+                                        graph.lock().unwrap().default =
+                                            value.and_then(default_name);
+                                    }
+                                    0
+                                }
+                            })
+                            .register();
+                        proxies
+                            .borrow_mut()
+                            .insert(id, Box::new((metadata, listener)));
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .global_remove({
+            let proxies = proxies.clone();
+            let graph = graph.clone();
+            move |id| {
+                proxies.borrow_mut().remove(&id);
+                let mut g = graph.lock().unwrap();
+                g.sinks.remove(&id);
+                g.links.remove(&id);
+            }
+        })
+        .register();
+    Ok(Box::new((registry, listener, proxies)))
+}
+
+/// `{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}` → the name.
+fn default_name(json: &str) -> Option<String> {
+    let rest = json
+        .split_once("\"name\"")?
+        .1
+        .trim_start()
+        .strip_prefix(':')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    Some(rest[..rest.find('"')?].to_owned())
+}
+
+/// The kind of device a sink is, from its properties: PipeWire's form
+/// factor, else an HDMI or DisplayPort profile as a screen.
+fn output_type<'a>(get: impl Fn(&str) -> Option<&'a str>) -> OutputType {
+    let by_form = match get(*pw::keys::DEVICE_FORM_FACTOR) {
+        Some("speaker") => Some(OutputType::Speaker),
+        Some("headphone") => Some(OutputType::Headphones),
+        Some("headset" | "handsfree") => Some(OutputType::Headset),
+        Some("tv") => Some(OutputType::Tv),
+        Some("hifi") => Some(OutputType::Hifi),
+        Some("computer" | "internal") => Some(OutputType::Computer),
+        Some("portable") => Some(OutputType::Portable),
+        Some("handset") => Some(OutputType::Phone),
+        _ => None,
+    };
+    let screen =
+        get("device.profile.name").is_some_and(|p| p.contains("hdmi") || p.contains("displayport"));
+    by_form
+        .or(screen.then_some(OutputType::Tv))
+        .unwrap_or(OutputType::Generic)
+}
+
+/// Logs state changes and notes the stream's node ID once it has one.
+fn on_state<D>(
+    name: String,
+    id: u64,
+    graph: Arc<Mutex<Graph>>,
+) -> impl FnMut(&pw::stream::Stream, &mut D, pw::stream::StreamState, pw::stream::StreamState) {
+    let mut log = log_state(name);
+    move |stream, data, old, new| {
+        let node = stream.node_id();
+        if node != u32::MAX {
+            graph.lock().unwrap().streams.insert(id, node);
+        }
+        log(stream, data, old, new);
+    }
 }
 
 fn log_state<D>(
@@ -623,5 +942,30 @@ mod tests {
         assert_eq!(icons.get(OutputType::Hifi), "audio-card");
         assert_eq!(form_factor(OutputType::Phone), Some("handset"));
         assert_eq!(form_factor(OutputType::Generic), None);
+    }
+
+    #[test]
+    fn output_types() {
+        let props = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(key, _)| *key == k).map(|(_, v)| *v)
+        };
+        assert_eq!(
+            output_type(props(&[("device.form-factor", "internal")])),
+            OutputType::Computer
+        );
+        assert_eq!(
+            output_type(props(&[("device.form-factor", "headphone")])),
+            OutputType::Headphones
+        );
+        assert_eq!(
+            output_type(props(&[("device.profile.name", "hdmi-stereo-extra1")])),
+            OutputType::Tv
+        );
+        assert_eq!(output_type(props(&[])), OutputType::Generic);
+        assert_eq!(
+            default_name(r#"{ "name": "alsa_output.pci-0000_00_1f.3.analog-stereo" }"#).as_deref(),
+            Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
+        );
+        assert_eq!(default_name("{}"), None);
     }
 }

@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use orpheus_clock::Timescale;
+use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
-use orpheus_core::{AudioFormat, OutputType};
 use orpheus_engine::SenderId;
 use orpheus_engine::sender::PAYLOAD_TYPE;
 use orpheus_nmos::is04::{self, *};
@@ -233,7 +233,7 @@ fn snapshot(node: &Node) -> Snapshot {
         let mut base = Base::new(resource_id(dev, "receiver/0"), &node.name);
         base.tags.insert(
             TAG_FORM_FACTOR.into(),
-            vec![OutputType::Generic.as_str().into()],
+            vec![crate::outputs::receiver_type(node).as_str().into()],
         );
         snap.receivers.push(Receiver {
             base,
@@ -356,7 +356,8 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         id: first >> 1,
         // The clock lives in the node resource.
         version: sender.base.version.max(snap.node.base.version).tai_nanos(),
-        name: &sender.base.label,
+        // Names the sender for receivers, as AES67 devices do.
+        name: &node.name,
         source,
         destination,
         payload_type: PAYLOAD_TYPE,

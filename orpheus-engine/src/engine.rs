@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use orpheus_clock::Clock;
-use orpheus_core::AudioFormat;
+use orpheus_core::{AudioFormat, OutputType};
 
-use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
+use crate::backend::{AudioBackend, BackendError, Output, StreamHandle, StreamSpec};
 use crate::port::{PortStats, StatsSnapshot, port_pair};
 use crate::receiver::{Filter, Receiver, ReceiverConfig, ReceiverStatus};
 use crate::sender::{Route, Sender, SenderConfig, SenderStatus};
@@ -159,6 +159,33 @@ impl Engine {
             Some(r) => r.set_filter(filter).map(|()| true),
             None => Ok(false),
         }
+    }
+
+    /// Shows the receiver's playback stream under `description`, or under
+    /// its configured one for `None`.
+    pub fn set_receiver_description(&mut self, description: Option<&str>) {
+        if let Some(r) = &self.receiver {
+            r.describe(description);
+        }
+    }
+
+    /// The audio system's outputs.
+    pub fn outputs(&self) -> Vec<Output> {
+        self.backend.outputs()
+    }
+
+    /// The output the receiver plays on, if its stream is linked to one.
+    pub fn receiver_output(&self) -> Option<String> {
+        self.receiver.as_ref().and_then(Receiver::output)
+    }
+
+    /// Changes the kind of output a sender's sink shows; returns whether
+    /// the sender exists.
+    pub fn set_sender_remote(&mut self, id: SenderId, remote: OutputType) -> bool {
+        self.senders
+            .get(&id)
+            .map(|s| s.set_remote(remote))
+            .is_some()
     }
 
     /// Stops a sender; returns whether it existed.
