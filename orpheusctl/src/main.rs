@@ -49,6 +49,10 @@ enum Command {
         /// connected to it.
         #[arg(long)]
         force: bool,
+        /// `high` plays over the peer's other streams and turns them down
+        /// meanwhile, whatever the peer's policy (for announcements).
+        #[arg(long, value_parser = ["normal", "high"], default_value = "normal")]
+        priority: String,
     },
     /// List the other nodes on the network.
     Nodes,
@@ -144,6 +148,11 @@ struct Receiver {
     sender: Option<String>,
     /// Absent while free or off.
     stream: Option<Stream>,
+    /// What the node's policy does to the stream: `silent`, `playing`,
+    /// `muted` or `ducked`.
+    state: Option<String>,
+    /// `normal` or `high`.
+    priority: Option<String>,
     /// The kind of output.
     output: Option<String>,
     /// Description of the output it plays on.
@@ -202,6 +211,8 @@ struct Sender {
     #[serde(default)]
     asrc_ppm: f64,
     buffer: Buffer,
+    /// `normal` or `high`.
+    priority: Option<String>,
     /// The peer's receiver connected to it; absent if it only sends.
     receiver: Option<PeerLink>,
 }
@@ -209,6 +220,8 @@ struct Sender {
 #[derive(Clone, Deserialize)]
 struct PeerLink {
     state: String,
+    /// `muted` or `ducked` by the peer's policy.
+    policy: Option<String>,
 }
 
 /// Another node, as found over mDNS.
@@ -230,6 +243,7 @@ struct NewSender {
     name: Option<String>,
     send_only: bool,
     force: bool,
+    priority: String,
 }
 
 #[derive(Deserialize)]
@@ -330,6 +344,7 @@ fn main() -> Result<()> {
             name,
             send_only,
             force,
+            priority,
         } => {
             let url = format!("{base}/x-orpheus/v1/senders");
             let raw = post(
@@ -339,6 +354,7 @@ fn main() -> Result<()> {
                     name,
                     send_only,
                     force,
+                    priority,
                 },
             )
             .with_context(|| format!("connecting to {peer} via {url}"))?;
@@ -763,7 +779,11 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
         return;
     };
     let mark = match (st.ssrc, &r.sender) {
-        (Some(_), Some(from)) => p.mark(Level::Good, &format!("receiving from {from}")),
+        (Some(_), Some(from)) => match r.state.as_deref() {
+            Some("muted") => p.mark(Level::Off, &format!("receiving from {from}, muted")),
+            Some("ducked") => p.mark(Level::Good, &format!("receiving from {from}, ducked")),
+            _ => p.mark(Level::Good, &format!("receiving from {from}")),
+        },
         (Some(ssrc), None) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
         (None, Some(from)) => p.mark(Level::Off, &format!("connected to {from}, idle")),
         (None, None) if accept == Some("any") => p.mark(Level::Off, "free, plays any sender"),
@@ -777,6 +797,9 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
             None => output.clone(),
         };
         row(o, p, "output", &output);
+    }
+    if r.priority.as_deref() == Some("high") {
+        row(o, p, "priority", "high");
     }
     row(o, p, "link offset", &format!("{} ms", st.link_offset_ms));
     let level = st
@@ -849,12 +872,7 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             [
                 t.id.to_string(),
                 t.name.clone(),
-                match t.receiver.as_ref().map(|r| r.state.as_str()) {
-                    Some("disconnected") => format!("{} (disconnected, paused)", t.peer),
-                    Some(s @ ("unreachable" | "connecting")) => format!("{} ({s})", t.peer),
-                    _ if !t.enabled => format!("{} (off)", t.peer),
-                    _ => t.peer.clone(),
-                },
+                peer_column(t),
                 c.packets(t.packets),
                 format!("{} frames", t.buffer.level_frames),
                 format!("{:+.1} ppm", t.asrc_ppm),
@@ -864,6 +882,30 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
         .collect();
     let right = [false, false, false, true, true, true, false];
     table(o, p, header, right, &rows);
+}
+
+/// Where a sender sends, and how that stands.
+fn peer_column(t: &Sender) -> String {
+    let mut notes = vec![];
+    match t.receiver.as_ref().map(|r| r.state.as_str()) {
+        Some("disconnected") => notes.push("disconnected, paused".to_owned()),
+        Some(s @ ("unreachable" | "connecting")) => notes.push(s.to_owned()),
+        _ if !t.enabled => notes.push("off".into()),
+        _ => {}
+    }
+    match t.receiver.as_ref().and_then(|r| r.policy.as_deref()) {
+        Some("muted") => notes.push("muted by policy".into()),
+        Some(held) => notes.push(held.to_owned()),
+        None => {}
+    }
+    if t.priority.as_deref() == Some("high") {
+        notes.push("high priority".into());
+    }
+    if notes.is_empty() {
+        t.peer.clone()
+    } else {
+        format!("{} ({})", t.peer, notes.join(", "))
+    }
 }
 
 /// A table with a dim header. Widths come from the plain text; the last
@@ -1083,10 +1125,41 @@ Senders
 
         s.senders[0].receiver = Some(PeerLink {
             state: "disconnected".into(),
+            policy: None,
         });
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
             out.contains("  Kitchen  192.168.1.20:5004 (disconnected, paused)  "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn shows_policy_and_priority() {
+        let mut s: Status = serde_json::from_str(STATUS).unwrap();
+        let r = &mut s.receivers[0];
+        r.sender = Some("Laptop".into());
+        r.state = Some("muted".into());
+        r.priority = Some("high".into());
+        s.senders[0].receiver = Some(PeerLink {
+            state: "connected".into(),
+            policy: Some("muted".into()),
+        });
+        s.senders[0].priority = Some("high".into());
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("Receiver 0     ○ receiving from Laptop, muted\n"),
+            "{out}"
+        );
+        assert!(out.contains("  priority     high\n"), "{out}");
+        assert!(
+            out.contains("  Kitchen  192.168.1.20:5004 (muted by policy, high priority)  "),
+            "{out}"
+        );
+        s.receivers[0].state = Some("ducked".into());
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("Receiver 0     ● receiving from Laptop, ducked\n"),
             "{out}"
         );
     }

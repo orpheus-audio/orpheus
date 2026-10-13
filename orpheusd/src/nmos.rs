@@ -247,6 +247,9 @@ fn snapshot(node: &Node) -> Snapshot {
         if node.health.lock().unwrap().receiver_jitter(id) {
             base.tags.insert(TAG_WARNINGS.into(), vec!["jitter".into()]);
         }
+        if let Some(tag) = node.mixer.lock().unwrap().state(id).and_then(|s| s.tag()) {
+            base.tags.insert(TAG_STATE.into(), vec![tag.into()]);
+        }
         snap.receivers.push(Receiver {
             base,
             format: FORMAT_AUDIO,
@@ -343,7 +346,10 @@ fn snapshot(node: &Node) -> Snapshot {
 /// The SDP file of sender `id`, or `None` if there is no such sender.
 pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
     let snap = refresh(node);
-    let active = node.connections.lock().unwrap().sender_active(id)?.clone();
+    let (active, priority) = {
+        let conns = node.connections.lock().unwrap();
+        (conns.sender_active(id)?.clone(), conns.sender_priority(id))
+    };
     let node_id = node.id.to_string();
     let uuid = resource_id(node.id, &format!("sender/{id}"));
     let sender = snap.senders.iter().find(|s| s.base.id == uuid)?;
@@ -378,6 +384,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         // RTP timestamps count media-clock frames since the epoch.
         media_clock_offset: 0,
         node: Some(&node_id),
+        priority,
     };
     Some(session.render())
 }

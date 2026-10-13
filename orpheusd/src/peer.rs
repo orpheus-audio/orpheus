@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use orpheus_core::{DeviceId, OutputType};
-use orpheus_nmos::is04::{TAG_FORM_FACTOR, TAG_WARNINGS};
+use orpheus_nmos::is04::{TAG_FORM_FACTOR, TAG_STATE, TAG_WARNINGS};
 use orpheus_nmos::{Uuid, is05};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::Node;
 use crate::config::RTP_PORT;
+use crate::policy::State;
 
 /// A failed request: status and message.
 pub type Fail = (StatusCode, String);
@@ -271,6 +272,8 @@ pub struct Playing {
     pub sender: Option<Uuid>,
     /// Whether it warns that packets arrive with a wide spread.
     pub jitter: bool,
+    /// Whether its policy mutes or ducks the stream.
+    pub held: Option<State>,
 }
 
 /// Asks a peer's receiver what it plays and on what.
@@ -282,6 +285,11 @@ pub fn playing(of: &PeerReceiver) -> Result<Playing, Fail> {
         jitter: r["tags"][TAG_WARNINGS]
             .as_array()
             .is_some_and(|w| w.iter().any(|w| w == "jitter")),
+        held: match r["tags"][TAG_STATE][0].as_str() {
+            Some("muted") => Some(State::Muted),
+            Some("ducked") => Some(State::Ducked),
+            _ => None,
+        },
     })
 }
 

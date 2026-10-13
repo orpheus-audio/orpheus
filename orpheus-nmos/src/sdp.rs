@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
+use serde::{Deserialize, Serialize};
 
 /// What timestamps the stream (RFC 7273).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +16,18 @@ pub enum RefClock {
     Ptp { gmid: String, domain: u8 },
     /// The sender's own clock, named by the MAC address of its interface.
     LocalMac(String),
+}
+
+/// How a stream ranks against the others a node receives
+/// (`a=x-orpheus-priority`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    #[default]
+    Normal,
+    /// Plays over normal streams, which are turned down meanwhile:
+    /// announcements, a doorbell.
+    High,
 }
 
 /// One RTP stream from `source` to `destination`.
@@ -36,6 +49,8 @@ pub struct Session<'a> {
     pub media_clock_offset: u32,
     /// The sending Orpheus node's ID, as `a=x-orpheus-node`.
     pub node: Option<&'a str>,
+    /// Written only when high.
+    pub priority: Priority,
 }
 
 impl Session<'_> {
@@ -96,6 +111,9 @@ impl Session<'_> {
         if let Some(node) = self.node {
             let _ = write!(s, "a=x-orpheus-node:{}\r\n", one_line(node));
         }
+        if self.priority == Priority::High {
+            s.push_str("a=x-orpheus-priority:high\r\n");
+        }
         s
     }
 }
@@ -117,6 +135,7 @@ pub struct Stream {
     pub channels: u16,
     /// The sending Orpheus node's ID (`a=x-orpheus-node`), if it is one.
     pub node: Option<String>,
+    pub priority: Priority,
 }
 
 /// Reads the first `m=audio` section with RTP/AVP.
@@ -129,6 +148,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
     let mut rtpmap: Option<(String, u32, u16)> = None;
     let mut filter = None;
     let mut node = None;
+    let mut priority = Priority::Normal;
     let mut done = false;
     for line in sdp.lines() {
         let line = line.trim_end_matches('\r');
@@ -173,6 +193,10 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
                     }
                 } else if let Some(id) = value.strip_prefix("x-orpheus-node:") {
                     node = Some(id.trim().to_owned()).filter(|id| !id.is_empty());
+                } else if let Some(p) = value.strip_prefix("x-orpheus-priority:") {
+                    if p.trim() == "high" {
+                        priority = Priority::High;
+                    }
                 } else if let Some(f) = value.strip_prefix("source-filter:") {
                     let f: Vec<&str> = f.split_whitespace().collect();
                     if let ["incl", "IN", _, _, src, ..] = f[..] {
@@ -196,6 +220,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
         rate,
         channels,
         node,
+        priority,
     })
 }
 
@@ -247,6 +272,7 @@ mod tests {
             clock,
             media_clock_offset: 0,
             node: None,
+            priority: Priority::Normal,
         }
     }
 
@@ -279,8 +305,9 @@ mod tests {
     fn reads_own_files() {
         let mut sdp = session(RefClock::LocalMac("00-1b-21-ab-cd-ef".into()));
         sdp.node = Some("B73AQ0P0");
+        sdp.priority = Priority::High;
         let sdp = sdp.render();
-        assert!(sdp.ends_with("a=x-orpheus-node:B73AQ0P0\r\n"));
+        assert!(sdp.ends_with("a=x-orpheus-node:B73AQ0P0\r\na=x-orpheus-priority:high\r\n"));
         assert_eq!(
             parse(&sdp),
             Ok(Stream {
@@ -293,6 +320,7 @@ mod tests {
                 rate: 48_000,
                 channels: 2,
                 node: Some("B73AQ0P0".into()),
+                priority: Priority::High,
             })
         );
     }
@@ -305,6 +333,7 @@ mod tests {
                    m=audio 5006 RTP/AVP 96\na=rtpmap:96 L16/44100\n";
         let s = parse(sdp).unwrap();
         assert_eq!(s.name, "x");
+        assert_eq!(s.priority, Priority::Normal);
         assert_eq!(s.source, Some("10.0.0.9".parse().unwrap()));
         assert_eq!(s.destination, "239.1.2.3".parse::<IpAddr>().unwrap());
         assert_eq!((s.port, s.payload_type), (5006, 96));

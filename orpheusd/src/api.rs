@@ -4,6 +4,7 @@
 //! spec is served at `/x-orpheus/v1/openapi.json` and printed by
 //! `orpheusd --openapi`.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
@@ -20,8 +21,10 @@ use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
-use crate::config::{Accept, RTP_PORT};
+use crate::config::{Accept, Policy, RTP_PORT};
+use crate::policy::State as PolicyState;
 use orpheus_core::OutputType;
+use orpheus_nmos::sdp::Priority;
 
 pub struct Node {
     pub id: DeviceId,
@@ -45,6 +48,8 @@ pub struct Node {
     pub outputs: Mutex<crate::outputs::Overrides>,
     /// Warnings about the network paths. Lock it last.
     pub health: Mutex<crate::health::Health>,
+    /// What the policy does to each receiver's stream. Lock it last.
+    pub mixer: Mutex<crate::policy::Mixer>,
 }
 
 /// An error status with a plain-text message.
@@ -86,6 +91,10 @@ struct Status {
     loopback: Option<StatsSnapshot>,
     /// What a free receiver plays.
     accept: Accept,
+    /// Which streams are heard when several play at once.
+    policy: Policy,
+    /// How far normal streams are turned down under a high-priority one.
+    duck_db: f32,
     /// The receivers: one per connection and a free one.
     receivers: Vec<ReceiverEntry>,
     senders: Vec<SenderEntry>,
@@ -110,6 +119,12 @@ struct ReceiverEntry {
     /// `accept` is `any`) or switched off.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<ReceiverStatus>,
+    /// What the policy does to the stream; absent without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<PolicyState>,
+    /// The connected sender's priority, from its SDP file.
+    #[schema(value_type = String, example = "normal")]
+    priority: Priority,
     /// The kind of output it plays on, as announced to other nodes.
     #[schema(value_type = String, example = "speaker")]
     output: OutputType,
@@ -178,6 +193,9 @@ struct SenderEntry {
     id: SenderId,
     #[serde(flatten)]
     status: SenderStatus,
+    /// What the SDP file announces to the peer's policy.
+    #[schema(value_type = String, example = "normal")]
+    priority: Priority,
     /// The peer's receiver connected to it; absent if it only sends.
     #[serde(skip_serializing_if = "Option::is_none")]
     receiver: Option<crate::connection::PeerLink>,
@@ -201,6 +219,11 @@ struct NewSender {
     /// to it.
     #[serde(default)]
     force: bool,
+    /// `high` plays over the peer's other streams and turns them down
+    /// meanwhile, whatever the peer's policy; for announcements.
+    #[serde(default)]
+    #[schema(value_type = String, example = "normal")]
+    priority: Priority,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -260,9 +283,10 @@ pub fn router(node: Arc<Node>) -> Router {
     responses((status = OK, description = "Node status", body = Status)),
 )]
 async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
-    let (ports, mut links) = {
+    let (ports, mut links, sender_priorities) = {
         let conns = node.connections.lock().unwrap();
-        let ports: Vec<(ReceiverId, u16, Option<String>)> = conns
+        let priorities = conns.receiver_priorities();
+        let ports: Vec<(ReceiverId, u16, Option<String>, Priority)> = conns
             .receiver_ids()
             .into_iter()
             .map(|id| {
@@ -270,17 +294,24 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
                     .receiver_active(id)
                     .and_then(|a| a.transport_params.first()?.destination_port.value())
                     .unwrap_or_default();
-                (id, port, conns.receiver_sender(id))
+                let priority = priorities.get(&id).copied().unwrap_or_default();
+                (id, port, conns.receiver_sender(id), priority)
             })
             .collect();
-        (ports, conns.peer_links())
+        let senders: BTreeMap<SenderId, Priority> = conns
+            .sender_ids()
+            .into_iter()
+            .map(|id| (id, conns.sender_priority(id)))
+            .collect();
+        (ports, conns.peer_links(), senders)
     };
     let engine = node.engine.as_ref().map(|e| e.lock().unwrap().status());
     let mut engine = engine.unwrap_or_default();
     let view = crate::outputs::View::of(&node);
+    let mixer = node.mixer.lock().unwrap();
     let receivers = ports
         .into_iter()
-        .map(|(id, port, sender)| {
+        .map(|(id, port, sender, priority)| {
             let stream = engine
                 .receivers
                 .iter()
@@ -291,12 +322,15 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
                 uuid: crate::connection::receiver_uuid(&node, id),
                 port,
                 sender,
+                state: stream.as_ref().and(mixer.state(id)),
                 stream,
+                priority,
                 output: view.receiver_type(&node, id),
                 plays_on: view.receiver(id).map(|o| o.description.clone()),
             }
         })
         .collect();
+    drop(mixer);
     Json(Status {
         id: node.id.to_string(),
         name: node.name.clone(),
@@ -314,6 +348,8 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
         },
         loopback: engine.loopback,
         accept: node.receiver.accept,
+        policy: node.receiver.policy,
+        duck_db: node.receiver.duck_db,
         receivers,
         senders: engine
             .senders
@@ -321,6 +357,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
             .map(|(id, status)| SenderEntry {
                 id,
                 status,
+                priority: sender_priorities.get(&id).copied().unwrap_or_default(),
                 receiver: links.remove(&id),
             })
             .collect(),
@@ -355,10 +392,12 @@ async fn add_sender(
         let peer = resolve(&req.peer).await?;
         let name = req.name.unwrap_or_else(|| req.peer.clone());
         let label = name.clone();
-        let id =
-            tokio::task::spawn_blocking(move || crate::connection::add_sender(&node, peer, label))
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+        let priority = req.priority;
+        let id = tokio::task::spawn_blocking(move || {
+            crate::connection::add_sender(&node, peer, label, priority)
+        })
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
         Created {
             id,
             name,
@@ -367,7 +406,7 @@ async fn add_sender(
         }
     } else {
         let c = tokio::task::spawn_blocking(move || {
-            crate::connection::connect(&node, &req.peer, req.name, req.force)
+            crate::connection::connect(&node, &req.peer, req.name, req.force, req.priority)
         })
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;

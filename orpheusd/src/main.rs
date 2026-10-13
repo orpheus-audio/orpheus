@@ -9,6 +9,7 @@ mod network;
 mod nmos;
 mod outputs;
 mod peer;
+mod policy;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -99,12 +100,14 @@ async fn main() -> Result<()> {
             home.state_dir().join("outputs.json"),
         )),
         health: Mutex::default(),
+        mixer: Mutex::default(),
     });
     connection::restore(&node);
 
     let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));
     let peers = tokio::spawn(connection::watch_peers(node.clone()));
     let health = tokio::spawn(health::watch(node.clone()));
+    let mixer = tokio::spawn(policy::run(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -114,9 +117,11 @@ async fn main() -> Result<()> {
     refresh.abort();
     peers.abort();
     health.abort();
+    mixer.abort();
     let _ = refresh.await;
     let _ = peers.await;
     let _ = health.await;
+    let _ = mixer.await;
     drop(node);
     tracing::info!("stopped");
     Ok(())

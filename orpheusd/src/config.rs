@@ -137,6 +137,11 @@ pub struct ReceiverConfig {
     pub link_offset_ms: u32,
     /// What the receiver plays while no sender is connected to it.
     pub accept: Accept,
+    /// Which of several streams playing at once are heard.
+    pub policy: Policy,
+    /// How far normal streams are turned down while a high-priority one
+    /// plays.
+    pub duck_db: f32,
 }
 
 impl Default for ReceiverConfig {
@@ -147,6 +152,8 @@ impl Default for ReceiverConfig {
             max: 8,
             link_offset_ms: 10,
             accept: Accept::default(),
+            policy: Policy::default(),
+            duck_db: 20.0,
         }
     }
 }
@@ -161,6 +168,21 @@ pub enum Accept {
     Connected,
     /// Also any stream sent to its port while no sender is connected.
     Any,
+}
+
+/// Which streams are heard when several play at once. A stream plays while
+/// it carries sound (above −60 dBFS) or did within the last 5 seconds;
+/// high-priority streams are always heard.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Policy {
+    /// The one that started playing last; the others are muted.
+    #[default]
+    Last,
+    /// The one that started playing first, until it stops.
+    First,
+    /// All of them.
+    Mix,
 }
 
 /// Clock synchronization with the other nodes (and AES67 devices). Without
@@ -248,6 +270,9 @@ impl Config {
         }
         if u32::from(r.port) + 2 * (u32::from(r.max) - 1) > u32::from(u16::MAX) {
             anyhow::bail!("[receiver] port + 2 × (max − 1) must stay below 65536");
+        }
+        if !(0.0..=96.0).contains(&r.duck_db) {
+            anyhow::bail!("[receiver] duck_db must be 0 to 96");
         }
         Ok(())
     }
@@ -356,5 +381,12 @@ mod tests {
         assert!(max("[receiver]\nmax = 33").is_err());
         assert!(max("[receiver]\nport = 65530\nmax = 3").is_ok());
         assert!(max("[receiver]\nport = 65530\nmax = 4").is_err());
+        assert_eq!(c.receiver.policy, Policy::Last);
+        assert_eq!(c.receiver.duck_db, 20.0);
+        let c: Config = toml::from_str("[receiver]\npolicy = \"mix\"\nduck_db = 12").unwrap();
+        assert_eq!(c.receiver.policy, Policy::Mix);
+        assert_eq!(c.receiver.duck_db, 12.0);
+        assert!(max("[receiver]\nduck_db = -3").is_err());
+        assert!(max("[receiver]\nduck_db = nan").is_err());
     }
 }

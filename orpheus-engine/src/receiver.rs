@@ -401,13 +401,19 @@ impl Receiver {
             .unwrap_or(SocketAddr::new(self.bind_ip, 0))
     }
 
+    /// Time since the stream last carried sound, in milliseconds; `None`
+    /// if it never did.
+    pub fn silent_ms(&self) -> Option<u64> {
+        let sound = self.counters.sound_ns.load(Relaxed);
+        (sound != 0).then(|| self.clock.now_ns().saturating_sub(sound) / 1_000_000)
+    }
+
     pub fn status(&self) -> ReceiverStatus {
         let c = &self.counters;
         let ssrc = c.ssrc.load(Relaxed);
         let margin = c.margin_us.load(Relaxed);
         let jitter = c.jitter_us.load(Relaxed);
         let peak = f32::from_bits(c.peak.load(Relaxed));
-        let sound = c.sound_ns.load(Relaxed);
         ReceiverStatus {
             listen: self.listen(),
             link_offset_ms: self.link_offset_ms,
@@ -425,7 +431,7 @@ impl Receiver {
             asrc_ppm: f64::from_bits(c.asrc_ppm.load(Relaxed)),
             buffer: self.buffer.snapshot(),
             peak_dbfs: (peak > 0.0).then(|| 20.0 * peak.log10()),
-            silent_ms: (sound != 0).then(|| self.clock.now_ns().saturating_sub(sound) / 1_000_000),
+            silent_ms: self.silent_ms(),
             gain: f32::from_bits(self.gain.load(Relaxed)),
         }
     }

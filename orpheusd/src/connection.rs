@@ -41,6 +41,7 @@ use orpheus_nmos::is05::{
     self, Activation, Auto, Mode, ReceiverParams, ReceiverTransport, SenderParams, SenderTransport,
     TransportFile,
 };
+use orpheus_nmos::sdp::Priority;
 use orpheus_nmos::{Uuid, resource_id, sdp};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -52,6 +53,7 @@ use crate::nmos::FORMAT;
 use crate::nmos::{self, error};
 use crate::outputs;
 use crate::peer::{self, PeerReceiver};
+use crate::policy::State as PolicyState;
 
 const BASE: &str = "/x-nmos/connection/v1.1";
 
@@ -164,6 +166,9 @@ struct Link {
     /// The user named the sink; otherwise it follows the peer's name.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     named: bool,
+    /// Written into the SDP file, for the peer's policy.
+    #[serde(default)]
+    priority: Priority,
     /// Whether the peer's receiver plays the sender, as far as we know.
     #[serde(skip)]
     state: PeerState,
@@ -171,6 +176,9 @@ struct Link {
     /// spread.
     #[serde(skip)]
     jitter: bool,
+    /// What the peer's policy does to the stream, if it holds it back.
+    #[serde(skip)]
+    held: Option<PolicyState>,
     /// The kind of output the peer's receiver announces, which the sink
     /// shows unless overridden here.
     #[serde(default)]
@@ -206,6 +214,11 @@ pub struct PeerLink {
     #[schema(value_type = String)]
     pub id: Uuid,
     pub state: PeerState,
+    /// What the peer's policy does to the stream: `muted` while another
+    /// stream plays there, `ducked` under a high-priority one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, example = "muted")]
+    pub policy: Option<PolicyState>,
     /// The receiver warns that the packets arrive with a wide spread.
     #[serde(skip)]
     pub jitter: bool,
@@ -261,9 +274,33 @@ impl Connections {
                         api: r.api.clone(),
                         id: r.id,
                         state: l.state,
+                        policy: l.held,
                         jitter: l.jitter,
                     },
                 ))
+            })
+            .collect()
+    }
+
+    /// The senders routed here.
+    pub fn sender_ids(&self) -> Vec<SenderId> {
+        self.senders.keys().copied().collect()
+    }
+
+    /// The priority each sender announces.
+    pub fn sender_priority(&self, id: SenderId) -> Priority {
+        self.links.get(&id).map(|l| l.priority).unwrap_or_default()
+    }
+
+    /// The priority of each connected receiver's sender, from its SDP
+    /// file; normal if it doesn't say.
+    pub fn receiver_priorities(&self) -> BTreeMap<ReceiverId, Priority> {
+        self.receivers
+            .iter()
+            .filter(|(_, p)| p.active.master_enable)
+            .filter_map(|(&id, p)| {
+                let sdp = sdp::parse(p.active.transport_file.data.as_deref()?).ok()?;
+                Some((id, sdp.priority))
             })
             .collect()
     }
@@ -404,9 +441,15 @@ fn destination(p: &SenderParams) -> Option<SocketAddr> {
 
 /// Starts a sender to `peer` and activates that destination, without
 /// telling the peer.
-pub fn add_sender(node: &Node, peer: SocketAddr, name: String) -> Result<SenderId, Fail> {
+pub fn add_sender(
+    node: &Node,
+    peer: SocketAddr,
+    name: String,
+    priority: Priority,
+) -> Result<SenderId, Fail> {
     let link = Link {
         named: true,
+        priority,
         ..Link::default()
     };
     start_sender(node, peer, name, link)
@@ -420,6 +463,7 @@ pub fn connect(
     peer: &str,
     name: Option<String>,
     force: bool,
+    priority: Priority,
 ) -> Result<Connected, Fail> {
     let found = peer::resolve(node, peer)?;
     let ours: Vec<(SenderId, Uuid)> = node
@@ -442,8 +486,10 @@ pub fn connect(
     };
     let link = Link {
         named,
+        priority,
         state: PeerState::Connecting,
         jitter: false,
+        held: None,
         output: target.output,
         receiver: Some(to.clone()),
     };
@@ -654,9 +700,14 @@ fn update_link(
             }
             link.state = PeerState::Unreachable;
             link.jitter = false;
+            link.held = None;
         }
         Ok(p) => {
             link.jitter = p.jitter;
+            if p.held != link.held {
+                tracing::info!(id, held = ?p.held, "the peer's policy changed what it does to the stream");
+                link.held = p.held;
+            }
             link.state = if p.sender == Some(ours) {
                 PeerState::Connected
             } else {

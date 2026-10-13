@@ -188,6 +188,15 @@ impl Engine {
         self.receivers.get(&id).map(|r| r.set_gain(gain)).is_some()
     }
 
+    /// How long each running receiver's stream has been silent, in
+    /// milliseconds (see [`ReceiverStatus::silent_ms`]).
+    pub fn receiver_silence(&self) -> Vec<(ReceiverId, Option<u64>)> {
+        self.receivers
+            .iter()
+            .map(|(id, r)| (*id, r.silent_ms()))
+            .collect()
+    }
+
     /// The audio system's outputs.
     pub fn outputs(&self) -> Vec<Output> {
         self.backend.outputs()
