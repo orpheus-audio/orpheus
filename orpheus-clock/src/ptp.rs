@@ -24,6 +24,7 @@
 //! `CAP_NET_BIND_SERVICE`.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
@@ -71,6 +72,12 @@ const SETTLE_ROUNDS: u32 = 3;
 /// Measurements this soon after a step are dropped: they may have been
 /// taken before it.
 const STEP_HOLDOFF_NS: i64 = 500_000_000;
+
+/// Delay samples the servo's own path delay estimate is the median of.
+const DELAY_SAMPLES: usize = 15;
+/// A sync and a delay measurement further apart than this are not paired:
+/// the clock's frequency error between them would bias the delay.
+const DELAY_PAIR_NS: f64 = 250_000_000.0;
 
 /// TAI − UTC announced when this node is the grandmaster.
 const UTC_OFFSET_S: i16 = 37;
@@ -382,17 +389,65 @@ impl Drop for PtpClock {
 type BmcaPort<'a> =
     Port<'a, InBmca, AcceptAnyMaster, StdRng, PortClock, Servo, RefCell<PtpInstanceState>>;
 
-/// statime's Kalman filter, started afresh after every step.
+/// statime's Kalman filter, started afresh after every step, fed with
+/// measurements from which the path delay is taken out.
 ///
 /// statime keeps its estimate of the measurement noise across a step, and on
 /// a cold start that estimate takes in a pair of measurements from both
 /// sides of the step, off by the whole step. The filter then distrusts every
 /// measurement until the pair ages out about 30 s later, and overshoots.
+///
+/// statime also resets its filter when a raw measurement (offset + delay
+/// from a sync, offset − delay from a delay request) is further than the
+/// step threshold from its offset alone, without the delay. With a path
+/// delay above half the threshold it then resets and steps over and over.
+/// So the servo estimates the delay itself, from sync and delay
+/// measurements close together (the offset cancels), and hands the filter
+/// only what is left of it. The estimate survives steps, which don't change
+/// the path.
 struct Servo {
     config: KalmanConfiguration,
     filter: KalmanFilter,
     /// Time of the last step; measurements shortly after it are dropped.
     stepped_at: Option<Time>,
+    delay: DelayEstimate,
+}
+
+/// The path delay, as the median of recent samples.
+#[derive(Default)]
+struct DelayEstimate {
+    /// The last sync measurement: when, and offset + delay in seconds.
+    last_sync: Option<(Time, f64)>,
+    samples: VecDeque<f64>,
+    /// Median of `samples`, in seconds; `None` before the first pair.
+    value: Option<f64>,
+}
+
+impl DelayEstimate {
+    fn sync(&mut self, at: Time, raw: f64) {
+        self.last_sync = Some((at, raw));
+    }
+
+    fn delay(&mut self, at: Time, raw: f64) {
+        let Some((sync_at, sync)) = self.last_sync else {
+            return;
+        };
+        if (at - sync_at).nanos_lossy().abs() > DELAY_PAIR_NS {
+            return;
+        }
+        self.samples.push_back((sync - raw) / 2.0);
+        if self.samples.len() > DELAY_SAMPLES {
+            self.samples.pop_front();
+        }
+        let mut sorted: Vec<f64> = self.samples.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        self.value = Some(sorted[sorted.len() / 2]);
+    }
+
+    /// Forgets the last sync, which a step made stale.
+    fn stepped(&mut self) {
+        self.last_sync = None;
+    }
 }
 
 impl Filter for Servo {
@@ -403,10 +458,15 @@ impl Filter for Servo {
             filter: KalmanFilter::new(config),
             config,
             stepped_at: None,
+            delay: DelayEstimate::default(),
         }
     }
 
-    fn measurement<C: statime::Clock>(&mut self, m: Measurement, clock: &mut C) -> FilterUpdate {
+    fn measurement<C: statime::Clock>(
+        &mut self,
+        mut m: Measurement,
+        clock: &mut C,
+    ) -> FilterUpdate {
         if let Some(at) = self.stepped_at {
             if (clock.now() - at).nanos_lossy() < STEP_HOLDOFF_NS as f64 {
                 return FilterUpdate::default();
@@ -414,17 +474,35 @@ impl Filter for Servo {
             self.stepped_at = None;
             self.filter = KalmanFilter::new(self.config);
         }
+        if let Some(sync) = m.raw_sync_offset {
+            self.delay.sync(m.event_time, sync.seconds());
+        }
+        if let Some(delay) = m.raw_delay_offset {
+            self.delay.delay(m.event_time, delay.seconds());
+        }
+        // Until the first pair, the filter would take the delay for an
+        // offset and step by it.
+        let Some(delay) = self.delay.value else {
+            return FilterUpdate::default();
+        };
+        let delay = Duration::from_seconds(delay);
+        m.raw_sync_offset = m.raw_sync_offset.map(|o| o - delay);
+        m.raw_delay_offset = m.raw_delay_offset.map(|o| o + delay);
         let mut watch = StepWatch {
             clock,
             stepped_at: None,
         };
         let update = self.filter.measurement(m, &mut watch);
         self.stepped_at = watch.stepped_at;
-        update
+        if self.stepped_at.is_some() {
+            self.delay.stepped();
+        }
+        self.with_delay(update)
     }
 
     fn update<C: statime::Clock>(&mut self, clock: &mut C) -> FilterUpdate {
-        self.filter.update(clock)
+        let update = self.filter.update(clock);
+        self.with_delay(update)
     }
 
     fn demobilize<C: statime::Clock>(self, clock: &mut C) {
@@ -432,7 +510,24 @@ impl Filter for Servo {
     }
 
     fn current_estimates(&self) -> FilterEstimate {
-        self.filter.current_estimates()
+        let mut estimate = self.filter.current_estimates();
+        // Zero still means "no measurements yet".
+        if estimate.mean_delay != Duration::ZERO {
+            estimate.mean_delay += self.bulk_delay();
+        }
+        estimate
+    }
+}
+
+impl Servo {
+    /// The part of the delay taken out before the filter.
+    fn bulk_delay(&self) -> Duration {
+        Duration::from_seconds(self.delay.value.unwrap_or(0.0))
+    }
+
+    fn with_delay(&self, mut update: FilterUpdate) -> FilterUpdate {
+        update.mean_delay = update.mean_delay.map(|d| d + self.bulk_delay());
+        update
     }
 }
 
@@ -890,6 +985,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn delay_estimate_pairs_sync_and_delay() {
+        let ms = Time::from_millis;
+        let mut d = DelayEstimate::default();
+        // A delay measurement without a sync before it says nothing.
+        d.delay(ms(1000), 0.002 - 0.004);
+        assert_eq!(d.value, None);
+        // Offset 2 ms, delay 4 ms: sync sees +6 ms, the delay request -2 ms.
+        d.sync(ms(1000), 0.006);
+        d.delay(ms(1100), -0.002);
+        assert!((d.value.unwrap() - 0.004).abs() < 1e-12);
+        // Too far apart to pair.
+        d.sync(ms(2000), 0.016);
+        d.delay(ms(2500), -0.002);
+        assert_eq!(d.samples.len(), 1);
+        // A step makes the last sync stale.
+        d.sync(ms(3000), 0.006);
+        d.stepped();
+        d.delay(ms(3100), -0.010);
+        assert_eq!(d.samples.len(), 1);
+        // The median ignores outliers.
+        for (i, delay) in [0.004, 0.030, 0.004, 0.004].into_iter().enumerate() {
+            let at = 4000 + 1000 * i as u64;
+            d.sync(ms(at), 0.001 + delay);
+            d.delay(ms(at + 50), 0.001 - delay);
+        }
+        assert!((d.value.unwrap() - 0.004).abs() < 1e-12);
+    }
+
+    #[test]
     fn default_routes() {
         let v4 = "Iface\tDestination\tGateway\tFlags\n\
                   wlan0\t0018A8C0\t00000000\t0001\n\
@@ -1013,8 +1137,17 @@ mod tests {
             raw_sync_offset: Some(offset),
             ..Default::default()
         };
-        // Cold start, 200 ms off: one step.
+        // Cold start, 200 ms off: nothing until a delay request gives the
+        // delay (here none), then one step.
         servo.measurement(sync(&clock, Duration::from_millis(200)), &mut clock);
+        assert_eq!(clock.steps, 0);
+        clock.now += Duration::from_millis(10);
+        let delay = Measurement {
+            event_time: clock.now,
+            raw_delay_offset: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+        servo.measurement(delay, &mut clock);
         assert_eq!(clock.steps, 1);
         // A measurement taken before the step arrives after it. statime's
         // filter alone would step back.
@@ -1027,5 +1160,38 @@ mod tests {
         assert_eq!(clock.steps, 1);
         let offset = servo.current_estimates().offset_from_master;
         assert!(offset.abs() < Duration::from_micros(10), "{offset:?}");
+    }
+
+    #[test]
+    fn servo_settles_behind_a_slow_path() {
+        // 5 ms each way, five times the step threshold, and 300 µs off.
+        // statime's filter alone resets and steps on every measurement.
+        let mut clock = TestClock {
+            now: Time::from_secs(1000),
+            steps: 0,
+        };
+        let mut servo = Servo::new(KalmanConfiguration::default());
+        let (delay, offset) = (Duration::from_millis(5), Duration::from_micros(300));
+        for i in 0..40 {
+            clock.now += Duration::from_millis(125);
+            let mut m = Measurement {
+                event_time: clock.now,
+                ..Default::default()
+            };
+            if i % 2 == 0 {
+                m.raw_sync_offset = Some(offset + delay);
+            } else {
+                m.raw_delay_offset = Some(offset - delay);
+            }
+            servo.measurement(m, &mut clock);
+        }
+        assert_eq!(clock.steps, 0);
+        // The test clock ignores frequency steering, so offset and delay only
+        // roughly matches.
+        let e = servo.current_estimates();
+        let off = e.offset_from_master - offset;
+        assert!(off.abs() < Duration::from_micros(200), "{off:?}");
+        let d = e.mean_delay - delay;
+        assert!(d.abs() < Duration::from_micros(50), "{d:?}");
     }
 }

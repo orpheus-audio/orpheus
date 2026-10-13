@@ -34,8 +34,8 @@ const JITTER_WINDOW: usize = 10;
 /// Wired, with software timestamps, it is tens to a few hundred µs.
 pub const PTP_DELAY_LIMIT_MS: f64 = 0.5;
 /// The clock warns when it stepped this often within [`STEPS_WINDOW`]. One
-/// or two steps after a start are normal; a path delay above about half
-/// the step threshold makes it step over and over and never settle.
+/// or two steps after a start are normal; jitter above the step threshold
+/// makes it step over and over and never settle.
 const STEPS_LIMIT: u64 = 3;
 const STEPS_WINDOW: Duration = Duration::from_secs(60);
 /// How often the node's own link is checked for announcing it.

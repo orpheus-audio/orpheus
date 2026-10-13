@@ -5,11 +5,14 @@ Start with `orpheusctl status` on both nodes and the `orpheusd` log.
 ## Logs
 
 `orpheusd` logs to stderr at the levels error, warn, info and debug; by
-default it shows info and above. `RUST_LOG` changes that, also per module:
+default it shows info and above, from statime (the PTP stack) only
+warnings, because it logs every measurement. `RUST_LOG` changes that, also
+per module:
 
 ```sh
 RUST_LOG=debug orpheusd
 RUST_LOG=info,orpheus_clock=debug orpheusd
+RUST_LOG=info,statime=info orpheusd   # every PTP measurement
 ```
 
 As a systemd service its log goes to the journal, with each line's level as
@@ -60,9 +63,10 @@ The log line `PTP unavailable; using the system clock` gives the reason.
   low rate, and with power saving they hold it back for 100 to 300 ms. Use
   Ethernet; a Wi-Fi profile is planned. The node warns about it (`wifi`,
   `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)).
-- **Slow path.** With more than about 0.5 ms one way to the grandmaster
-  the clock steps over and over (`steps` keeps rising, warning
-  `ptp_steps`); see the [roadmap](roadmap.md#known-limitations).
+- **Unsteady path.** If `steps` keeps rising (warning `ptp_steps`), the
+  delay to the grandmaster jumps by more than `step_threshold_us`, as on
+  Wi-Fi. Set `[ptp] step_threshold_us = 20000`; see
+  [clock](clock.md#ptp).
 
 ## PTP works for a few minutes, then stops
 

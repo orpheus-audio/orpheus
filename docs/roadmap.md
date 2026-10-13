@@ -77,11 +77,12 @@ and Bluetooth inputs.
 - One interface and one transport per node, end-to-end delay only. The AES67
   message rates are fixed. `[ptp]` can only be set in the config file.
 - The PTP clock sits on the system clock, so an NTP step disturbs it.
-- With more than about 0.5 ms of delay one way (half the step threshold),
-  PTP never settles: after each step the filter starts afresh, its first
-  sync and delay measurements differ by twice the delay, and it steps
-  again. Wi-Fi is well above that. The node warns (`ptp_steps`); a fix
-  belongs in the servo, for example estimating the delay before stepping.
+- Jitter above the step threshold (1 ms), as on Wi-Fi, makes the clock
+  step over and over, and a sudden change of the path delay makes it step
+  for a few seconds; see [clock](clock.md#ptp). The node warns
+  (`ptp_steps`). A larger `step_threshold_us` helps; the planned Wi-Fi
+  profile should set it, or the servo should step only on offsets that
+  persist.
 - PTP needs `CAP_NET_BIND_SERVICE`, which has to be set again after every
   build.
 

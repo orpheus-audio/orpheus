@@ -42,7 +42,8 @@ the virtual clock:
   until it catches up. `orpheusctl status` shows this rate as `frequency`
   in ppm (parts per million; 1 ppm is 1 µs per second, or 3.6 ms per hour).
 
-**Servo.** Two changes to statime's defaults make a cold start fast:
+**Servo.** Three changes to statime's defaults make a cold start fast and
+let the clock settle behind a slow path:
 
 - After a step, measurements are dropped for 0.5 s and the filter starts
   afresh. statime keeps its estimate of the measurement noise across a step,
@@ -50,6 +51,23 @@ the virtual clock:
   step, made it distrust everything for about 30 s and then overshoot.
 - The filter estimates the measurement noise after two measurement pairs
   instead of four, and corrects offsets within about 1 s instead of 2.
+- The servo estimates the path delay itself, as the median of the last 15
+  pairs of a sync and a delay request (within 250 ms of each other, so the
+  offset cancels), and hands the filter only what is left of it. statime
+  compares each raw measurement, offset plus or minus the delay, with its
+  offset alone and starts over when they differ by more than
+  `step_threshold_us`, so with more than half a millisecond of delay each
+  way it stepped over and over and never settled. The servo waits for the
+  first pair before it steers, about a second at most, and keeps the
+  estimate across steps, which don't change the path.
+
+With a path delay that changes suddenly by more than the step threshold
+the clock steps a few times until the median follows (about 8 s). Jitter
+beyond the step threshold, as on Wi-Fi, still makes it start over on
+single measurements; raising `step_threshold_us` (for example to 20000)
+lets it settle there, at the cost of slewing instead of stepping offsets
+below that on a cold start. Measured with 4 ms ± 2 ms each way, a node
+settled after about 35 s without stepping.
 
 Measured between two nodes on one machine (network namespaces, 50 µs of
 added jitter, clock skews up to ±200 ppm), a node that joins a running
