@@ -1,6 +1,7 @@
-<h1 align="center"><img src="docs/logo/orpheus-styx.svg" alt="Orpheus" width="560"></h1>
-
-<p align="center"><b>O</b>pen <b>R</b>ealtime <b>P</b>eer-to-peer <b>H</b>ome <b>E</b>thernet <b>U</b>nicast <b>S</b>treaming</p>
+<div align="center">
+  <h1><img src="docs/logo/orpheus-styx.svg" alt="Orpheus" width="560"></h1>
+  <p><b>O</b>pen <b>R</b>ealtime <b>P</b>eer-to-peer <b>H</b>ome <b>E</b>thernet <b>U</b>nicast <b>S</b>treaming</p>
+</div>
 
 Orpheus is a decentralized audio-over-IP network for the home. Every device is
 a node that can send and play audio, and there is no central server. On wired
