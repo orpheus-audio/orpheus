@@ -3,7 +3,9 @@
 mod api;
 mod config;
 mod connection;
+mod health;
 mod home;
+mod network;
 mod nmos;
 mod outputs;
 mod peer;
@@ -92,17 +94,19 @@ async fn main() -> Result<()> {
         connections: Mutex::new(connection::Connections::new(
             home.state_dir().join("routes.json"),
         )),
-        quantum: config.audio.quantum,
+        block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
         receiver_port: config.receiver.port,
         accept: config.receiver.accept,
         outputs: Mutex::new(outputs::Overrides::load(
             home.state_dir().join("outputs.json"),
         )),
+        health: Mutex::default(),
     });
     connection::restore(&node);
 
     let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));
     let peers = tokio::spawn(connection::watch_peers(node.clone()));
+    let health = tokio::spawn(health::watch(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -111,8 +115,10 @@ async fn main() -> Result<()> {
         .await?;
     refresh.abort();
     peers.abort();
+    health.abort();
     let _ = refresh.await;
     let _ = peers.await;
+    let _ = health.await;
     drop(node);
     tracing::info!("stopped");
     Ok(())
@@ -257,7 +263,7 @@ fn start_engine(
                 description: "Orpheus loopback".into(),
                 format: AudioFormat::AES67,
                 latency_ms: config.loopback.latency_ms,
-                quantum: config.audio.quantum,
+                block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
             })
             .map_err(|e| anyhow!(e))
             .context("starting loopback")?;
@@ -274,7 +280,7 @@ fn start_engine(
                 encoding: Encoding::L24,
                 listen,
                 link_offset_ms: rx.link_offset_ms,
-                quantum: config.audio.quantum,
+                block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
             })
             .map_err(|e| anyhow!(e))
             .with_context(|| format!("starting receiver on {listen}"))?;

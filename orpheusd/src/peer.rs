@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use orpheus_core::{DeviceId, OutputType};
-use orpheus_nmos::is04::TAG_FORM_FACTOR;
+use orpheus_nmos::is04::{TAG_FORM_FACTOR, TAG_WARNINGS};
 use orpheus_nmos::{Uuid, is05};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -269,6 +269,8 @@ pub struct Playing {
     pub output: OutputType,
     /// The sender it is connected to, if any.
     pub sender: Option<Uuid>,
+    /// Whether it warns that packets arrive with a wide spread.
+    pub jitter: bool,
 }
 
 /// Asks a peer's receiver what it plays and on what.
@@ -277,6 +279,9 @@ pub fn playing(of: &PeerReceiver) -> Result<Playing, Fail> {
     Ok(Playing {
         output: form_factor(&r),
         sender: holder(&r),
+        jitter: r["tags"][TAG_WARNINGS]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w == "jitter")),
     })
 }
 

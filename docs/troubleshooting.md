@@ -58,7 +58,11 @@ The log line `PTP unavailable; using the system clock` gives the reason.
   grandmaster; if all nodes start at once, the election adds about 10 s.
 - **Wi-Fi.** PTP over Wi-Fi is unreliable. Access points send multicast at a
   low rate, and with power saving they hold it back for 100 to 300 ms. Use
-  Ethernet; a Wi-Fi profile is planned.
+  Ethernet; a Wi-Fi profile is planned. The node warns about it (`wifi`,
+  `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)).
+- **Slow path.** With more than about 0.5 ms one way to the grandmaster
+  the clock steps over and over (`steps` keeps rising, warning
+  `ptp_steps`); see the [roadmap](roadmap.md#known-limitations).
 
 ## PTP works for a few minutes, then stops
 
@@ -101,6 +105,10 @@ affected.
    - `connected to …, idle`: the sender points to the wrong address or port
      (the `PEER` column on the sending node), or a firewall blocks UDP 5004;
    - no receiver at all: it is disabled in `[receiver]`.
+
+   On the sending node, a sender shown as `(disconnected, paused)` or
+   `(off)` sends nothing; see [reading the
+   status](usage.md#reading-the-status).
 2. If packets arrive but count as `late` or `early`, the clocks disagree. See
    the next section.
 3. Check that the sender's sink actually gets audio: the application must play
@@ -123,6 +131,8 @@ affected.
 
 ## Dropouts and clicks
 
+- **Warnings** in `orpheusctl status` name Wi-Fi or a jittery path on
+  either end; see [warnings](usage.md#warnings).
 - **`late` rises, `margin` near zero:** packets arrive too close to their
   playout time. Raise `link_offset_ms`, or make sure both nodes are settled
   on PTP. On the system clock, NTP decides how well the nodes agree.
@@ -130,7 +140,8 @@ affected.
   overloaded link, or a switch that floods multicast.
 - **`underruns` rise:** the audio system or a network thread doesn't keep up.
   This happens under heavy CPU load, because Orpheus's threads don't run with
-  realtime priority yet. A larger `[audio] quantum` helps.
+  realtime priority yet. A larger block (`[audio] block_frames` or
+  `cycle_ms`) helps.
 - **`realigns` rise:** a thread stalled for more than 100 ms, or the clock
   jumped. Look for steps in the PTP status, or NTP stepping the system clock.
 

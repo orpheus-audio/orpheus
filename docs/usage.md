@@ -14,7 +14,7 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 |---|---|
 | `status` | Shows the node's ID, name, version, clock, receiver and senders. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
-| `nodes` | Lists the other nodes the node found on the network, with ID, address and version. Nodes that stopped stay listed as offline. |
+| `nodes` | Lists the other nodes the node found on the network, with ID, address, version and link (`wired` or `Wi-Fi`, as each node announces it). Nodes that stopped stay listed as offline. |
 | `connect PEER [--name NAME] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a sink called `NAME` (the peer's name if none is given), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. The connection is kept across restarts. |
 | `connect PEER --send-only [--name NAME]` | Only sends; the peer's receiver is left alone. For devices without NMOS, and receivers set to accept any stream. |
 | `disconnect ID` | Stops a sender, removes its sink and disconnects the peer's receiver. The ID is shown by `connect` and `status`. |
@@ -85,12 +85,17 @@ A receiver plays only the sender connected to it, unless it is set to
 A host name that resolves to both IPv4 and IPv6 is reached over IPv4, which
 every receiver listens on.
 
-Senders are not saved. They end when `orpheusd` stops.
+Senders and their connections are kept in `routes.json` in the [state
+directory](configuration.md#files). When `orpheusd` starts again it
+recreates the senders under the same IDs and sinks.
 
 ## Reading the status
 
 ```text
 desk  B73AQ0P0  orpheusd 0.0.1
+
+Warnings
+  ● sender 0: Kitchen is on Wi-Fi; expect dropouts
 
 Clock          ● PTP, settled
   interface    enp3s0 (IPv4)
@@ -102,10 +107,13 @@ Clock          ● PTP, settled
   frequency    +12.31 ppm
   steps        1
 
-Receiver       ● receiving ssrc 5e1f02aa
+Receiver       ● receiving from Kitchen
   listen       [::]:5004
+  accepts      connected senders
+  output       hifi (Built-in Audio Analog Stereo)
   link offset  10 ms
   margin       8.71 ms
+  jitter       0.21 ms
   packets      120000
   buffer       1140 frames
   ASRC         -3.2 ppm
@@ -123,6 +131,9 @@ off when the output is piped or `NO_COLOR` is set.
 
 Counters are totals since the start. With `--watch` they are rates over the
 last interval instead, so `problems` shows only what is going wrong now.
+
+**Warnings** are listed only when there are any, and logged as they come
+and go; see [warnings](#warnings).
 
 **Clock**
 
@@ -159,6 +170,9 @@ last interval instead, so `problems` shows only what is going wrong now.
 - `margin`: the smallest time between a packet's arrival and its playout over
   the last second. It should stay well above zero. If it gets close to zero,
   raise `link_offset_ms`.
+- `jitter`: how far the packets' transit times spread over the last
+  second. A few hundred µs is normal on a wired network; above 3 ms it is
+  highlighted and the node [warns](#warnings).
 - `problems`: the counters that are not zero, all counted since the start:
   - `lost`: packets that never arrived. `late`: arrived after their playout
     time. Both cause short gaps.
@@ -170,14 +184,23 @@ last interval instead, so `problems` shows only what is going wrong now.
 
 **Senders** have the same buffer columns, and `send errors` among their
 problems: packets the operating system could not send, for example because
-there is no route to the peer. `(off)` after the peer means a connection
-paused the sender: its sink still takes audio, but nothing is sent.
+there is no route to the peer. After the peer, the `PEER` column may show
+the sender's state:
+
+- `(off)`: a connection paused the sender. Its sink still takes audio, but
+  nothing is sent.
+- `(disconnected, paused)`: someone else connected the peer's receiver, so
+  nothing is sent (see [connecting](#connecting)).
+- `(unreachable)`: the peer is offline or doesn't answer. The sender keeps
+  sending.
+- `(connecting)`: `connect` is still setting up the peer's receiver.
 
 **Buffers** (receiver, senders, loopback)
 
 - `buffer`: fill level of the ring between PipeWire and the network thread.
-  In both directions it is about one quantum plus a few milliseconds:
-  PipeWire moves a whole cycle at a time, the network threads 1 ms.
+  In both directions it is about one block plus a few milliseconds:
+  PipeWire moves a whole block per cycle, the network threads 1 ms (see
+  [`[audio]`](configuration.md#audio)).
 - `ASRC`: the current rate correction between the media clock and the sound
   card. It settles near the sound card's crystal error.
 - `underruns`: the ring ran dry, so there was a gap.
@@ -191,7 +214,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 
 | Method and path | Effect |
 |---|---|
-| `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows). |
+| `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows), with `warnings`: a list of `{kind, on, sender, message}`, see [warnings](#warnings). |
 | `POST /x-orpheus/v1/senders` | Starts a sender and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": 0, "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender and disconnects the peer's receiver. Returns `204`, or `404` if there is no such sender. |
 | `GET /x-orpheus/v1/senders/{id}/sdp` | The sender's stream as an SDP file (`application/sdp`). |
@@ -208,6 +231,29 @@ curl -s localhost:7480/x-orpheus/v1/status | jq .clock
 curl -s -X POST localhost:7480/x-orpheus/v1/senders \
   -H 'content-type: application/json' -d '{"peer": "Kitchen"}'
 ```
+
+## Warnings
+
+A node warns about network paths that put the audio at risk. Each warning
+is shown by `orpheusctl status`, in the status JSON, and logged when it
+appears (`WARN`) and when it is resolved (`INFO`):
+
+| `kind` | On | Meaning |
+|---|---|---|
+| `wifi` | clock, receiver, sender | PTP or the stream leaves this node over Wi-Fi. Wi-Fi delays packets by milliseconds and holds back multicast, so expect dropouts and clocks that don't settle. |
+| `multicast_wifi` | receiver, sender | A [multicast](#multicast-interop) stream goes over Wi-Fi, where the access point sends it at its lowest rate to every client. |
+| `peer_wifi` | receiver, sender | The node at the other end is on Wi-Fi, as it announces. |
+| `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). |
+| `peer_jitter` | sender | The peer's receiver warns about `jitter` for this sender. |
+| `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. |
+| `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. |
+
+Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
+the stream or PTP takes. Each node also announces its own link, that of its
+default route, in its mDNS record (`x-orpheus-link`), so the node at the
+other end warns too, and `orpheusctl nodes` shows it. The receiver tells its
+senders about `jitter` through its NMOS resource (the tag
+`urn:x-orpheus:warnings`), which the senders [follow](#connecting).
 
 ## Output types
 
@@ -336,7 +382,8 @@ controllers expect it. A node uses it only when a connection asks:
 Use it on wired networks whose switches do IGMP snooping. Switches without
 it send the stream (about 2.6 Mbit/s) to every port, and over Wi-Fi it is
 sent at the slowest rate to every client and can take a large part of the
-airtime.
+airtime. A node [warns](#warnings) (`multicast_wifi`) when it sends or
+joins a group over Wi-Fi.
 
 The API has no authentication yet. Restrict `[api] listen` to `127.0.0.1` if
 the network is not trusted.

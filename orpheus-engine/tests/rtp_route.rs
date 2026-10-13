@@ -57,7 +57,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
             encoding: Encoding::L24,
             listen: "127.0.0.1:0".parse().unwrap(),
             link_offset_ms: LINK_OFFSET_MS,
-            quantum: Some(QUANTUM as u32),
+            block_frames: Some(QUANTUM as u32),
         })
         .unwrap();
     let listen = engine.status().receiver.unwrap().listen;
@@ -69,7 +69,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
             encoding: Encoding::L24,
             peer: listen,
             remote: OutputType::Generic,
-            quantum: Some(QUANTUM as u32),
+            block_frames: Some(QUANTUM as u32),
         })
         .unwrap();
     let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
@@ -184,7 +184,7 @@ fn routes_and_filters_change_at_runtime() {
             encoding: Encoding::L24,
             listen: "127.0.0.1:0".parse().unwrap(),
             link_offset_ms: LINK_OFFSET_MS,
-            quantum: Some(QUANTUM as u32),
+            block_frames: Some(QUANTUM as u32),
         })
         .unwrap();
     let listen = engine.status().receiver.unwrap().listen;
@@ -196,7 +196,7 @@ fn routes_and_filters_change_at_runtime() {
             encoding: Encoding::L24,
             peer: listen,
             remote: OutputType::Generic,
-            quantum: Some(QUANTUM as u32),
+            block_frames: Some(QUANTUM as u32),
         })
         .unwrap();
     let (taken, ignored) = counts_over(&engine, 100);

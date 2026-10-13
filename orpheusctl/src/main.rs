@@ -83,6 +83,15 @@ struct Status {
     receiver: Option<Receiver>,
     #[serde(default)]
     senders: Vec<Sender>,
+    /// Missing from older nodes.
+    #[serde(default)]
+    warnings: Vec<Warning>,
+}
+
+/// A problem with a network path.
+#[derive(Clone, Deserialize)]
+struct Warning {
+    message: String,
 }
 
 fn yes() -> bool {
@@ -141,6 +150,8 @@ struct Receiver {
     lost: u64,
     realigns: u64,
     margin_us: Option<i64>,
+    /// Missing from older nodes.
+    jitter_us: Option<i64>,
     #[serde(default)]
     asrc_ppm: f64,
     buffer: Buffer,
@@ -199,6 +210,8 @@ struct Node {
     version: Option<String>,
     #[serde(default)]
     addresses: Vec<String>,
+    /// `wired` or `wifi`, as the node announces it.
+    link: Option<String>,
     online: bool,
 }
 
@@ -650,6 +663,12 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
         let mark = p.mark(Level::Bad, "no audio system, no streams");
         heading(&mut o, p, "Audio", Some(mark));
     }
+    if !s.warnings.is_empty() {
+        heading(&mut o, p, "Warnings", None);
+        for w in &s.warnings {
+            let _ = writeln!(o, "  {}", p.mark(Level::Warn, &w.message));
+        }
+    }
     match &s.clock {
         Some(ClockInfo { ptp: Some(t), .. }) => clock(&mut o, p, t),
         Some(c) => {
@@ -748,6 +767,16 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
         None => "-".into(),
     };
     row(o, p, "margin", &margin);
+    if let Some(j) = r.jitter_us {
+        let text = format!("{:.2} ms", j as f64 / 1000.0);
+        // As orpheusd's health check warns.
+        let text = if j > 3000 {
+            p.level(Level::Warn, &text)
+        } else {
+            text
+        };
+        row(o, p, "jitter", &text);
+    }
     row(o, p, "packets", &c.packets(r.packets));
     if r.ignored > 0 {
         // From other sources: expected while connected to one sender.
@@ -879,7 +908,7 @@ fn render_nodes(nodes: &[Node], p: Paint) -> String {
         let _ = writeln!(o, "{}", p.mark(Level::Off, "no other nodes found"));
         return o;
     }
-    let rows: Vec<[String; 5]> = nodes
+    let rows: Vec<[String; 6]> = nodes
         .iter()
         .map(|n| {
             let state = if n.online {
@@ -892,12 +921,17 @@ fn render_nodes(nodes: &[Node], p: Paint) -> String {
                 n.id.clone().unwrap_or_else(|| "-".into()),
                 n.addresses.first().cloned().unwrap_or_else(|| "-".into()),
                 n.version.clone().unwrap_or_else(|| "-".into()),
+                match n.link.as_deref() {
+                    Some("wired") => "wired".into(),
+                    Some("wifi") => p.level(Level::Warn, "Wi-Fi"),
+                    _ => "-".into(),
+                },
                 state,
             ]
         })
         .collect();
-    let header = ["NAME", "ID", "ADDRESS", "VERSION", "STATE"];
-    table(&mut o, p, header, [false; 5], &rows);
+    let header = ["NAME", "ID", "ADDRESS", "VERSION", "LINK", "STATE"];
+    table(&mut o, p, header, [false; 6], &rows);
     o
 }
 
@@ -1032,6 +1066,30 @@ Senders
     }
 
     #[test]
+    fn shows_network_warnings() {
+        let mut s: Status = serde_json::from_str(STATUS).unwrap();
+        s.warnings.push(Warning {
+            message: "sender 0: Kitchen is on Wi-Fi; expect dropouts".into(),
+        });
+        s.receiver.as_mut().unwrap().jitter_us = Some(4210);
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("\nWarnings\n  ● sender 0: Kitchen is on Wi-Fi; expect dropouts\n"),
+            "{out}"
+        );
+        assert!(out.contains("  jitter       4.21 ms\n"), "{out}");
+
+        let nodes: Vec<Node> = serde_json::from_str(
+            r#"[{"name": "Kitchen", "addresses": ["10.0.0.2"], "link": "wifi", "online": true},
+                {"name": "Desk", "addresses": ["10.0.0.3"], "online": true}]"#,
+        )
+        .unwrap();
+        let out = render_nodes(&nodes, Paint(false));
+        assert!(out.contains("10.0.0.2  -        Wi-Fi  ● online"), "{out}");
+        assert!(out.contains("10.0.0.3  -        -      ● online"), "{out}");
+    }
+
+    #[test]
     fn colour_stays_out_of_alignment() {
         let s: Status = serde_json::from_str(STATUS).unwrap();
         let plain = render(&s, Paint(false), Counts::Total);
@@ -1086,9 +1144,9 @@ Senders
             ]"#,
         )
         .unwrap();
-        let expected = "  NAME           ID        ADDRESS    VERSION  STATE
-  Kitchen        B73AQ0P0  10.99.0.2  0.0.1    ● online
-  nmos-cpp node  -         -          -        ○ offline
+        let expected = "  NAME           ID        ADDRESS    VERSION  LINK  STATE
+  Kitchen        B73AQ0P0  10.99.0.2  0.0.1    -     ● online
+  nmos-cpp node  -         -          -        -     ○ offline
 ";
         assert_eq!(render_nodes(&nodes, Paint(false)), expected);
         assert_eq!(render_nodes(&[], Paint(false)), "○ no other nodes found\n");

@@ -51,7 +51,7 @@ name = "Living room"
 listen = "[::]:7480"
 
 [audio]
-# quantum = 256
+# block_frames = 256    # or cycle_ms = 5, not both
 
 [receiver]
 enabled = true
@@ -88,9 +88,43 @@ and stop senders.
 
 ### `[audio]`
 
+The audio system moves audio in blocks: once per cycle it wakes up, and
+every stream hands over or takes one block. Orpheus' streams copy each
+block between the audio system and the network threads, so the block size
+sets part of the latency, about one block in each direction.
+
 | Key | Default | Meaning |
 |---|---|---|
-| `quantum` | unset | Frames per PipeWire cycle to request for Orpheus streams. Smaller means lower latency and more CPU wakeups. Unset keeps the system default. The senders size their buffer from it and assume 1024 frames when it is unset. |
+| `block_frames` | unset | Block size to ask for, in frames. The same number at every sample rate. |
+| `cycle_ms` | unset | Block size to ask for, as a duration. It is converted to frames at the stream's sample rate and rounded to a whole frame, so the latency stays the same if the rate changes. |
+
+Set one of them or neither; setting both is an error. The block must come
+to 16 to 8192 frames, at 48 kHz 0.33 to 170 ms. Unset, the audio system
+picks (PipeWire usually 1024 frames, 21 ms, unless other applications ask
+for less).
+
+- **Smaller blocks** mean lower latency, but more wakeups and CPU, and
+  under load the audio system may not keep up (`underruns` in the
+  [status](usage.md#reading-the-status)).
+- **Larger blocks** cost latency but survive load.
+- Use `block_frames` to match a number the audio system shows, such as
+  PipeWire's quantum in `pw-top`; use `cycle_ms` to think in time.
+- Senders size their buffer from the block (1024 frames if unset). A block
+  the audio system makes smaller only leaves more headroom.
+
+What each platform does with it:
+
+| Platform | The block becomes |
+|---|---|
+| Linux, PipeWire | `node.latency = "<frames>/<rate>"` on Orpheus' streams, a request. PipeWire runs the whole graph at the smallest latency any stream asks for, scaled to the graph's rate, limited by `default.clock.min-quantum` and `max-quantum` (32 and 2048 by default), and rounded down to a power of two unless `clock.power-of-two-quantum` is off. So `cycle_ms = 5` (240 frames) runs at 128 frames, 2.7 ms. `pw-top` shows the real quantum (`QUANT`). |
+| Linux, ALSA (planned) | The period size; the buffer holds two to three periods. |
+| Windows, WASAPI (planned) | The buffer duration. Shared mode runs at the audio engine's period (usually 10 ms), or with `IAudioClient3` at a multiple of the device's smallest period; exclusive mode takes the block as the period. |
+| macOS, Core Audio (planned) | The device's buffer frame size (`kAudioDevicePropertyBufferFrameSize`), within the range the device allows. |
+| ESP32 (planned) | The I2S DMA buffer length in frames (`dma_frame_num`). |
+
+Where a platform can't run the exact size, it takes the nearest it can;
+`orpheusctl status` will show the size in use once nodes read it back (see
+the [roadmap](roadmap.md#known-limitations)).
 
 ### `[receiver]`
 
@@ -167,7 +201,8 @@ generic = "audio-speakers"
 
 The `orpheus-*` icons ship with Orpheus, see
 [`orpheusd/dist/icons`](../orpheusd/dist/icons/README.md); the others come
-from the icon theme. For now, every network sink is `generic`.
+from the icon theme. A sink to another node takes the type its receiver
+announces; see [output types](usage.md#output-types).
 
 ### `[loopback]`
 
@@ -190,6 +225,9 @@ measure the engine's own latency.
 | `ORPHEUS_NODE` | Node URL for `orpheusctl`; default `http://localhost:7480`. |
 | `ORPHEUS_DEBUG_CLOCK_SKEW_PPM` | Testing only: run this node's clock fast by this many ppm. |
 | `ORPHEUS_DEBUG_CLOCK_OFFSET_MS` | Testing only: offset this node's clock by this many milliseconds. |
+| `ORPHEUS_DEBUG_WIRELESS` | Testing only: interfaces to treat as Wi-Fi, separated by commas, or `*` for all. |
 
-The two debug variables let one machine play two nodes whose clocks disagree;
-see [development](development.md).
+The clock variables let one machine play two nodes whose clocks disagree,
+and `ORPHEUS_DEBUG_WIRELESS` tests the [network
+warnings](usage.md#warnings) without Wi-Fi; see
+[development](development.md).

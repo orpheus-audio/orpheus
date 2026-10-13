@@ -24,7 +24,7 @@ pub struct StreamSpec {
     pub group: Option<String>,
     /// Frames per processing cycle to ask the audio system for; `None` keeps
     /// the system default.
-    pub quantum: Option<u32>,
+    pub block_frames: Option<u32>,
     /// Latency the stream adds on top of the audio system, in frames.
     /// Reported so that players can delay video to match.
     pub process_latency: u32,

@@ -43,12 +43,77 @@ impl Default for ApiConfig {
     }
 }
 
+/// How much audio the audio system moves per cycle, asked for either in
+/// frames or in milliseconds; `None` keeps the system default.
 #[derive(Debug, Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(try_from = "RawAudio")]
 pub struct AudioConfig {
-    /// Frames per processing cycle to ask the audio system for. Smaller is
-    /// lower latency but more CPU wakeups; `None` keeps the system default.
-    pub quantum: Option<u32>,
+    pub block: Option<Block>,
+}
+
+/// A block size as configured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Block {
+    /// `block_frames`: exactly this many frames at every sample rate.
+    Frames(u32),
+    /// `cycle_ms`: this long, in frames at the stream's rate.
+    Millis(f64),
+}
+
+/// Block sizes PipeWire accepts (`clock.quantum-limit` defaults to 8192).
+const BLOCK_FRAMES: std::ops::RangeInclusive<u32> = 16..=8192;
+
+#[derive(Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct RawAudio {
+    block_frames: Option<u32>,
+    cycle_ms: Option<f64>,
+}
+
+impl TryFrom<RawAudio> for AudioConfig {
+    type Error = String;
+
+    fn try_from(raw: RawAudio) -> Result<Self, String> {
+        let block = match (raw.block_frames, raw.cycle_ms) {
+            (Some(_), Some(_)) => {
+                return Err("set either block_frames or cycle_ms, not both".into());
+            }
+            (Some(frames), None) => Some(Block::Frames(frames)),
+            (None, Some(ms)) => Some(Block::Millis(ms)),
+            (None, None) => None,
+        };
+        let audio = Self { block };
+        if let Some(frames) = audio.block_frames(48_000)
+            && !BLOCK_FRAMES.contains(&frames)
+        {
+            return Err(format!(
+                "the block must be {} to {} frames (at 48 kHz {:.2} to {:.0} ms), not {frames}",
+                BLOCK_FRAMES.start(),
+                BLOCK_FRAMES.end(),
+                *BLOCK_FRAMES.start() as f64 / 48.0,
+                *BLOCK_FRAMES.end() as f64 / 48.0,
+            ));
+        }
+        Ok(audio)
+    }
+}
+
+impl AudioConfig {
+    /// The block size in frames at `rate`; `cycle_ms` rounds to the
+    /// nearest frame.
+    pub fn block_frames(&self, rate: u32) -> Option<u32> {
+        self.block.map(|b| match b {
+            Block::Frames(frames) => frames,
+            Block::Millis(ms) => {
+                let frames = (ms * f64::from(rate) / 1000.0).round();
+                if frames.is_finite() {
+                    frames.max(0.0) as u32
+                } else {
+                    0
+                }
+            }
+        })
+    }
 }
 
 /// Default UDP port for RTP, as is common for AES67.
@@ -224,6 +289,26 @@ mod tests {
         assert_eq!(c.icons[&OutputType::Hifi], "audio-card");
         assert_eq!(c.icons.len(), 1);
         assert!(toml::from_str::<Config>("[icons]\ncar = \"x\"").is_err());
+    }
+
+    #[test]
+    fn audio_section() {
+        let block =
+            |toml: &str| toml::from_str::<Config>(toml).map(|c| c.audio.block_frames(48_000));
+        assert_eq!(block("").unwrap(), None);
+        assert_eq!(block("[audio]\nblock_frames = 256").unwrap(), Some(256));
+        assert_eq!(block("[audio]\ncycle_ms = 5").unwrap(), Some(240));
+        assert_eq!(block("[audio]\ncycle_ms = 5.33").unwrap(), Some(256));
+        let c: Config = toml::from_str("[audio]\ncycle_ms = 5").unwrap();
+        assert_eq!(c.audio.block_frames(96_000), Some(480));
+        let c: Config = toml::from_str("[audio]\nblock_frames = 256").unwrap();
+        assert_eq!(c.audio.block_frames(96_000), Some(256));
+        let both = block("[audio]\nblock_frames = 256\ncycle_ms = 5").unwrap_err();
+        assert!(both.to_string().contains("not both"), "{both}");
+        assert!(block("[audio]\nblock_frames = 0").is_err());
+        assert!(block("[audio]\ncycle_ms = -1").is_err());
+        assert!(block("[audio]\ncycle_ms = 1000").is_err());
+        assert!(block("[audio]\nquantum = 256").is_err());
     }
 
     #[test]

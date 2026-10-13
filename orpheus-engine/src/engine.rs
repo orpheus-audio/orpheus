@@ -21,7 +21,7 @@ pub struct LoopbackConfig {
     pub format: AudioFormat,
     pub latency_ms: u32,
     /// Frames per cycle to ask the audio system for.
-    pub quantum: Option<u32>,
+    pub block_frames: Option<u32>,
 }
 
 struct Loopback {
@@ -77,7 +77,7 @@ impl Engine {
                 format: cfg.format,
                 group: Some(cfg.name.clone()),
                 remote: None,
-                quantum: cfg.quantum,
+                block_frames: cfg.block_frames,
                 process_latency: 0,
             },
             playback,
@@ -89,7 +89,7 @@ impl Engine {
                 format: cfg.format,
                 group: Some(cfg.name.clone()),
                 remote: None,
-                quantum: cfg.quantum,
+                block_frames: cfg.block_frames,
                 process_latency: target as u32,
             },
             capture,

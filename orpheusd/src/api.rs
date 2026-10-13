@@ -38,7 +38,7 @@ pub struct Node {
     pub nmos: Mutex<orpheus_nmos::Store>,
     /// Staged and active routing (IS-05). Lock it before the engine.
     pub connections: Mutex<crate::connection::Connections>,
-    pub quantum: Option<u32>,
+    pub block_frames: Option<u32>,
     /// UDP port the receiver listens on unless a connection asks for
     /// another.
     pub receiver_port: u16,
@@ -46,6 +46,8 @@ pub struct Node {
     pub accept: Accept,
     /// The user's output types. Lock it last.
     pub outputs: Mutex<crate::outputs::Overrides>,
+    /// Warnings about the network paths. Lock it last.
+    pub health: Mutex<crate::health::Health>,
 }
 
 /// An error status with a plain-text message.
@@ -88,6 +90,8 @@ struct Status {
     #[serde(skip_serializing_if = "Option::is_none")]
     receiver: Option<ReceiverEntry>,
     senders: Vec<SenderEntry>,
+    /// Problems with the network paths of the clock and the streams.
+    warnings: Vec<crate::health::Warning>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -294,6 +298,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
                 receiver: links.remove(&id),
             })
             .collect(),
+        warnings: node.health.lock().unwrap().warnings(),
     })
 }
 

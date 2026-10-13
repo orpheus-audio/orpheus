@@ -28,8 +28,8 @@ use crate::port::{PlaybackPort, PortStats, StatsSnapshot, port_pair};
 /// Dynamic payload type; AES67 leaves the number to the SDP.
 pub const PAYLOAD_TYPE: u8 = 97;
 
-/// Cycle length assumed when no quantum is configured (PipeWire's default).
-const DEFAULT_QUANTUM: u32 = 1024;
+/// Block size assumed when none is configured (PipeWire's default quantum).
+const DEFAULT_BLOCK_FRAMES: u32 = 1024;
 
 /// Extra buffering for scheduling jitter between the sink and the TX thread.
 const JITTER_MARGIN_MS: u32 = 2;
@@ -46,7 +46,7 @@ pub struct SenderConfig {
     /// The kind of output at the other end, which the sink shows.
     pub remote: OutputType,
     /// Frames per audio-system cycle, as configured.
-    pub quantum: Option<u32>,
+    pub block_frames: Option<u32>,
 }
 
 /// Hops a multicast stream may take; AES67 devices commonly use 32.
@@ -196,8 +196,8 @@ impl Sender {
         cfg: &SenderConfig,
     ) -> Result<Self, BackendError> {
         let format = cfg.format;
-        let quantum = cfg.quantum.unwrap_or(DEFAULT_QUANTUM) as usize;
-        let target = quantum + format.frames_in_ms(JITTER_MARGIN_MS);
+        let block_frames = cfg.block_frames.unwrap_or(DEFAULT_BLOCK_FRAMES) as usize;
+        let target = block_frames + format.frames_in_ms(JITTER_MARGIN_MS);
         let (capture, playback, buffer) = port_pair(format.channels, target);
 
         let link = Arc::new(Mutex::new(Link::open(Route::to(cfg.peer))?));
@@ -215,7 +215,7 @@ impl Sender {
                 format,
                 group: None,
                 remote: Some(cfg.remote),
-                quantum: cfg.quantum,
+                block_frames: cfg.block_frames,
                 process_latency: (target + asrc.delay()) as u32,
             },
             capture,

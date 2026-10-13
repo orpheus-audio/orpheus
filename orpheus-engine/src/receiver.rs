@@ -53,7 +53,7 @@ pub struct ReceiverConfig {
     pub listen: SocketAddr,
     /// Playout delay after the media-clock time in the RTP timestamp.
     pub link_offset_ms: u32,
-    pub quantum: Option<u32>,
+    pub block_frames: Option<u32>,
 }
 
 /// Which packets the receiver plays.
@@ -134,6 +134,7 @@ struct Counters {
     realigns: AtomicU64,
     ssrc: AtomicU64,
     margin_us: AtomicI64,
+    jitter_us: AtomicI64,
     /// `f64` bits.
     asrc_ppm: AtomicU64,
 }
@@ -166,6 +167,11 @@ pub struct ReceiverStatus {
     /// Smallest time between arrival and playout over the last second, in
     /// microseconds. Negative means late; it should stay well above zero.
     pub margin_us: Option<i64>,
+    /// How far packets' transit times spread over the last second (latest
+    /// minus earliest relative to their timestamps), in microseconds. A few
+    /// hundred on a wired network; Wi-Fi and congested links reach
+    /// milliseconds.
+    pub jitter_us: Option<i64>,
     /// Rate correction from the media clock to the sound card's clock.
     pub asrc_ppm: f64,
     /// The buffer between the RX thread and the playback stream.
@@ -221,7 +227,7 @@ impl Receiver {
                 format,
                 group: None,
                 remote: Some(OutputType::Generic),
-                quantum: cfg.quantum,
+                block_frames: cfg.block_frames,
                 process_latency: 0,
             },
             playback,
@@ -237,6 +243,7 @@ impl Receiver {
             realigns: AtomicU64::new(0),
             ssrc: AtomicU64::new(NO_SSRC),
             margin_us: AtomicI64::new(NO_MARGIN),
+            jitter_us: AtomicI64::new(NO_MARGIN),
             asrc_ppm: AtomicU64::new(0f64.to_bits()),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -346,6 +353,7 @@ impl Receiver {
         let c = &self.counters;
         let ssrc = c.ssrc.load(Relaxed);
         let margin = c.margin_us.load(Relaxed);
+        let jitter = c.jitter_us.load(Relaxed);
         ReceiverStatus {
             listen: self.listen(),
             link_offset_ms: self.link_offset_ms,
@@ -359,6 +367,7 @@ impl Receiver {
             lost: c.lost.load(Relaxed),
             realigns: c.realigns.load(Relaxed),
             margin_us: (margin != NO_MARGIN).then_some(margin),
+            jitter_us: (jitter != NO_MARGIN).then_some(jitter),
             asrc_ppm: f64::from_bits(c.asrc_ppm.load(Relaxed)),
             buffer: self.buffer.snapshot(),
         }
@@ -374,11 +383,12 @@ impl Drop for Receiver {
     }
 }
 
-/// Minimum arrival margin over one-second windows.
+/// Smallest and largest arrival margin over one-second windows.
 #[derive(Default)]
 struct MarginWindow {
     start_ns: u64,
     min_ns: Option<i64>,
+    max_ns: Option<i64>,
 }
 
 struct Rx {
@@ -511,6 +521,7 @@ impl Rx {
         let playout = extend(header.timestamp, next - self.offset) + self.offset;
         let margin = self.media.ns_at(playout) as i64 - now as i64;
         self.window.min_ns = Some(self.window.min_ns.map_or(margin, |m| m.min(margin)));
+        self.window.max_ns = Some(self.window.max_ns.map_or(margin, |m| m.max(margin)));
 
         match self.jitter.insert(header.timestamp, &samples[..n]) {
             Insert::Stored => {}
@@ -544,8 +555,13 @@ impl Rx {
         if now.saturating_sub(self.window.start_ns) < 1_000_000_000 {
             return;
         }
-        let margin = self.window.min_ns.take().map_or(NO_MARGIN, |m| m / 1000);
+        let (min, max) = (self.window.min_ns.take(), self.window.max_ns.take());
+        let margin = min.map_or(NO_MARGIN, |m| m / 1000);
+        let jitter = min
+            .zip(max)
+            .map_or(NO_MARGIN, |(min, max)| (max - min) / 1000);
         self.counters.margin_us.store(margin, Relaxed);
+        self.counters.jitter_us.store(jitter, Relaxed);
         self.window.start_ns = now;
     }
 }

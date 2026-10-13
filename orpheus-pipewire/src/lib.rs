@@ -422,8 +422,8 @@ fn create_stream(
         // Keeps the session manager from linking group members to each other.
         props.insert(*pw::keys::NODE_LINK_GROUP, group.as_str());
     }
-    if let Some(quantum) = spec.quantum {
-        let latency = format!("{quantum}/{}", spec.format.rate);
+    if let Some(frames) = spec.block_frames {
+        let latency = format!("{frames}/{}", spec.format.rate);
         props.insert(*pw::keys::NODE_LATENCY, latency.as_str());
     }
 

@@ -14,6 +14,9 @@ pub const DEVICE_GENERIC: &str = "urn:x-nmos:device:generic";
 pub const CONTROL_CONNECTION: &str = "urn:x-nmos:control:sr-ctrl/v1.1";
 /// The output type of a receiver's output (`speaker`, `hifi`, …).
 pub const TAG_FORM_FACTOR: &str = "urn:x-orpheus:form-factor";
+/// What a receiver warns its senders about: `jitter` if their packets
+/// arrive with a wide spread.
+pub const TAG_WARNINGS: &str = "urn:x-orpheus:warnings";
 
 pub type Tags = BTreeMap<String, Vec<String>>;
 

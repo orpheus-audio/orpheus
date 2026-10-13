@@ -150,6 +150,10 @@ struct Link {
     /// Whether the peer's receiver plays the sender, as far as we know.
     #[serde(skip)]
     state: PeerState,
+    /// The peer's receiver warns that our packets arrive with a wide
+    /// spread.
+    #[serde(skip)]
+    jitter: bool,
     /// The kind of output the peer's receiver announces, which the sink
     /// shows unless overridden here.
     #[serde(default)]
@@ -185,6 +189,9 @@ pub struct PeerLink {
     #[schema(value_type = String)]
     pub id: Uuid,
     pub state: PeerState,
+    /// The receiver warns that the packets arrive with a wide spread.
+    #[serde(skip)]
+    pub jitter: bool,
 }
 
 /// A sender connected to a peer's receiver.
@@ -231,6 +238,7 @@ impl Connections {
                         api: r.api.clone(),
                         id: r.id,
                         state: l.state,
+                        jitter: l.jitter,
                     },
                 ))
             })
@@ -355,7 +363,7 @@ fn sender_config(
         encoding: nmos::ENCODING,
         peer,
         remote,
-        quantum: node.quantum,
+        block_frames: node.block_frames,
     }
 }
 
@@ -409,6 +417,7 @@ pub fn connect(
     let link = Link {
         named,
         state: PeerState::Connecting,
+        jitter: false,
         output: target.output,
         receiver: Some(to.clone()),
     };
@@ -608,8 +617,10 @@ fn update_link(
                 tracing::warn!(id, error = %e, "peer unreachable");
             }
             link.state = PeerState::Unreachable;
+            link.jitter = false;
         }
         Ok(p) => {
+            link.jitter = p.jitter;
             link.state = if p.sender == Some(ours) {
                 PeerState::Connected
             } else {

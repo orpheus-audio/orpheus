@@ -235,6 +235,9 @@ fn snapshot(node: &Node) -> Snapshot {
             TAG_FORM_FACTOR.into(),
             vec![crate::outputs::receiver_type(node).as_str().into()],
         );
+        if node.health.lock().unwrap().receiver_jitter() {
+            base.tags.insert(TAG_WARNINGS.into(), vec!["jitter".into()]);
+        }
         snap.receivers.push(Receiver {
             base,
             format: FORMAT_AUDIO,
@@ -382,7 +385,7 @@ fn gmid(identity: &str) -> String {
 }
 
 pub struct NetInterface {
-    name: String,
+    pub name: String,
     mac: [u8; 6],
     addrs: Vec<IpAddr>,
 }
@@ -432,6 +435,11 @@ fn endpoints(listen: SocketAddr) -> Vec<Endpoint> {
             protocol: "http",
         })
         .collect()
+}
+
+/// Names of this node's interfaces (with a MAC address).
+pub fn interface_names() -> Vec<String> {
+    interfaces().into_iter().map(|i| i.name).collect()
 }
 
 /// Addresses of this node's interfaces.

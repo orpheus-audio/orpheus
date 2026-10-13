@@ -9,15 +9,16 @@ networks the nodes speak AES67: RTP with linear PCM, synchronized by PTP. That
 makes rooms play in sync and keeps latency low enough for video.
 
 This repository holds the shared core and the Linux node, which is built on
-PipeWire. ESP32 receivers, a web UI, Wi-Fi operation and NMOS control are
-planned; see the [roadmap](docs/roadmap.md).
+PipeWire. ESP32 receivers, a web UI and Wi-Fi operation are planned; see the
+[roadmap](docs/roadmap.md).
 
 **Status:** early development. Two Linux nodes can stream to each other over
 RTP unicast (IPv4 or IPv6; multicast only for AES67/Dante interop), with the
 clock synchronized over PTP and sample-rate conversion against the sound
 cards' clocks. Nodes find each other over mDNS and speak NMOS (IS-04,
-IS-05), so routes can be set with `orpheusctl`, which connects both ends, or an
-NMOS controller; they are kept across restarts. There is no authentication and no UI yet.
+IS-05), so routes can be set with `orpheusctl`, which connects both ends, or
+an NMOS controller; they are kept across restarts. There is no
+authentication and no UI yet.
 
 ## Quick start
 

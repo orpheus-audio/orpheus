@@ -10,7 +10,7 @@
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
-| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04, SDP, IS-05, connecting both ends done; docs open |
+| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl`, output types | done, except interop tests |
 | M5 | Receiver pool and policy: one receiver per connection, mixing policies (mix, first sender wins, last sender wins) and ducking; pinned peers, aliases, route restore on reconnect, per-sender gains; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
@@ -34,8 +34,6 @@ and Bluetooth inputs.
   [below](#receiver-pool-and-policies).
 - Only `POST /x-orpheus/v1/senders` creates senders; IS-05 can redirect,
   pause and resume them, not create them.
-- Multicast (interop only) has no guard rails yet: nothing warns when a
-  multicast stream runs over Wi-Fi. `orpheusctl status` and the log should.
 - IPv6 multicast groups are joined on the system's default interface, so a
   node without an IPv6 default route can't join them.
 - A connection made on a receiver through IS-05 doesn't reach the sender,
@@ -53,8 +51,9 @@ and Bluetooth inputs.
   its receiver; the later one wins.
 - `connect` accepts a peer with an NMOS API but no `[receiver]` of the right
   format only with `--send-only`.
-- The sender sizes its buffer from `[audio] quantum` (or assumes 1024 frames)
-  instead of reading the real quantum.
+- The sender sizes its buffer from the configured block (`[audio]
+  block_frames` or `cycle_ms`, or assumes 1024 frames) instead of reading
+  the block the audio system really runs, and the status doesn't show it.
 - The receiver path has two buffers in a row (its port, then PipeWire's
   cycle). Playing out directly in the realtime callback would save a cycle.
 - The receiver's playback stream runs even when nothing is sent to it, which
@@ -78,6 +77,11 @@ and Bluetooth inputs.
 - One interface and one transport per node, end-to-end delay only. The AES67
   message rates are fixed. `[ptp]` can only be set in the config file.
 - The PTP clock sits on the system clock, so an NTP step disturbs it.
+- With more than about 0.5 ms of delay one way (half the step threshold),
+  PTP never settles: after each step the filter starts afresh, its first
+  sync and delay measurements differ by twice the delay, and it steps
+  again. Wi-Fi is well above that. The node warns (`ptp_steps`); a fix
+  belongs in the servo, for example estimating the delay before stepping.
 - PTP needs `CAP_NET_BIND_SERVICE`, which has to be set again after every
   build.
 
@@ -88,6 +92,10 @@ and Bluetooth inputs.
   registry. Interfaces don't name the switch port they are attached to
   (`attached_network_device`), and receivers have no BCP-004 capabilities
   yet.
+- Network warnings see Wi-Fi only on the two ends' own links; a wireless
+  hop in between shows only as jitter. Along a chain of nodes (A to B, B on
+  to C), C doesn't learn about Wi-Fi between A and B. Wi-Fi detection is
+  Linux-specific (`/sys/class/net`).
 - Output types are detected from PipeWire's form factor and profile name
   only; the active port of a sound card (headphone jack or speakers) is not
   looked at. Outputs are matched by their PipeWire name, so a type set for a
@@ -211,7 +219,7 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 ### Receiver pool and policies
 
-Planned for M5, after connecting both ends (M4):
+Planned for M5:
 
 - **One receiver per connection.** A node advertises one NMOS receiver more
   than it has connections, so there is always a free one, up to about

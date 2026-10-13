@@ -104,12 +104,13 @@ time instead of catching up ("realign").
 
 | Thread | Work |
 |---|---|
-| main | tokio runtime: HTTP API, signals |
+| main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
 | `orpheus-ptp` | PTP: sockets, timers, statime |
 | TX, one per sender | Pacing, ASRC, RTP send |
 | RX | RTP receive, jitter buffer, ASRC |
+| mDNS | mdns-sd's daemon, plus `mdns-monitor` (renames on name conflicts) and `mdns-browse` (the node list) |
 
 The TX, RX and PTP threads run at normal priority for now.
 
@@ -208,6 +209,24 @@ doesn't see (reached by URL, or mDNS blocked) get only the 30-second check.
 The answer updates the sink's type and name and the link's state; a
 receiver that plays another sender pauses the sender in the engine,
 separately from its IS-05 route, so activations don't undo the pause.
+
+## Health
+
+`health.rs` checks the network paths once a second and keeps a list of
+warnings, which the status shows and the log follows. Wi-Fi is seen on
+this node's own interfaces (`network.rs`: the route the kernel picks for
+a peer, a multicast group or PTP, and whether that interface is wireless)
+and, for the other end, in the link each node announces over mDNS
+(`x-orpheus-link`, that of its default route, checked every 5 s).
+
+The receiver measures, per second, the spread of the packets' arrival
+margins: the latest minus the earliest relative to their timestamps. That
+catches Wi-Fi and congestion anywhere on the way. A receiver that warns
+about it adds the tag `urn:x-orpheus:warnings: ["jitter"]` to its IS-04
+resource; the new version bumps `ver_rcv`, the senders' peer watch asks
+the receiver again and warns on its side too. The clock warns about a
+slow path (mean delay) and about repeated steps, which is how a slow path
+shows when the filter can't settle.
 
 ## Identity
 

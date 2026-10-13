@@ -5,8 +5,9 @@
 //! that are not Orpheus nodes show up too, without an Orpheus ID.
 //!
 //! TXT keys: the IS-04 ones (`api_proto`, `api_ver`, `api_auth` and the
-//! `ver_*` resource counters), plus `x-orpheus-id` and `x-orpheus-ver`
-//! (the orpheusd version). The name is the instance name, so TXT stays
+//! `ver_*` resource counters), plus `x-orpheus-id`, `x-orpheus-ver` (the
+//! orpheusd version) and `x-orpheus-link` (`wired` or `wifi`, the node's
+//! own network link, so that peers can warn about it). The name is the instance name, so TXT stays
 //! ASCII, which some NMOS tools expect.
 
 use std::collections::HashMap;
@@ -37,6 +38,33 @@ pub struct Announcement {
     pub version: String,
 }
 
+/// What kind of network link a node has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub enum Link {
+    Wired,
+    Wifi,
+}
+
+impl Link {
+    fn as_str(self) -> &'static str {
+        match self {
+            Link::Wired => "wired",
+            Link::Wifi => "wifi",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "wired" => Some(Link::Wired),
+            "wifi" => Some(Link::Wifi),
+            _ => None,
+        }
+    }
+}
+
 /// A node seen on the network.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -65,6 +93,9 @@ pub struct Node {
     /// one of its receivers does, for example what it plays or on what.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub receivers: Option<u8>,
+    /// The node's own network link, as it announces it.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub link: Option<Link>,
 }
 
 /// Announces this node and keeps a list of the others. Says goodbye on drop.
@@ -73,6 +104,8 @@ pub struct Discovery {
     me: Announcement,
     /// Our instance's full name; changes if mDNS renames it after a conflict.
     fullname: Arc<Mutex<String>>,
+    /// What the TXT record says beyond the fixed keys.
+    announced: Mutex<(Counters, Option<Link>)>,
     registry: Arc<Mutex<Registry>>,
 }
 
@@ -83,7 +116,7 @@ impl Discovery {
         // loopback only ever finds ourselves.
         daemon.disable_interface(vec![IfKind::LoopbackV4, IfKind::LoopbackV6])?;
 
-        let info = service_info(me, instance_name(&me.name), Counters::default())?;
+        let info = service_info(me, instance_name(&me.name), Counters::default(), None)?;
         let fullname = Arc::new(Mutex::new(info.get_fullname().to_owned()));
         daemon.register(info)?;
 
@@ -132,6 +165,7 @@ impl Discovery {
             daemon,
             me: me.clone(),
             fullname,
+            announced: Mutex::new((Counters::default(), None)),
             registry,
         })
     }
@@ -139,9 +173,25 @@ impl Discovery {
     /// Announces new resource change counters, so that NMOS controllers
     /// know to fetch the resources again.
     pub fn set_counters(&self, counters: Counters) -> Result<(), Error> {
+        let mut announced = self.announced.lock().unwrap();
+        announced.0 = counters;
+        self.announce(*announced)
+    }
+
+    /// Announces the node's own network link.
+    pub fn set_link(&self, link: Option<Link>) -> Result<(), Error> {
+        let mut announced = self.announced.lock().unwrap();
+        if announced.1 == link {
+            return Ok(());
+        }
+        announced.1 = link;
+        self.announce(*announced)
+    }
+
+    fn announce(&self, (counters, link): (Counters, Option<Link>)) -> Result<(), Error> {
         let name = instance(&self.fullname.lock().unwrap());
         self.daemon
-            .register(service_info(&self.me, &name, counters)?)
+            .register(service_info(&self.me, &name, counters, link)?)
     }
 
     /// Other nodes, online first, then by name.
@@ -162,10 +212,15 @@ impl Drop for Discovery {
     }
 }
 
-fn service_info(me: &Announcement, instance: &str, c: Counters) -> Result<ServiceInfo, Error> {
+fn service_info(
+    me: &Announcement,
+    instance: &str,
+    c: Counters,
+    link: Option<Link>,
+) -> Result<ServiceInfo, Error> {
     let id = me.id.to_string();
     let ver = |n: u8| n.to_string();
-    let txt: &[(&str, String)] = &[
+    let mut txt: Vec<(&str, String)> = vec![
         ("api_proto", "http".into()),
         ("api_ver", "v1.3".into()),
         ("api_auth", "false".into()),
@@ -178,8 +233,11 @@ fn service_info(me: &Announcement, instance: &str, c: Counters) -> Result<Servic
         ("x-orpheus-id", id.clone()),
         ("x-orpheus-ver", me.version.clone()),
     ];
+    if let Some(link) = link {
+        txt.push(("x-orpheus-link", link.as_str().into()));
+    }
     let host = format!("orpheus-{}.local.", id.to_lowercase());
-    Ok(ServiceInfo::new(SERVICE_TYPE, instance, &host, (), me.port, txt)?.enable_addr_auto())
+    Ok(ServiceInfo::new(SERVICE_TYPE, instance, &host, (), me.port, &txt[..])?.enable_addr_auto())
 }
 
 /// The DNS-SD instance name: the node name, cut to fit one DNS label.
@@ -211,6 +269,7 @@ fn node(s: &ResolvedService) -> Node {
         port: s.port,
         online: true,
         receivers: txt("ver_rcv").and_then(|v| v.parse().ok()),
+        link: txt("x-orpheus-link").and_then(|l| Link::parse(&l)),
     }
 }
 
@@ -316,6 +375,7 @@ mod tests {
             port: 7480,
             online: true,
             receivers: Some(0),
+            link: None,
         }
     }
 
