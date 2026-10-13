@@ -19,8 +19,6 @@ pub struct StreamSpec {
     /// end, which backends show, e.g. as an icon. `None` for local streams.
     pub remote: Option<OutputType>,
     pub format: AudioFormat,
-    /// Node to connect to instead of the system default (playback only).
-    pub target: Option<String>,
     /// Streams with the same group run on one clock in one graph cycle, so
     /// audio passed between them never drifts.
     pub group: Option<String>,

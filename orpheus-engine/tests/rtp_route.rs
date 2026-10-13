@@ -58,7 +58,6 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
             listen: "127.0.0.1:0".parse().unwrap(),
             link_offset_ms: LINK_OFFSET_MS,
             quantum: Some(QUANTUM as u32),
-            target: None,
         })
         .unwrap();
     let listen = engine.status().receiver.unwrap().listen;
@@ -158,4 +157,92 @@ fn drift_is_absorbed() {
         "latency {early} → {late} frames"
     );
     eprintln!("latency {early} → {late} frames");
+}
+
+/// Packets the receiver took and ignored over `ms`.
+fn counts_over(engine: &Engine, ms: u64) -> (u64, u64) {
+    let rx = |e: &Engine| e.status().receiver.unwrap();
+    let before = rx(engine);
+    thread::sleep(Duration::from_millis(ms));
+    let after = rx(engine);
+    (
+        after.packets - before.packets,
+        after.ignored - before.ignored,
+    )
+}
+
+#[test]
+fn routes_and_filters_change_at_runtime() {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
+    let mut engine = Engine::new(Box::new(FakeBackend::default()), clock);
+    engine
+        .start_receiver(&ReceiverConfig {
+            name: "rx".into(),
+            description: "rx".into(),
+            format: AudioFormat::AES67,
+            encoding: Encoding::L24,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            link_offset_ms: LINK_OFFSET_MS,
+            quantum: Some(QUANTUM as u32),
+        })
+        .unwrap();
+    let listen = engine.status().receiver.unwrap().listen;
+    let id = engine
+        .add_sender(&SenderConfig {
+            name: "tx".into(),
+            description: "tx".into(),
+            format: AudioFormat::AES67,
+            encoding: Encoding::L24,
+            peer: listen,
+            quantum: Some(QUANTUM as u32),
+        })
+        .unwrap();
+    let (taken, ignored) = counts_over(&engine, 100);
+    assert!(taken > 50 && ignored == 0, "{taken} {ignored}");
+
+    // Another payload type or source: ignored.
+    for filter in [
+        Filter {
+            payload_type: Some(96),
+            ..Filter::default()
+        },
+        Filter {
+            source: Some("127.0.0.2".parse().unwrap()),
+            ..Filter::default()
+        },
+        Filter {
+            enabled: false,
+            ..Filter::default()
+        },
+    ] {
+        engine.set_receiver_filter(filter).unwrap();
+        let (taken, ignored) = counts_over(&engine, 100);
+        assert!(taken <= 1 && ignored > 50, "{filter:?}: {taken} {ignored}");
+    }
+    let own = Filter {
+        source: Some("127.0.0.1".parse().unwrap()),
+        payload_type: Some(sender::PAYLOAD_TYPE),
+        ..Filter::default()
+    };
+    engine.set_receiver_filter(own).unwrap();
+    let (taken, _) = counts_over(&engine, 100);
+    assert!(taken > 50, "{taken}");
+
+    // A paused sender sends nothing.
+    let mut route = Route::to(listen);
+    route.enabled = false;
+    assert!(engine.set_sender_route(id, route).unwrap());
+    let (taken, ignored) = counts_over(&engine, 100);
+    assert!(taken <= 1 && ignored == 0, "{taken} {ignored}");
+
+    // Both move to another port, the sender also to another source port.
+    engine.set_receiver_port(0).unwrap();
+    let listen = engine.status().receiver.unwrap().listen;
+    let mut route = Route::to(listen);
+    route.source = "127.0.0.1:0".parse().unwrap();
+    engine.set_sender_route(id, route).unwrap();
+    thread::sleep(Duration::from_millis(20));
+    let (taken, _) = counts_over(&engine, 100);
+    assert!(taken > 50, "{taken}");
+    assert!(!engine.set_sender_route(id + 1, route).unwrap());
 }

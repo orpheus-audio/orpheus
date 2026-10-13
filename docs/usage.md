@@ -15,7 +15,7 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `status` | Shows the node's ID, name, version, clock, receiver and senders. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
 | `nodes` | Lists the other nodes the node found on the network, with ID, address and version. Nodes that stopped stay listed as offline. |
-| `connect PEER [--name NAME]` | Sends the node's audio to `PEER`. This creates a sink called `NAME` (the peer if no name is given), marked with a network icon. Whatever is played into the sink goes to the peer's receiver. |
+| `connect PEER [--name NAME]` | Sends the node's audio to `PEER`. This creates a sink called `NAME` (the peer if no name is given), marked with a network icon. Whatever is played into the sink goes to the peer's receiver. The sender is kept across restarts. |
 | `disconnect ID` | Stops a sender and removes its sink. The ID is shown by `connect` and `status`. |
 
 `--json` prints the node's JSON responses instead of text: the status as the
@@ -68,8 +68,8 @@ Receiver       ● receiving ssrc 5e1f02aa
   problems     none
 
 Senders
-  ID  PEER               PACKETS       BUFFER      ASRC  PROBLEMS
-  0   192.168.1.20:5004   120000  1120 frames  +8.9 ppm  none
+  ID  NAME     PEER               PACKETS       BUFFER      ASRC  PROBLEMS
+  0   Kitchen  192.168.1.20:5004   120000  1120 frames  +8.9 ppm  none
 ```
 
 On a terminal the dots are coloured: green is fine, yellow needs attention
@@ -100,7 +100,10 @@ last interval instead, so `problems` shows only what is going wrong now.
 
 **Receiver**
 
-- `receiving ssrc …`: the stream being played; `idle` if none.
+- `receiving ssrc …`: the stream being played; `idle` if none, `off` if a
+  [connection](#connections-is-05) switched the receiver off.
+- `ignored`: packets turned away because the receiver is connected to
+  another sender or switched off. Shown only when there are any.
 - `margin`: the smallest time between a packet's arrival and its playout over
   the last second. It should stay well above zero. If it gets close to zero,
   raise `link_offset_ms`.
@@ -115,7 +118,8 @@ last interval instead, so `problems` shows only what is going wrong now.
 
 **Senders** have the same buffer columns, and `send errors` among their
 problems: packets the operating system could not send, for example because
-there is no route to the peer.
+there is no route to the peer. `(off)` after the peer means a connection
+paused the sender: its sink still takes audio, but nothing is sent.
 
 **Buffers** (receiver, senders, loopback)
 
@@ -136,7 +140,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | Method and path | Effect |
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows). |
-| `POST /x-orpheus/v1/senders` | Starts a sender. Body: `{"peer": "192.168.1.20", "name": "Kitchen"}`; `name` is optional. Returns `201` with `{"id": 0}`. |
+| `POST /x-orpheus/v1/senders` | Starts a sender and connects it to the peer through [IS-05](#connections-is-05). Body: `{"peer": "192.168.1.20", "name": "Kitchen"}`; `name` is optional. Returns `201` with `{"id": 0}`. |
 | `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender. Returns `204`, or `404` if there is no such sender. |
 | `GET /x-orpheus/v1/senders/{id}/sdp` | The sender's stream as an SDP file (`application/sdp`). |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows). Returns `503` if mDNS could not start. |
@@ -192,8 +196,59 @@ Without PTP the SDP names the sender's own clock (`ts-refclk:localmac=…`).
 Resource IDs are derived from the node ID, so they stay the same across
 restarts. The receiver carries the tag `urn:x-orpheus:form-factor` with the
 output type (always `generic` for now). Nodes don't register with an NMOS
-registry; they only use peer-to-peer discovery. Connecting through NMOS
-(IS-05) is not there yet.
+registry; they only use peer-to-peer discovery.
+
+### Connections (IS-05)
+
+The IS-05 Connection API v1.1 at `/x-nmos/connection/v1.1/` routes the
+senders and the receiver. Each has **staged** parameters, which a controller
+changes with `PATCH`, and **active** ones, which the node runs. Staged
+parameters become active at once (`activate_immediate`) or at a TAI time
+(`activate_scheduled_absolute`, `activate_scheduled_relative`). `auto`
+values are resolved in the active parameters.
+
+- **Senders:** `destination_ip` and `destination_port` (unicast, or a
+  multicast group for [interop](#multicast-interop)), `source_ip` and
+  `source_port`. `master_enable: false`
+  pauses the sender. The SDP file is at `…/senders/{id}/transportfile`.
+- **Receiver:** a `transport_file` (the sender's SDP) connects it to that
+  sender: it then only plays packets from the sender's address with its
+  payload type, and joins its multicast group if it has one. `source_ip`,
+  `multicast_ip` and `destination_port` can also be set directly.
+  `master_enable: false` switches it off. Without a connection it plays
+  whatever arrives on its port.
+
+For example, to connect this node's receiver to a sender of another node:
+
+```sh
+C=localhost:7480/x-nmos/connection/v1.1/single
+RX=$(curl -s $C/receivers/ | jq -r '.[0]' | tr -d /)
+SDP=$(curl -s 192.168.1.20:7480/x-nmos/connection/v1.1/single/senders/<id>/transportfile)
+jq -n --arg sdp "$SDP" '{master_enable: true,
+  activation: {mode: "activate_immediate"},
+  transport_file: {data: $sdp, type: "application/sdp"}}' |
+  curl -s -X PATCH $C/receivers/$RX/staged -H 'content-type: application/json' -d @-
+```
+
+`orpheusctl connect` creates a sender and activates its destination the
+same way; it doesn't touch the peer's receiver yet. The node saves what was
+last activated, as requested (with `auto`), in `routes.json` in its
+[state directory](configuration.md#files) and activates it again at start.
+
+### Multicast (interop)
+
+Orpheus nodes stream to each other by unicast only; `orpheusctl connect`
+never uses multicast. Multicast is there for other equipment: AES67 and
+Dante devices usually send only to multicast groups, and studio NMOS
+controllers expect it. A node uses it only when a connection asks:
+
+- a receiver given an SDP file with a multicast address joins that group;
+- a sender given a multicast `destination_ip` sends to that group (TTL 32).
+
+Use it on wired networks whose switches do IGMP snooping. Switches without
+it send the stream (about 2.6 Mbit/s) to every port, and over Wi-Fi it is
+sent at the slowest rate to every client and can take a large part of the
+airtime.
 
 The API has no authentication yet. Restrict `[api] listen` to `127.0.0.1` if
 the network is not trusted.

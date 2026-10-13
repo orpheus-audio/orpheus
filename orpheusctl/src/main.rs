@@ -104,9 +104,15 @@ struct Buffer {
 struct Receiver {
     listen: String,
     link_offset_ms: u32,
+    /// Missing from older nodes, which are always on.
+    #[serde(default = "yes")]
+    enabled: bool,
     ssrc: Option<u32>,
     packets: u64,
     malformed: u64,
+    /// Turned away by the connection's source or payload type.
+    #[serde(default)]
+    ignored: u64,
     late: u64,
     early: u64,
     lost: u64,
@@ -124,6 +130,8 @@ struct Sender {
     #[serde(default)]
     name: String,
     peer: String,
+    #[serde(default = "yes")]
+    enabled: bool,
     packets: u64,
     send_errors: u64,
     realigns: u64,
@@ -167,6 +175,7 @@ impl Status {
             Receiver {
                 packets: r.packets.saturating_sub(p.packets),
                 malformed: r.malformed.saturating_sub(p.malformed),
+                ignored: r.ignored.saturating_sub(p.ignored),
                 late: r.late.saturating_sub(p.late),
                 early: r.early.saturating_sub(p.early),
                 lost: r.lost.saturating_sub(p.lost),
@@ -538,6 +547,7 @@ fn clock(o: &mut String, p: Paint, t: &Ptp) {
 
 fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
     let mark = match r.ssrc {
+        _ if !r.enabled => p.mark(Level::Off, "off"),
         Some(ssrc) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
         None => p.mark(Level::Off, "idle"),
     };
@@ -557,6 +567,10 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver) {
     };
     row(o, p, "margin", &margin);
     row(o, p, "packets", &c.packets(r.packets));
+    if r.ignored > 0 {
+        // From other sources: expected while connected to one sender.
+        row(o, p, "ignored", &c.packets(r.ignored));
+    }
     row(o, p, "buffer", &format!("{} frames", r.buffer.level_frames));
     row(o, p, "ASRC", &format!("{:+.1} ppm", r.asrc_ppm));
     let mut counts = vec![
@@ -591,7 +605,11 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             [
                 t.id.to_string(),
                 t.name.clone(),
-                t.peer.clone(),
+                if t.enabled {
+                    t.peer.clone()
+                } else {
+                    format!("{} (off)", t.peer)
+                },
                 c.packets(t.packets),
                 format!("{} frames", t.buffer.level_frames),
                 format!("{:+.1} ppm", t.asrc_ppm),
@@ -746,6 +764,22 @@ Senders
             out.contains(
                 "  1   Kitchen  192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"
             ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn shows_ports_that_are_off() {
+        let mut s: Status = serde_json::from_str(STATUS).unwrap();
+        let r = s.receiver.as_mut().unwrap();
+        r.enabled = false;
+        r.ignored = 42;
+        s.senders[0].enabled = false;
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(out.contains("Receiver       ○ off\n"), "{out}");
+        assert!(out.contains("  ignored      42\n"), "{out}");
+        assert!(
+            out.contains("  Kitchen  192.168.1.20:5004 (off)  "),
             "{out}"
         );
     }

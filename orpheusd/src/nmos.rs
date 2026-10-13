@@ -20,20 +20,21 @@ use orpheus_core::{AudioFormat, OutputType};
 use orpheus_engine::SenderId;
 use orpheus_engine::sender::PAYLOAD_TYPE;
 use orpheus_nmos::is04::{self, *};
+use orpheus_nmos::is05;
 use orpheus_nmos::sdp::{self, RefClock};
 use orpheus_nmos::{Snapshot, Uuid, resource_id};
 
 use crate::api::Node;
 
 const CLOCK: &str = "clk0";
-/// What every sender sends, as `api::add_sender` sets it up.
-const FORMAT: AudioFormat = AudioFormat::AES67;
-const ENCODING: Encoding = Encoding::L24;
+/// What every sender sends and the receiver plays.
+pub const FORMAT: AudioFormat = AudioFormat::AES67;
+pub const ENCODING: Encoding = Encoding::L24;
 
 pub fn router() -> Router<Arc<Node>> {
     let list = |items: &'static [&'static str]| get(move || async move { Json(items) });
     Router::new()
-        .route("/x-nmos", list(&["node/"]))
+        .route("/x-nmos", list(&["node/", "connection/"]))
         .route("/x-nmos/node", list(&["v1.3/"]))
         .route(
             "/x-nmos/node/v1.3",
@@ -62,10 +63,15 @@ pub async fn refresh_loop(node: Arc<Node>) {
     }
 }
 
+/// The current TAI time, for resource versions and activations.
+pub fn now() -> Version {
+    Version::from_tai_nanos(Timescale::tai().now())
+}
+
 /// Rebuilds the resources; if any changed, announces the new counters.
 pub fn refresh(node: &Node) -> Snapshot {
     let fresh = snapshot(node);
-    let now = Version::from_tai_nanos(Timescale::tai().now());
+    let now = now();
     let mut store = node.nmos.lock().unwrap();
     let changed = store.update(fresh, now);
     if changed {
@@ -81,7 +87,7 @@ pub fn refresh(node: &Node) -> Snapshot {
 }
 
 /// An NMOS error response.
-fn error(code: StatusCode, msg: String) -> Response {
+pub fn error(code: StatusCode, msg: String) -> Response {
     let body = serde_json::json!({ "code": code.as_u16(), "error": msg, "debug": null });
     (code, Json(body)).into_response()
 }
@@ -179,6 +185,14 @@ fn snapshot(node: &Node) -> Snapshot {
         .as_ref()
         .map(|e| e.lock().unwrap().status())
         .unwrap_or_default();
+    let conns = node.connections.lock().unwrap();
+    let receiver_active = conns.receiver_active().cloned();
+    let sender_active: Vec<_> = engine
+        .senders
+        .iter()
+        .map(|(n, _)| conns.sender_active(*n).cloned())
+        .collect();
+    drop(conns);
     let format = FORMAT;
     let media_type: &'static str = match ENCODING {
         Encoding::L16 => "audio/L16",
@@ -228,16 +242,21 @@ fn snapshot(node: &Node) -> Snapshot {
                 media_types: vec![media_type],
             },
             device_id,
-            transport: TRANSPORT_RTP_UCAST,
+            transport: TRANSPORT_RTP,
             interface_bindings: names.clone(),
             subscription: ReceiverSubscription {
-                sender_id: None,
-                active: true,
+                // Parked receivers follow no sender.
+                sender_id: receiver_active
+                    .as_ref()
+                    .filter(|a| a.master_enable)
+                    .and_then(|a| a.sender_id),
+                active: receiver_active.as_ref().is_none_or(|a| a.master_enable),
             },
         });
     }
 
-    for (n, s) in &engine.senders {
+    for ((n, s), active) in engine.senders.iter().zip(sender_active) {
+        let uuid = resource_id(dev, &format!("sender/{n}"));
         let source_id = resource_id(dev, &format!("source/{n}"));
         let flow_id = resource_id(dev, &format!("flow/{n}"));
         let base = |id| Base {
@@ -274,17 +293,23 @@ fn snapshot(node: &Node) -> Snapshot {
             bit_depth: 8 * ENCODING.bytes_per_sample() as u8,
         });
         snap.senders.push(Sender {
-            base: base(resource_id(dev, &format!("sender/{n}"))),
+            base: base(uuid),
             flow_id: Some(flow_id),
-            transport: TRANSPORT_RTP_UCAST,
+            transport: TRANSPORT_RTP,
             device_id,
-            manifest_href: Some(format!("{href}x-orpheus/v1/senders/{n}/sdp")),
+            manifest_href: Some(format!(
+                "{href}x-nmos/connection/{}/single/senders/{uuid}/transportfile",
+                is05::API_VERSION
+            )),
             interface_bindings: route(s.peer)
                 .and_then(|(_, i)| i)
                 .map_or_else(|| names.clone(), |i| vec![i.name]),
             subscription: SenderSubscription {
-                receiver_id: None,
-                active: true,
+                receiver_id: active
+                    .as_ref()
+                    .filter(|a| a.master_enable)
+                    .and_then(|a| a.receiver_id),
+                active: active.as_ref().is_none_or(|a| a.master_enable),
             },
         });
     }
@@ -298,7 +323,10 @@ fn snapshot(node: &Node) -> Snapshot {
         node_id,
         senders: snap.senders.iter().map(|s| s.base.id).collect(),
         receivers: snap.receivers.iter().map(|r| r.base.id).collect(),
-        controls: vec![],
+        controls: vec![Control {
+            href: format!("{href}x-nmos/connection/{}/", is05::API_VERSION),
+            kind: CONTROL_CONNECTION,
+        }],
     });
     snap
 }
@@ -306,17 +334,13 @@ fn snapshot(node: &Node) -> Snapshot {
 /// The SDP file of sender `id`, or `None` if there is no such sender.
 pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
     let snap = refresh(node);
-    let engine = node.engine.as_ref()?.lock().unwrap().status();
-    let (_, status) = engine.senders.iter().find(|(n, _)| *n == id)?;
+    let active = node.connections.lock().unwrap().sender_active(id)?.clone();
     let uuid = resource_id(node.id, &format!("sender/{id}"));
     let sender = snap.senders.iter().find(|s| s.base.id == uuid)?;
-    let (source, interface) = route(status.peer).unwrap_or((
-        match status.peer {
-            SocketAddr::V4(_) => [0, 0, 0, 0].into(),
-            SocketAddr::V6(_) => [0u16; 8].into(),
-        },
-        None,
-    ));
+    let leg = active.transport_params.first()?;
+    let destination = SocketAddr::new(leg.destination_ip.value()?, leg.destination_port.value()?);
+    let source = leg.source_ip.value()?;
+    let interface = interfaces().into_iter().find(|i| i.addrs.contains(&source));
     let clock = match node.ptp.as_ref().map(|p| p.status()) {
         Some(p) => RefClock::Ptp {
             gmid: gmid(&p.grandmaster),
@@ -334,7 +358,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         version: sender.base.version.max(snap.node.base.version).tai_nanos(),
         name: &sender.base.label,
         source,
-        destination: status.peer,
+        destination,
         payload_type: PAYLOAD_TYPE,
         encoding: ENCODING,
         format: FORMAT,
@@ -356,7 +380,7 @@ fn gmid(identity: &str) -> String {
     pairs.join("-")
 }
 
-struct NetInterface {
+pub struct NetInterface {
     name: String,
     mac: [u8; 6],
     addrs: Vec<IpAddr>,
@@ -409,8 +433,13 @@ fn endpoints(listen: SocketAddr) -> Vec<Endpoint> {
         .collect()
 }
 
+/// Addresses of this node's interfaces.
+pub fn local_ips() -> Vec<IpAddr> {
+    interfaces().into_iter().flat_map(|i| i.addrs).collect()
+}
+
 /// The address and interface the kernel would send to `peer` from.
-fn route(peer: SocketAddr) -> Option<(IpAddr, Option<NetInterface>)> {
+pub fn route(peer: SocketAddr) -> Option<(IpAddr, Option<NetInterface>)> {
     let bind: SocketAddr = match peer {
         SocketAddr::V4(_) => ([0, 0, 0, 0], 0).into(),
         SocketAddr::V6(_) => ([0u16; 8], 0).into(),

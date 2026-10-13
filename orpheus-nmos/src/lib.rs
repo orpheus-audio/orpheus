@@ -4,12 +4,14 @@
 //! restarts. The [`Store`] gives each resource a new version whenever its
 //! content changes and counts changes per resource type, which IS-04
 //! peer-to-peer discovery announces in the `ver_*` TXT keys. [`sdp`] writes
-//! the SDP files senders link to.
+//! the SDP files senders link to; [`is05`] has the parameters of the
+//! Connection API.
 
 pub mod is04;
+pub mod is05;
 pub mod sdp;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use orpheus_core::DeviceId;
@@ -53,6 +55,8 @@ pub struct Counters {
 pub struct Store {
     /// Content hash (without the version) and version, by resource ID.
     stamps: HashMap<Uuid, (u64, Version)>,
+    /// Resources that get a new version at the next update, changed or not.
+    touched: HashSet<Uuid>,
     current: Option<Snapshot>,
     counters: Counters,
 }
@@ -69,7 +73,10 @@ impl Store {
         let prev = self.current.take();
         let ids = |f: fn(&Snapshot) -> Vec<Uuid>| prev.as_ref().map(f).unwrap_or_default();
         let c = &mut self.counters;
-        let s = &mut self.stamps;
+        let s = &mut Stamps {
+            stamps: &mut self.stamps,
+            touched: &mut self.touched,
+        };
         let mut any = false;
         let mut bump = |counter: &mut u8, changed: bool| {
             if changed {
@@ -110,6 +117,12 @@ impl Store {
         any
     }
 
+    /// Gives a resource a new version at the next update, e.g. after an
+    /// activation that left its content as it was.
+    pub fn touch(&mut self, id: Uuid) {
+        self.touched.insert(id);
+    }
+
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.current.as_ref()
     }
@@ -119,6 +132,11 @@ impl Store {
     }
 }
 
+struct Stamps<'a> {
+    stamps: &'a mut HashMap<Uuid, (u64, Version)>,
+    touched: &'a mut HashSet<Uuid>,
+}
+
 fn ids_of<T: Resource>(items: &[T]) -> Vec<Uuid> {
     items.iter().map(|r| r.base().id).collect()
 }
@@ -126,7 +144,7 @@ fn ids_of<T: Resource>(items: &[T]) -> Vec<Uuid> {
 /// Sets the versions of `items`; true if one was added, changed or removed
 /// since `prev`.
 fn stamp<T: Resource>(
-    stamps: &mut HashMap<Uuid, (u64, Version)>,
+    Stamps { stamps, touched }: &mut Stamps,
     prev: &[Uuid],
     items: &mut [T],
     now: Version,
@@ -136,8 +154,9 @@ fn stamp<T: Resource>(
         item.base_mut().version = Version::default();
         let hash = content_hash(item);
         let id = item.base().id;
+        let touched = touched.remove(&id);
         let version = match stamps.get(&id) {
-            Some(&(h, v)) if h == hash && prev.contains(&id) => v,
+            Some(&(h, v)) if h == hash && prev.contains(&id) && !touched => v,
             old => {
                 changed = true;
                 // Versions only ever grow, even if the clock steps back.
@@ -191,7 +210,7 @@ mod tests {
                 .map(|(i, label)| Sender {
                     base: Base::new(resource_id(dev, &format!("sender/{i}")), *label),
                     flow_id: None,
-                    transport: TRANSPORT_RTP_UCAST,
+                    transport: TRANSPORT_RTP,
                     device_id,
                     manifest_href: None,
                     interface_bindings: vec![],
@@ -245,6 +264,13 @@ mod tests {
         let s = store.snapshot().unwrap();
         assert!(s.senders[1].base.version > t(3));
         assert_eq!(store.counters().snd, 4);
+
+        // Touched: a new version without a change.
+        store.touch(resource_id(DeviceId::from_bits(42), "sender/0"));
+        assert!(store.update(snapshot(&["a", "b"]), t(9)));
+        let s = store.snapshot().unwrap();
+        assert_eq!(s.senders[0].base.version, t(9));
+        assert!(!store.update(snapshot(&["a", "b"]), t(10)));
     }
 
     #[test]

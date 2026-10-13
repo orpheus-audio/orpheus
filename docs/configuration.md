@@ -7,7 +7,8 @@ A node keeps its files where the XDG base directory specification says:
 ```text
 ~/.config/orpheus/config.toml   configuration, optional, hand-edited
 ~/.local/state/orpheus/id       device ID, created on first start
-~/.local/state/orpheus/         later also peers, aliases, routes and gains
+~/.local/state/orpheus/routes.json  senders and connections, kept across restarts
+~/.local/state/orpheus/         later also peers, aliases and gains
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
 ```
 
@@ -55,7 +56,6 @@ listen = "[::]:7480"
 enabled = true
 port = 5004
 link_offset_ms = 10
-# target = "alsa_output.pci-0000_00_1f.3.analog-stereo"
 
 [ptp]
 enabled = true
@@ -97,16 +97,21 @@ Every node has one receiver. It plays the RTP stream sent to it on its output.
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Run the receiver. |
-| `port` | `5004` | UDP port for RTP, over IPv4 and IPv6. |
+| `port` | `5004` | UDP port for RTP, over IPv4 and IPv6, unless a connection asks for another. |
 | `link_offset_ms` | `10` | Playout delay after the sender's timestamp. It must cover packetization (1 ms), network delay, and the clock error between the nodes. Every receiver of a stream should use the same value so that they play in sync. |
-| `target` | unset | `node.name` of the PipeWire output to play on; the default output if unset. `pw-cli ls Node` or `wpctl status` lists the outputs. Temporary: this moves to the API (see below). |
 
 The receiver follows one stream at a time. If a second sender streams to the
-same node, it is ignored until the first one has been quiet for a second.
+same node, it is ignored until the first one has been quiet for a second. A
+connection made over [IS-05](usage.md#connections-is-05) can limit it to one
+sender, or switch it off.
 
-Choosing where streams play is routing, which belongs to the control plane.
-`target` and `link_offset_ms` will therefore probably move to the API, and the
-node will remember them in its state directory.
+The receiver plays on the default output. To play on another one, move its
+stream (named after the node) in `pavucontrol` or with `wpctl`; WirePlumber
+remembers the choice.
+
+Which streams go where is routing, which belongs to the API, not to this
+file: senders and connections are kept in `routes.json` in the state
+directory and restored at start.
 
 ### `[ptp]`
 

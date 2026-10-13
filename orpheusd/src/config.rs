@@ -63,8 +63,6 @@ pub struct ReceiverConfig {
     /// Playout delay after the sender's timestamp. Covers network delay and
     /// the clock error between the nodes.
     pub link_offset_ms: u32,
-    /// `node.name` of the output to play on; default output if unset.
-    pub target: Option<String>,
 }
 
 impl Default for ReceiverConfig {
@@ -73,7 +71,6 @@ impl Default for ReceiverConfig {
             enabled: true,
             port: RTP_PORT,
             link_offset_ms: 10,
-            target: None,
         }
     }
 }

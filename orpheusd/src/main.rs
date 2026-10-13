@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod connection;
 mod home;
 mod nmos;
 
@@ -86,8 +87,13 @@ async fn main() -> Result<()> {
         ptp,
         discovery,
         nmos: Mutex::new(orpheus_nmos::Store::new()),
+        connections: Mutex::new(connection::Connections::new(
+            home.state_dir().join("routes.json"),
+        )),
         quantum: config.audio.quantum,
+        receiver_port: config.receiver.port,
     });
+    connection::restore(&node);
 
     let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
@@ -260,7 +266,6 @@ fn start_engine(
                 listen,
                 link_offset_ms: rx.link_offset_ms,
                 quantum: config.audio.quantum,
-                target: rx.target.clone(),
             })
             .map_err(|e| anyhow!(e))
             .with_context(|| format!("starting receiver on {listen}"))?;

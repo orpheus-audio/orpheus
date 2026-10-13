@@ -12,10 +12,9 @@ use axum::http::{StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
-use orpheus_core::rtp::Encoding;
-use orpheus_core::{AudioFormat, DeviceId};
+use orpheus_core::DeviceId;
 use orpheus_discovery::Discovery;
-use orpheus_engine::{Engine, ReceiverStatus, SenderConfig, SenderId, SenderStatus, StatsSnapshot};
+use orpheus_engine::{Engine, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
@@ -36,7 +35,12 @@ pub struct Node {
     pub discovery: Option<Discovery>,
     /// NMOS resources and their versions.
     pub nmos: Mutex<orpheus_nmos::Store>,
+    /// Staged and active routing (IS-05). Lock it before the engine.
+    pub connections: Mutex<crate::connection::Connections>,
     pub quantum: Option<u32>,
+    /// UDP port the receiver listens on unless a connection asks for
+    /// another.
+    pub receiver_port: u16,
 }
 
 /// An error status with a plain-text message.
@@ -142,10 +146,16 @@ pub fn router(node: Arc<Node>) -> Router {
     let spec = api.to_pretty_json().expect("serializing OpenAPI spec");
     router
         .merge(crate::nmos::router())
+        .merge(crate::connection::router())
         .route(
             &format!("{BASE}/openapi.json"),
             get(move || async move { ([(header::CONTENT_TYPE, "application/json")], spec) }),
         )
+        // NMOS clients expect JSON errors everywhere.
+        .fallback(|| async { crate::nmos::error(StatusCode::NOT_FOUND, "no such path".into()) })
+        .method_not_allowed_fallback(|| async {
+            crate::nmos::error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed".into())
+        })
         .with_state(node)
 }
 
@@ -185,7 +195,9 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
 }
 
 /// Sends this node's audio to a peer: creates a sink named after it and
-/// streams what is played into it to the peer's receiver.
+/// streams what is played into it to the peer's receiver. The destination
+/// is activated through IS-05, where the sender can then be redirected or
+/// paused. The sender is kept across restarts.
 #[utoipa::path(
     post,
     path = "/x-orpheus/v1/senders",
@@ -204,27 +216,14 @@ async fn add_sender(
 ) -> Result<(StatusCode, Json<Created>), ApiError> {
     let peer = resolve(&req.peer).await?;
     let label = req.name.unwrap_or_else(|| req.peer.clone());
-    let id = tokio::task::spawn_blocking(move || {
-        let mut engine = lock_engine(&node)?;
-        let cfg = SenderConfig {
-            name: format!("orpheus.send.{}", engine.next_sender_id()),
-            description: label,
-            format: AudioFormat::AES67,
-            encoding: Encoding::L24,
-            peer,
-            quantum: node.quantum,
-        };
-        engine
-            .add_sender(&cfg)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let id = tokio::task::spawn_blocking(move || crate::connection::add_sender(&node, peer, label))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     tracing::info!(id, %peer, "sender started");
     Ok((StatusCode::CREATED, Json(Created { id })))
 }
 
-/// Stops a sender and removes its sink.
+/// Stops a sender, removes its sink and forgets it.
 #[utoipa::path(
     delete,
     path = "/x-orpheus/v1/senders/{id}",
@@ -240,11 +239,9 @@ async fn remove_sender(
     State(node): State<Arc<Node>>,
     Path(id): Path<SenderId>,
 ) -> Result<StatusCode, ApiError> {
-    let removed = tokio::task::spawn_blocking(move || {
-        Ok::<_, ApiError>(lock_engine(&node)?.remove_sender(id))
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let removed = tokio::task::spawn_blocking(move || crate::connection::remove_sender(&node, id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     if removed {
         tracing::info!(id, "sender stopped");
         Ok(StatusCode::NO_CONTENT)
@@ -294,13 +291,6 @@ async fn nodes(
         StatusCode::SERVICE_UNAVAILABLE,
         "mDNS is not running".into(),
     ))
-}
-
-fn lock_engine(node: &Node) -> Result<std::sync::MutexGuard<'_, Engine>, ApiError> {
-    node.engine
-        .as_ref()
-        .map(|e| e.lock().unwrap())
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()))
 }
 
 /// Resolves a peer: a host name or address, optionally with a port.

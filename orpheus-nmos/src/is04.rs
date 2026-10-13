@@ -2,13 +2,16 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
 pub const API_VERSION: &str = "v1.3";
 pub const FORMAT_AUDIO: &str = "urn:x-nmos:format:audio";
-pub const TRANSPORT_RTP_UCAST: &str = "urn:x-nmos:transport:rtp.ucast";
+/// RTP, unicast or multicast.
+pub const TRANSPORT_RTP: &str = "urn:x-nmos:transport:rtp";
 pub const DEVICE_GENERIC: &str = "urn:x-nmos:device:generic";
+/// A device control for the IS-05 Connection API.
+pub const CONTROL_CONNECTION: &str = "urn:x-nmos:control:sr-ctrl/v1.1";
 /// The output type of a receiver's output (`speaker`, `hifi`, …).
 pub const TAG_FORM_FACTOR: &str = "urn:x-orpheus:form-factor";
 
@@ -43,6 +46,36 @@ impl std::fmt::Display for Version {
 impl Serialize for Version {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.collect_str(self)
+    }
+}
+
+impl std::str::FromStr for Version {
+    type Err = String;
+
+    /// `secs:nanos`, nanoseconds below 10⁹.
+    fn from_str(s: &str) -> Result<Self, String> {
+        let bad = || format!("not a TAI time (secs:nanos): {s:?}");
+        let (secs, nanos) = s.split_once(':').ok_or_else(bad)?;
+        let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+        if !digits(secs) || !digits(nanos) {
+            return Err(bad());
+        }
+        let secs: u64 = secs.parse().map_err(|_| bad())?;
+        let nanos: u64 = nanos.parse().map_err(|_| bad())?;
+        if nanos >= 1_000_000_000 {
+            return Err(bad());
+        }
+        secs.checked_mul(1_000_000_000)
+            .and_then(|n| n.checked_add(nanos))
+            .map(Self)
+            .ok_or_else(bad)
+    }
+}
+
+impl<'de> Deserialize<'de> for Version {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        s.parse().map_err(serde::de::Error::custom)
     }
 }
 

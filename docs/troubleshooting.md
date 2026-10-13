@@ -85,8 +85,18 @@ affected.
 3. Check that the sender's sink actually gets audio: the application must play
    into the sink named after the peer, for example chosen in `pavucontrol` or with
    `wpctl set-default`.
-4. Check where the receiver plays: the default output unless
-   `[receiver] target` names another one.
+4. Check where the receiver plays: the default output unless its stream was
+   moved in `pavucontrol` or with `wpctl`.
+5. Check the receiver's connection: `orpheusctl status` shows `off` if it was
+   switched off, and `ignored` packets if it only takes another sender:
+
+   ```sh
+   curl -s localhost:7480/x-nmos/connection/v1.1/single/receivers/ | jq
+   curl -s localhost:7480/x-nmos/connection/v1.1/single/receivers/<id>/active | jq
+   ```
+
+   Packets to another port than the receiver listens on (`listen`) don't
+   arrive at all.
 
 ## Dropouts and clicks
 

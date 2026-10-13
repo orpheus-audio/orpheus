@@ -15,8 +15,10 @@ Linux.
 ## Design goals
 
 - **Cheap home networks.** Everything must work on unmanaged switches and
-  consumer routers. Streams therefore default to RTP unicast, because
-  multicast floods such networks and Wi-Fi.
+  consumer routers. Orpheus' own streams are therefore always RTP unicast,
+  because multicast floods such networks and Wi-Fi. Multicast exists only
+  for interoperability with AES67 and Dante devices and NMOS controllers,
+  and only when one of them asks for it.
 - **Decentralized.** Every device is a node with sources and sinks. Nodes
   find each other and connect directly; a controller is optional.
 - **Open.** Orpheus is free software (GPL-3.0-or-later) and builds on open
@@ -43,7 +45,7 @@ Linux.
 | `orpheusd` | The node daemon: config, home directory, HTTP API. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
 | `orpheus-discovery` | Announces the node over mDNS and keeps the list of other nodes. |
-| `orpheus-nmos` | NMOS IS-04 resource types, resource IDs and versions. |
+| `orpheus-nmos` | NMOS IS-04 resources, IDs and versions; IS-05 parameters; writing and reading SDP. |
 
 ## Audio path
 
@@ -117,7 +119,7 @@ The TX, RX and PTP threads run at normal priority for now.
 |---|---|---|
 | 319/udp | PTP event messages | multicast, IPv4 or IPv6 |
 | 320/udp | PTP general messages | multicast, IPv4 or IPv6 |
-| 5004/udp | RTP | unicast, IPv4 and IPv6 |
+| 5004/udp | RTP (by default; connections can pick other ports) | unicast; multicast only for interop, IPv4 and IPv6 |
 | 5353/udp | mDNS | multicast, IPv4 and IPv6 |
 | 7480/tcp | HTTP API | IPv4 and IPv6 |
 
@@ -142,8 +144,34 @@ follows the sender's and the node's resource versions, so it changes when the
 destination or the PTP grandmaster does.
 
 Resource IDs are UUIDv5 from the node ID and the resource's path
-(`node`, `device`, `receiver/0`, `sender/3`, …). Sender numbers restart at 0
-when `orpheusd` restarts, so a sender's ID may later name another stream.
+(`node`, `device`, `receiver/0`, `sender/3`, …). Saved senders come back
+under their number after a restart, so their IDs stay the same; the number
+of a removed sender is used again only after a restart.
+
+## Connections
+
+Routing goes through IS-05: every sender and the receiver has staged and
+active parameters. Activating them changes the engine at runtime without
+restarting streams:
+
+- A sender sends to another address or port, from another source address
+  or port (the socket is reopened), or pauses. Multicast destinations need
+  nothing special when sending.
+- The receiver filters what it plays by source address and payload type (from
+  the sender's SDP), joins and leaves multicast groups, and moves to another
+  UDP port. A new filter drops the stream played so far, so the next one
+  starts at once.
+
+An activation gives the IS-04 resource a new version even where its content
+stays the same, as NMOS asks. Scheduled activations run on a timer; while
+one is pending, the staged parameters are locked (`423`) until it fires or is
+cancelled.
+
+`routes.json` in the state directory keeps, for each sender, its number,
+name and last destination, and for each port the parameters last activated
+as requested, `auto` included. At start the node recreates the senders and
+activates these again, so `auto` is resolved afresh (a source port, for
+example, need not be free any more).
 
 ## Identity
 

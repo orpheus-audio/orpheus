@@ -9,13 +9,14 @@
 //! packetization, network delay and the error between the nodes' clocks.
 //!
 //! The receiver follows one stream (SSRC) at a time and switches to another
-//! once the current one has been quiet for [`SWITCH_AFTER_MS`]. Listening on
-//! `[::]`, it takes streams over IPv4 and IPv6.
+//! once the current one has been quiet for [`SWITCH_AFTER_MS`]. A [`Filter`]
+//! limits it to one source and payload type, or switches it off. Listening
+//! on `[::]`, it takes streams over IPv4 and IPv6.
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -53,14 +54,80 @@ pub struct ReceiverConfig {
     /// Playout delay after the media-clock time in the RTP timestamp.
     pub link_offset_ms: u32,
     pub quantum: Option<u32>,
-    /// Output node to play on; `None` follows the default output.
-    pub target: Option<String>,
+}
+
+/// Which packets the receiver plays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Filter {
+    /// Off: everything is ignored and the receiver plays silence.
+    pub enabled: bool,
+    /// Only packets from this address; `None` takes any.
+    pub source: Option<IpAddr>,
+    /// Only this RTP payload type; `None` takes any.
+    pub payload_type: Option<u8>,
+    /// A multicast group to join, else the stream comes by unicast.
+    pub group: Option<Group>,
+}
+
+/// A multicast group and, for IPv4, the address of the interface to join
+/// it on (`None`: the system's choice).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Group {
+    pub address: IpAddr,
+    pub interface: Option<IpAddr>,
+}
+
+impl Group {
+    fn join(&self, socket: &UdpSocket) -> io::Result<()> {
+        let s = socket2::SockRef::from(socket);
+        match self.address {
+            IpAddr::V4(g) => s.join_multicast_v4(&g, &self.interface_v4()),
+            IpAddr::V6(g) => s.join_multicast_v6(&g, 0),
+        }
+    }
+
+    fn leave(&self, socket: &UdpSocket) -> io::Result<()> {
+        let s = socket2::SockRef::from(socket);
+        match self.address {
+            IpAddr::V4(g) => s.leave_multicast_v4(&g, &self.interface_v4()),
+            IpAddr::V6(g) => s.leave_multicast_v6(&g, 0),
+        }
+    }
+
+    fn interface_v4(&self) -> Ipv4Addr {
+        match self.interface {
+            Some(IpAddr::V4(ip)) => ip,
+            _ => Ipv4Addr::UNSPECIFIED,
+        }
+    }
+}
+
+impl Default for Filter {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            source: None,
+            payload_type: None,
+            group: None,
+        }
+    }
+}
+
+/// The filter, shared with the RX thread, which picks up a new one by its
+/// generation.
+#[derive(Default)]
+struct SharedFilter {
+    filter: Mutex<Filter>,
+    /// A socket on a new port, for the RX thread to take over.
+    socket: Mutex<Option<UdpSocket>>,
+    generation: AtomicU64,
 }
 
 #[derive(Debug)]
 struct Counters {
     packets: AtomicU64,
     malformed: AtomicU64,
+    ignored: AtomicU64,
     late: AtomicU64,
     early: AtomicU64,
     lost: AtomicU64,
@@ -78,11 +145,16 @@ pub struct ReceiverStatus {
     #[cfg_attr(feature = "openapi", schema(value_type = String, example = "[::]:5004"))]
     pub listen: SocketAddr,
     pub link_offset_ms: u32,
+    /// Whether the filter lets packets through.
+    pub enabled: bool,
     /// The stream being played, if any.
     pub ssrc: Option<u32>,
     pub packets: u64,
     /// Not RTP or not the expected format.
     pub malformed: u64,
+    /// Turned away by the filter: another source or payload type, or the
+    /// receiver is off.
+    pub ignored: u64,
     /// Arrived after their playout time.
     pub late: u64,
     /// Arrived too far ahead of their playout time to buffer.
@@ -116,8 +188,12 @@ fn bind(listen: SocketAddr) -> io::Result<UdpSocket> {
 }
 
 pub(crate) struct Receiver {
-    listen: SocketAddr,
+    /// The address to listen on, with whatever port.
+    bind_ip: IpAddr,
     link_offset_ms: u32,
+    filter: Arc<SharedFilter>,
+    /// The RX thread's socket, for joining and leaving groups.
+    socket: Mutex<UdpSocket>,
     counters: Arc<Counters>,
     buffer: Arc<PortStats>,
     stop: Arc<AtomicBool>,
@@ -133,7 +209,7 @@ impl Receiver {
     ) -> Result<Self, BackendError> {
         let format = cfg.format;
         let socket = bind(cfg.listen)?;
-        let listen = socket.local_addr()?;
+        let membership = socket.try_clone()?;
         let (capture, playback, buffer) =
             port_pair(format.channels, format.frames_in_ms(BUFFER_MS));
         let playback = backend.create_playback(
@@ -141,7 +217,6 @@ impl Receiver {
                 name: cfg.name.clone(),
                 description: cfg.description.clone(),
                 format,
-                target: cfg.target.clone(),
                 group: None,
                 remote: Some(OutputType::Generic),
                 quantum: cfg.quantum,
@@ -153,6 +228,7 @@ impl Receiver {
         let counters = Arc::new(Counters {
             packets: AtomicU64::new(0),
             malformed: AtomicU64::new(0),
+            ignored: AtomicU64::new(0),
             late: AtomicU64::new(0),
             early: AtomicU64::new(0),
             lost: AtomicU64::new(0),
@@ -162,6 +238,7 @@ impl Receiver {
             asrc_ppm: AtomicU64::new(0f64.to_bits()),
         });
         let stop = Arc::new(AtomicBool::new(false));
+        let filter = Arc::new(SharedFilter::default());
         let offset = format.frames_in_ms(cfg.link_offset_ms) as u64;
         let rx = Rx {
             port: capture,
@@ -178,6 +255,9 @@ impl Receiver {
             ),
             seqs: SequenceStats::default(),
             ssrc: None,
+            shared_filter: filter.clone(),
+            filter: Filter::default(),
+            filter_generation: 0,
             last_heard: 0,
             window: MarginWindow::default(),
             asrc: Asrc::new(
@@ -195,8 +275,10 @@ impl Receiver {
             move || rx.run(&stop)
         })?;
         Ok(Self {
-            listen,
+            bind_ip: cfg.listen.ip(),
             link_offset_ms: cfg.link_offset_ms,
+            filter,
+            socket: Mutex::new(membership),
             counters,
             buffer,
             stop,
@@ -205,16 +287,59 @@ impl Receiver {
         })
     }
 
+    /// Sets the filter and joins its group, leaving the previous one.
+    pub fn set_filter(&self, filter: Filter) -> io::Result<()> {
+        let mut current = self.filter.filter.lock().unwrap();
+        if current.group != filter.group {
+            let socket = self.socket.lock().unwrap();
+            if let Some(g) = &filter.group {
+                g.join(&socket)?;
+            }
+            if let Some(g) = &current.group {
+                let _ = g.leave(&socket);
+            }
+        }
+        *current = filter;
+        self.filter.generation.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    /// Moves to another UDP port, keeping the group joined.
+    pub fn set_port(&self, port: u16) -> io::Result<()> {
+        let current = self.filter.filter.lock().unwrap();
+        let mut socket = self.socket.lock().unwrap();
+        if socket.local_addr()?.port() == port {
+            return Ok(());
+        }
+        let new = bind(SocketAddr::new(self.bind_ip, port))?;
+        if let Some(g) = &current.group {
+            g.join(&new)?;
+        }
+        *self.filter.socket.lock().unwrap() = Some(new.try_clone()?);
+        *socket = new;
+        self.filter.generation.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    fn listen(&self) -> SocketAddr {
+        let socket = self.socket.lock().unwrap();
+        socket
+            .local_addr()
+            .unwrap_or(SocketAddr::new(self.bind_ip, 0))
+    }
+
     pub fn status(&self) -> ReceiverStatus {
         let c = &self.counters;
         let ssrc = c.ssrc.load(Relaxed);
         let margin = c.margin_us.load(Relaxed);
         ReceiverStatus {
-            listen: self.listen,
+            listen: self.listen(),
             link_offset_ms: self.link_offset_ms,
+            enabled: self.filter.filter.lock().unwrap().enabled,
             ssrc: (ssrc != NO_SSRC).then_some(ssrc as u32),
             packets: c.packets.load(Relaxed),
             malformed: c.malformed.load(Relaxed),
+            ignored: c.ignored.load(Relaxed),
             late: c.late.load(Relaxed),
             early: c.early.load(Relaxed),
             lost: c.lost.load(Relaxed),
@@ -254,6 +379,9 @@ struct Rx {
     jitter: JitterBuffer,
     seqs: SequenceStats,
     ssrc: Option<u32>,
+    shared_filter: Arc<SharedFilter>,
+    filter: Filter,
+    filter_generation: u64,
     last_heard: u64,
     window: MarginWindow,
     asrc: Asrc,
@@ -306,13 +434,15 @@ impl Rx {
 
     /// Waits up to `timeout` for one packet and stores it.
     fn receive(&mut self, packet: &mut [u8], samples: &mut [f32], next: u64, timeout: Duration) {
+        // Before waiting, so that a new socket takes over at once.
+        self.update_filter();
         // A zero timeout would mean "block forever".
         let timeout = timeout.max(Duration::from_micros(1));
         if self.socket.set_read_timeout(Some(timeout)).is_err() {
             return;
         }
-        let len = match self.socket.recv(packet) {
-            Ok(len) => len,
+        let (len, from) = match self.socket.recv_from(packet) {
+            Ok(got) => got,
             Err(e)
                 if matches!(
                     e.kind(),
@@ -333,6 +463,14 @@ impl Rx {
             c.malformed.fetch_add(1, Relaxed);
             return;
         };
+        let f = self.filter;
+        if !f.enabled
+            || f.source.is_some_and(|s| s != from.ip().to_canonical())
+            || f.payload_type.is_some_and(|pt| pt != header.payload_type)
+        {
+            c.ignored.fetch_add(1, Relaxed);
+            return;
+        }
         let ch = self.format.channels as usize;
         let n = self.encoding.decode(payload, samples);
         if n == 0 || !n.is_multiple_of(ch) || n * self.encoding.bytes_per_sample() != payload.len()
@@ -369,6 +507,23 @@ impl Rx {
                 c.early.fetch_add(1, Relaxed);
             }
         }
+    }
+
+    /// Takes a new filter and drops the stream played so far, so that the
+    /// next one starts at once.
+    fn update_filter(&mut self) {
+        let generation = self.shared_filter.generation.load(Relaxed);
+        if generation == self.filter_generation {
+            return;
+        }
+        self.filter_generation = generation;
+        self.filter = *self.shared_filter.filter.lock().unwrap();
+        if let Some(socket) = self.shared_filter.socket.lock().unwrap().take() {
+            self.socket = socket;
+        }
+        self.ssrc = None;
+        self.jitter.reset();
+        self.counters.ssrc.store(NO_SSRC, Relaxed);
     }
 
     fn publish_margin(&mut self, now: u64) {

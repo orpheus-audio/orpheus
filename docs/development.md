@@ -66,12 +66,17 @@ the NMOS APIs. Clone it outside the synced folders, install its
 ```sh
 python3 nmos-test.py suite IS-04-01 --host 10.99.0.2 --port 7480 \
   --version v1.3 --output is-04-01.json
+python3 nmos-test.py suite IS-05-01 --host 10.99.0.2 --port 7480 \
+  --version v1.1 --output is-05-01.json
+python3 nmos-test.py suite IS-05-02 --host 10.99.0.2 10.99.0.2 \
+  --port 7480 7480 --version v1.3 v1.1 --output is-05-02.json
 ```
 
 On first start the tool clones the NMOS specifications from GitHub, so a
-namespace without internet needs one run outside first. With IS-04-01 all
-Node API tests pass. The registration tests fail, as expected, because nodes
-don't register with a registry. The tool decodes TXT records as ASCII, which
+namespace without internet needs one run outside first. IS-05-01 and
+IS-05-02 pass completely. With IS-04-01 all Node API tests pass; the
+registration tests fail, as expected, because nodes don't register with a
+registry. The tool decodes TXT records as ASCII, which
 is why the name is not in the TXT record.
 
 ## OpenAPI

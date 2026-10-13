@@ -334,9 +334,6 @@ fn create_stream(
         *pw::keys::NODE_DESCRIPTION => spec.description.as_str(),
         *pw::keys::AUDIO_CHANNELS => channels.as_str(),
     };
-    if let Some(target) = &spec.target {
-        props.insert(*pw::keys::TARGET_OBJECT, target.as_str());
-    }
     if let Some(group) = &spec.group {
         props.insert(*pw::keys::NODE_GROUP, group.as_str());
         // Keeps the session manager from linking group members to each other.

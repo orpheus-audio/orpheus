@@ -8,8 +8,8 @@ use orpheus_core::AudioFormat;
 
 use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
 use crate::port::{PortStats, StatsSnapshot, port_pair};
-use crate::receiver::{Receiver, ReceiverConfig, ReceiverStatus};
-use crate::sender::{Sender, SenderConfig, SenderStatus};
+use crate::receiver::{Filter, Receiver, ReceiverConfig, ReceiverStatus};
+use crate::sender::{Route, Sender, SenderConfig, SenderStatus};
 
 /// A local test route: a virtual sink whose audio is played straight back on
 /// the local output. Exercises the backend, its realtime callbacks and the
@@ -75,7 +75,6 @@ impl Engine {
                 name: format!("{}.playback", cfg.name),
                 description: format!("{} (playback)", cfg.description),
                 format: cfg.format,
-                target: None,
                 group: Some(cfg.name.clone()),
                 remote: None,
                 quantum: cfg.quantum,
@@ -88,7 +87,6 @@ impl Engine {
                 name: cfg.name.clone(),
                 description: cfg.description.clone(),
                 format: cfg.format,
-                target: None,
                 group: Some(cfg.name.clone()),
                 remote: None,
                 quantum: cfg.quantum,
@@ -122,11 +120,45 @@ impl Engine {
 
     /// Starts a sender and returns its ID.
     pub fn add_sender(&mut self, cfg: &SenderConfig) -> Result<SenderId, BackendError> {
-        let sender = Sender::start(self.backend.as_mut(), self.clock.clone(), cfg)?;
         let id = self.next_sender;
-        self.next_sender += 1;
-        self.senders.insert(id, sender);
+        self.insert_sender(id, cfg)?;
         Ok(id)
+    }
+
+    /// Starts a sender under a given ID, e.g. one restored from before a
+    /// restart, replacing a sender with that ID.
+    pub fn insert_sender(&mut self, id: SenderId, cfg: &SenderConfig) -> Result<(), BackendError> {
+        self.senders.remove(&id);
+        let sender = Sender::start(self.backend.as_mut(), self.clock.clone(), cfg)?;
+        self.next_sender = self.next_sender.max(id + 1);
+        self.senders.insert(id, sender);
+        Ok(())
+    }
+
+    /// Redirects a sender; `Ok(false)` if there is no such sender.
+    pub fn set_sender_route(&mut self, id: SenderId, route: Route) -> std::io::Result<bool> {
+        match self.senders.get(&id) {
+            Some(s) => s.set_route(route).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// Moves the receiver to another UDP port; `Ok(false)` if there is no
+    /// receiver.
+    pub fn set_receiver_port(&mut self, port: u16) -> std::io::Result<bool> {
+        match &self.receiver {
+            Some(r) => r.set_port(port).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// Sets which packets the receiver plays; `Ok(false)` if there is no
+    /// receiver.
+    pub fn set_receiver_filter(&mut self, filter: Filter) -> std::io::Result<bool> {
+        match &self.receiver {
+            Some(r) => r.set_filter(filter).map(|()| true),
+            None => Ok(false),
+        }
     }
 
     /// Stops a sender; returns whether it existed.

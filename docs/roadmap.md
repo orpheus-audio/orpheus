@@ -10,7 +10,7 @@
 | M3 | PTP, TAI time base, ASRC in both directions | done, except interop tests |
 | — | IPv6 for PTP, RTP and the API | done |
 | — | Tuning the PTP servo | done, except on real hardware |
-| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04, SDP done |
+| M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl` | in progress: mDNS, IS-04, SDP, IS-05 done |
 | M5 | Memory and policy: pinned peers, aliases, route restore on reconnect, per-sender gains; mixing policies and ducking; sample-rate changes | planned |
 | M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
 
@@ -26,10 +26,18 @@ and Bluetooth inputs.
 **Audio**
 
 - The stream format is fixed: L24, 48 kHz, stereo, 1 ms packets, payload type
-  97. Senders describe their stream in an SDP file, but the receiver doesn't
-  read SDP and accepts any payload type.
+  97. A receiver refuses SDP files for other formats; without an SDP file it
+  accepts any payload type.
 - One receiver per node, following one stream at a time. Mixing comes in M5.
-- Routes are not saved and end when `orpheusd` stops.
+- Only `POST /x-orpheus/v1/senders` creates senders; IS-05 can redirect,
+  pause and resume them, not create them.
+- Multicast (interop only) has no guard rails yet: nothing warns when a
+  multicast stream runs over Wi-Fi. `orpheusctl status` and the log should.
+- IPv6 multicast groups are joined on the system's default interface, so a
+  node without an IPv6 default route can't join them.
+- A connection made on a receiver doesn't reach the sender, and the other
+  way round: a controller patches both, or `orpheusctl connect` patches the
+  sender only.
 - The sender sizes its buffer from `[audio] quantum` (or assumes 1024 frames)
   instead of reading the real quantum.
 - The receiver path has two buffers in a row (its port, then PipeWire's
@@ -147,13 +155,12 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 ### Control plane and configuration
 
-- **Split between config and control plane** (open question). Routing
-  belongs to the control plane: which output a receiver plays on, link
-  offsets, senders. It would move to the API and be remembered in the state
-  directory, and `[receiver] target` would leave the
-  config. Still open is how `config.toml` and settings changed through the
-  API relate, for example the file as defaults that the API overrides, with
-  the API showing where each value comes from.
+- **Split between config and control plane.** Routing lives in the API and
+  is saved in the state directory (`routes.json`); `config.toml` holds
+  defaults. Still open is how other settings changed through the API (link
+  offsets, clock settings in M6) relate to the file, for example the file as
+  defaults that the API overrides, with the API showing where each value
+  comes from.
 - **Connecting by name** (M4): `orpheusctl connect Kitchen`, resolved through
   discovery by the node's announced name or ID instead of a host name.
 - **Output types** (M4). Each output of a device announces a type, and other
