@@ -97,6 +97,7 @@ async fn main() -> Result<()> {
         nmos: Mutex::new(orpheus_nmos::Store::new()),
         connections: Mutex::new(connection::Connections::new(
             home.state_dir().join("routes.json"),
+            config.routes,
         )),
         block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
         receiver: config.receiver.clone(),

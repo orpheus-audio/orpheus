@@ -269,7 +269,8 @@ fn snapshot(node: &Node) -> Snapshot {
 
     for ((n, s), active) in engine.senders.iter().zip(sender_active) {
         let uuid = resource_id(dev, &format!("sender/{n}"));
-        let source_id = resource_id(dev, &format!("source/{n}"));
+        // The route's ID, which the SDP file announces as the source too.
+        let source_id = *n;
         let flow_id = resource_id(dev, &format!("flow/{n}"));
         let base = |id| Base {
             description: format!("to {}", s.peer),
@@ -351,6 +352,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         (conns.sender_active(id)?.clone(), conns.sender_priority(id))
     };
     let node_id = node.id.to_string();
+    let source_id = id.to_string();
     let uuid = resource_id(node.id, &format!("sender/{id}"));
     let sender = snap.senders.iter().find(|s| s.base.id == uuid)?;
     let leg = active.transport_params.first()?;
@@ -384,6 +386,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         // RTP timestamps count media-clock frames since the epoch.
         media_clock_offset: 0,
         node: Some(&node_id),
+        source_id: Some(&source_id),
         priority,
     };
     Some(session.render())

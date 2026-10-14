@@ -117,6 +117,11 @@ impl Peers {
         self.entries.get(id)?.alias.as_deref()
     }
 
+    /// Whether the node with device ID `id` is pinned.
+    pub fn pinned(&self, id: &str) -> bool {
+        self.entries.get(id).is_some_and(|e| e.pinned)
+    }
+
     /// The nodes discovery sees, with their aliases and pins, and the
     /// pinned ones it doesn't see as last seen. Online first, then by the
     /// name shown.

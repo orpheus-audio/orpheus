@@ -82,8 +82,9 @@ pub enum Subject {
 pub struct Warning {
     pub kind: WarningKind,
     pub on: Subject,
-    /// The sender, for warnings on a sender.
+    /// The route, for warnings on a sender.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
     pub sender: Option<SenderId>,
     /// The receiver, for warnings on a receiver.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -172,14 +173,14 @@ fn check(node: &Node, state: &mut State) {
     let mut health = node.health.lock().unwrap();
     for w in &found {
         if !health.warnings.iter().any(|o| o.key() == w.key()) {
-            tracing::warn!(on = ?w.on, sender = w.sender, receiver = w.receiver, "{}", w.message);
+            tracing::warn!(on = ?w.on, sender = w.sender.as_ref().map(tracing::field::display), receiver = w.receiver, "{}", w.message);
         }
     }
     for w in &health.warnings {
         if !found.iter().any(|n| n.key() == w.key()) {
             tracing::info!(
                 on = ?w.on,
-                sender = w.sender,
+                sender = w.sender.as_ref().map(tracing::field::display),
                 receiver = w.receiver,
                 "resolved: {}",
                 w.message
@@ -414,7 +415,7 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
                 found.push(warn(
                     WarningKind::MulticastWifi,
                     format!(
-                        "sender {id} ({name}) sends to multicast group {dest} over Wi-Fi \
+                        "route {name} sends to multicast group {dest} over Wi-Fi \
                          ({i}), which the access point sends at its lowest rate to every \
                          client; use a wired link or unicast"
                     ),
@@ -425,7 +426,7 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
         if let Some(i) = wireless_to(dest) {
             found.push(warn(
                 WarningKind::Wifi,
-                format!("sender {id} sends to {name} over Wi-Fi ({i}); expect dropouts"),
+                format!("route {name} goes out over Wi-Fi ({i}); expect dropouts"),
             ));
         }
         let link = links.get(&id);
@@ -436,14 +437,14 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
         if let Some(peer) = peer.filter(|n| n.link == Some(Link::Wifi)) {
             found.push(warn(
                 WarningKind::PeerWifi,
-                format!("sender {id}: {} is on Wi-Fi; expect dropouts", peer.name),
+                format!("route {name}: {} is on Wi-Fi; expect dropouts", peer.name),
             ));
         }
         if link.is_some_and(|l| l.jitter) {
             found.push(warn(
                 WarningKind::PeerJitter,
                 format!(
-                    "sender {id}: {name} reports the packets arriving spread over more \
+                    "route {name}: the peer reports the packets arriving spread over more \
                      than {JITTER_LIMIT_MS} ms: Wi-Fi or a congested link on the way"
                 ),
             ));

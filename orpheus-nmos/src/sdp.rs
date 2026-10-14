@@ -49,6 +49,9 @@ pub struct Session<'a> {
     pub media_clock_offset: u32,
     /// The sending Orpheus node's ID, as `a=x-orpheus-node`.
     pub node: Option<&'a str>,
+    /// What is sent, as `a=x-orpheus-source`: an ID that stays the same as
+    /// long as the sender's node remembers the route.
+    pub source_id: Option<&'a str>,
     /// Written only when high.
     pub priority: Priority,
 }
@@ -111,6 +114,9 @@ impl Session<'_> {
         if let Some(node) = self.node {
             let _ = write!(s, "a=x-orpheus-node:{}\r\n", one_line(node));
         }
+        if let Some(id) = self.source_id {
+            let _ = write!(s, "a=x-orpheus-source:{}\r\n", one_line(id));
+        }
         if self.priority == Priority::High {
             s.push_str("a=x-orpheus-priority:high\r\n");
         }
@@ -135,12 +141,18 @@ pub struct Stream {
     pub channels: u16,
     /// The sending Orpheus node's ID (`a=x-orpheus-node`), if it is one.
     pub node: Option<String>,
+    /// What is sent (`a=x-orpheus-source`), if an Orpheus node sends it.
+    pub source_id: Option<String>,
+    /// The session's identity from the origin line: user name, session ID
+    /// and address, which RFC 8866 makes globally unique.
+    pub session: Option<String>,
     pub priority: Priority,
 }
 
 /// Reads the first `m=audio` section with RTP/AVP.
 pub fn parse(sdp: &str) -> Result<Stream, String> {
     let mut origin = None;
+    let mut session = None;
     let mut name = String::new();
     let mut session_c = None;
     // Inside the first audio section: connection, port, payload type.
@@ -148,6 +160,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
     let mut rtpmap: Option<(String, u32, u16)> = None;
     let mut filter = None;
     let mut node = None;
+    let mut source_id = None;
     let mut priority = Priority::Normal;
     let mut done = false;
     for line in sdp.lines() {
@@ -170,7 +183,13 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
             }
             _ if done => {}
             "s" if media.is_none() => name = value.trim().to_owned(),
-            "o" => origin = value.split_whitespace().nth(5).and_then(|a| a.parse().ok()),
+            "o" => {
+                let f: Vec<&str> = value.split_whitespace().collect();
+                if let [user, id, _, _, _, addr] = f[..] {
+                    origin = addr.parse().ok();
+                    session = Some(format!("{user} {id} {addr}"));
+                }
+            }
             "c" => {
                 let addr = connection(value).ok_or_else(|| format!("bad connection {line:?}"))?;
                 match &mut media {
@@ -193,6 +212,8 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
                     }
                 } else if let Some(id) = value.strip_prefix("x-orpheus-node:") {
                     node = Some(id.trim().to_owned()).filter(|id| !id.is_empty());
+                } else if let Some(id) = value.strip_prefix("x-orpheus-source:") {
+                    source_id = Some(id.trim().to_owned()).filter(|id| !id.is_empty());
                 } else if let Some(p) = value.strip_prefix("x-orpheus-priority:") {
                     if p.trim() == "high" {
                         priority = Priority::High;
@@ -220,6 +241,8 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
         rate,
         channels,
         node,
+        source_id,
+        session,
         priority,
     })
 }
@@ -272,6 +295,7 @@ mod tests {
             clock,
             media_clock_offset: 0,
             node: None,
+            source_id: None,
             priority: Priority::Normal,
         }
     }
@@ -305,9 +329,14 @@ mod tests {
     fn reads_own_files() {
         let mut sdp = session(RefClock::LocalMac("00-1b-21-ab-cd-ef".into()));
         sdp.node = Some("B73AQ0P0");
+        sdp.source_id = Some("5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01");
         sdp.priority = Priority::High;
         let sdp = sdp.render();
-        assert!(sdp.ends_with("a=x-orpheus-node:B73AQ0P0\r\na=x-orpheus-priority:high\r\n"));
+        assert!(sdp.ends_with(
+            "a=x-orpheus-node:B73AQ0P0\r\n\
+             a=x-orpheus-source:5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01\r\n\
+             a=x-orpheus-priority:high\r\n"
+        ));
         assert_eq!(
             parse(&sdp),
             Ok(Stream {
@@ -320,6 +349,8 @@ mod tests {
                 rate: 48_000,
                 channels: 2,
                 node: Some("B73AQ0P0".into()),
+                source_id: Some("5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01".into()),
+                session: Some("- 42 192.168.1.10".into()),
                 priority: Priority::High,
             })
         );
@@ -335,6 +366,8 @@ mod tests {
         assert_eq!(s.name, "x");
         assert_eq!(s.priority, Priority::Normal);
         assert_eq!(s.source, Some("10.0.0.9".parse().unwrap()));
+        assert_eq!(s.session.as_deref(), Some("- 1 10.0.0.9"));
+        assert_eq!(s.source_id, None);
         assert_eq!(s.destination, "239.1.2.3".parse::<IpAddr>().unwrap());
         assert_eq!((s.port, s.payload_type), (5006, 96));
         assert_eq!(

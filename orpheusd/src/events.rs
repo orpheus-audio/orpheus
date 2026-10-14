@@ -35,10 +35,18 @@ pub enum Topic {
     Outputs,
     /// As `GET /x-orpheus/v1/settings`.
     Settings,
+    /// As `GET /x-orpheus/v1/routes`.
+    Routes,
 }
 
 impl Topic {
-    pub const ALL: [Topic; 4] = [Topic::Status, Topic::Nodes, Topic::Outputs, Topic::Settings];
+    pub const ALL: [Topic; 5] = [
+        Topic::Status,
+        Topic::Nodes,
+        Topic::Outputs,
+        Topic::Settings,
+        Topic::Routes,
+    ];
 
     fn slow(self) -> bool {
         matches!(self, Topic::Status | Topic::Outputs)

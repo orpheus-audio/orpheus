@@ -20,6 +20,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub audio: AudioConfig,
     pub receiver: ReceiverConfig,
+    pub routes: RoutesConfig,
     pub ptp: PtpConfig,
     pub loopback: LoopbackConfig,
     /// Icon names for other nodes' outputs, by output type, replacing the
@@ -227,6 +228,26 @@ impl Default for PtpConfig {
             slave_only: d.slave_only,
             step_threshold_us: d.step_threshold_us,
             settle_threshold_us: d.settle_threshold_us,
+        }
+    }
+}
+
+/// How long disconnected routes are remembered, so that connecting the
+/// same peer again restores them. Routes to pinned nodes are kept anyway.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RoutesConfig {
+    /// Forgets a route this many days after it was last connected.
+    pub max_age_days: u32,
+    /// Forgets the oldest routes beyond this many.
+    pub max_entries: u32,
+}
+
+impl Default for RoutesConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: 365,
+            max_entries: 100,
         }
     }
 }

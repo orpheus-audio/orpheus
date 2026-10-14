@@ -35,7 +35,7 @@ and Bluetooth inputs.
   it counts as playing.
 - Ducking has two levels, `normal` and `high`. Priorities are set by the
   sender per connection, not by the receiving node.
-- Only `POST /x-orpheus/v1/senders` creates senders; IS-05 can redirect,
+- Only `POST /x-orpheus/v1/routes` creates senders; IS-05 can redirect,
   pause and resume them, not create them.
 - IPv6 multicast groups are joined on the system's default interface, so a
   node without an IPv6 default route can't join them.

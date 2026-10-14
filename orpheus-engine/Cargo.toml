@@ -14,6 +14,7 @@ orpheus-clock = { path = "../orpheus-clock" }
 getrandom = "0.4"
 rubato = { version = "5", default-features = false }
 socket2 = "0.6"
+uuid = "1"
 serde = { workspace = true, optional = true }
 utoipa = { version = "6", optional = true }
 

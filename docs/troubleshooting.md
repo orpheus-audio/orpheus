@@ -89,8 +89,8 @@ affected.
   `max` there, or take one over with `--force`. A receiver whose sender
   vanished is freed within 30 seconds once the sending node is back; if it
   stays away, use `--force`.
-- `409 already connected to … as sender N`: this node already sends there
-  with the same priority. If `status` shows that sender as `disconnected,
+- `409 already connected to … as route ID`: this node already sends there
+  with the same priority. If `status` shows that route as `disconnected,
   paused`, it takes the next free receiver of the peer by itself.
 - `409 other senders took …'s free receivers meanwhile`: other nodes
   connected at the same moment; try again.
@@ -180,8 +180,8 @@ the filter corrects it. Gradual NTP adjustments (slewing) are harmless.
 - They speak PTP over IPv4 only. Use an interface with an IPv4 address, or
   set `transport = "ipv4"`.
 - SAP is not implemented, so the devices
-  cannot find the node's streams by themselves. Each sender has an SDP file
-  at `/x-orpheus/v1/senders/{id}/sdp`, which some devices can import. Interoperability is untested; see the
+  cannot find the node's streams by themselves. Each route has an SDP file
+  at `/x-orpheus/v1/routes/{id}/sdp`, which some devices can import. Interoperability is untested; see the
   [roadmap](roadmap.md).
 
 ## Two nodes on one machine

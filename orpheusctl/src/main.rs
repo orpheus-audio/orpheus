@@ -34,14 +34,16 @@ enum Command {
     },
     /// Send the node's audio to a peer: creates a sink "<name>" whose
     /// audio is streamed to a free receiver of the peer, and connects that
-    /// receiver to it.
+    /// receiver to it. A route to the peer with the same priority from
+    /// before comes back as it was.
     Connect {
         /// Peer: its name or ID (see `nodes`), host name or address, or the
         /// URL of its API. With --send-only: host name or address,
         /// optionally with :port (default 5004); IPv6 with a port as
         /// [addr]:port.
         peer: String,
-        /// Name shown in the sink; defaults to the peer's name.
+        /// Name shown in the sink; defaults to the route's name from
+        /// before, else the peer's name.
         #[arg(long)]
         name: Option<String>,
         /// Only send; don't connect a receiver on the peer (for receivers
@@ -93,7 +95,7 @@ enum Command {
         kind: String,
     },
     /// Play a receiver's stream on another output. The node remembers it
-    /// for the sending node and plays its streams there again later.
+    /// for what is sent, and plays it there again later.
     Play {
         /// Receiver ID, as shown by `status`.
         receiver: u32,
@@ -116,11 +118,21 @@ enum Command {
         #[arg(required = true, value_name = "SECTION[.KEY]")]
         keys: Vec<String>,
     },
-    /// Stop a sender started with `connect` and disconnect the peer's
-    /// receiver.
+    /// List the routes that run and the ones remembered from before.
+    Routes,
+    /// Stop a route started with `connect` and disconnect the peer's
+    /// receiver. The route is remembered for the next `connect`.
     Disconnect {
-        /// Sender ID, as shown by `status`.
-        id: u32,
+        /// The route: its name, or its ID or the start of it (see
+        /// `routes`).
+        route: String,
+    },
+    /// Forget a route, so that the next `connect` starts a new one;
+    /// disconnects it first if it runs.
+    Forget {
+        /// The route: its name, or its ID or the start of it (see
+        /// `routes`).
+        route: String,
     },
 }
 
@@ -138,7 +150,7 @@ struct Status {
     #[serde(default)]
     receivers: Vec<Receiver>,
     #[serde(default)]
-    senders: Vec<Sender>,
+    routes: Vec<Sender>,
     /// Missing from older nodes.
     #[serde(default)]
     warnings: Vec<Warning>,
@@ -250,7 +262,8 @@ struct Output {
 
 #[derive(Clone, Deserialize)]
 struct Sender {
-    id: u32,
+    /// Route ID.
+    id: String,
     /// Missing from older nodes.
     #[serde(default)]
     name: String,
@@ -304,7 +317,7 @@ struct NewSender {
 
 #[derive(Deserialize)]
 struct Created {
-    id: u32,
+    id: String,
     /// Missing from older nodes.
     name: Option<String>,
     destination: Option<String>,
@@ -349,12 +362,12 @@ impl Status {
                 }
             })
             .collect();
-        d.senders = self
-            .senders
+        d.routes = self
+            .routes
             .iter()
             .map(|t| {
-                // A new sender counts from now.
-                let p = prev.senders.iter().find(|p| p.id == t.id).unwrap_or(t);
+                // A new route counts from now.
+                let p = prev.routes.iter().find(|p| p.id == t.id).unwrap_or(t);
                 Sender {
                     packets: t.packets.saturating_sub(p.packets),
                     send_errors: t.send_errors.saturating_sub(p.send_errors),
@@ -419,7 +432,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             force,
             priority,
         } => {
-            let url = format!("{base}/x-orpheus/v1/senders");
+            let url = format!("{base}/x-orpheus/v1/routes");
             let raw = post(
                 &url,
                 NewSender {
@@ -443,7 +456,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 } else {
                     "send only"
                 };
-                println!("sender {} \"{name}\" → {to} ({how})", c.id);
+                println!("route {} \"{name}\" → {to} ({how})", short(&c.id));
             }
         }
         Command::Nodes => {
@@ -558,13 +571,119 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             let raw = change_settings(base, patch.into())?;
             print_settings(&raw, cli.json)?;
         }
-        Command::Disconnect { id } => {
-            let url = format!("{base}/x-orpheus/v1/senders/{id}");
+        Command::Routes => {
+            let url = format!("{base}/x-orpheus/v1/routes");
+            let raw = get(&url)?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let routes: Vec<RouteEntry> = serde_json::from_str(&raw)
+                    .with_context(|| format!("reading routes from {url}"))?;
+                print!("{}", render_routes(&routes, Paint::detect(), unix_now()));
+            }
+        }
+        Command::Disconnect { route } => {
+            let id = find_route(base, &route)?;
+            let url = format!("{base}/x-orpheus/v1/routes/{id}");
             reply(agent().delete(&url).call()?)
-                .with_context(|| format!("stopping sender {id} via {url}"))?;
+                .with_context(|| format!("disconnecting {route} via {url}"))?;
+        }
+        Command::Forget { route } => {
+            let id = find_route(base, &route)?;
+            let url = format!("{base}/x-orpheus/v1/routes/{id}?forget=true");
+            reply(agent().delete(&url).call()?)
+                .with_context(|| format!("forgetting {route} via {url}"))?;
         }
     }
     Ok(())
+}
+
+/// A route, as `/x-orpheus/v1/routes` lists it.
+#[derive(Deserialize)]
+struct RouteEntry {
+    id: String,
+    name: String,
+    priority: String,
+    peer: String,
+    active: bool,
+    last_used: Option<u64>,
+}
+
+/// The ID of the route `query` names: by ID, the start of an ID, or name.
+fn find_route(base: &str, query: &str) -> Result<String> {
+    let routes: Vec<RouteEntry> =
+        serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/routes"))?)
+            .context("reading the routes")?;
+    let q = query.to_lowercase();
+    let by_name: Vec<&RouteEntry> = routes
+        .iter()
+        .filter(|r| r.name.to_lowercase() == q)
+        .collect();
+    let found = match by_name[..] {
+        [] => routes.iter().filter(|r| r.id.starts_with(&q)).collect(),
+        _ => by_name,
+    };
+    match found[..] {
+        [r] => Ok(r.id.clone()),
+        [] => anyhow::bail!("no route {query:?}; see `orpheusctl routes`"),
+        _ => anyhow::bail!(
+            "{query:?} matches routes {}; give the ID",
+            found
+                .iter()
+                .map(|r| short(&r.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// The start of a route ID, enough to tell routes apart.
+fn short(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The routes a node runs and remembers.
+fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
+    let mut o = String::new();
+    if routes.is_empty() {
+        let _ = writeln!(o, "{}", p.mark(Level::Off, "no routes"));
+        return o;
+    }
+    let rows: Vec<[String; 5]> = routes
+        .iter()
+        .map(|r| {
+            let state = match (r.active, r.last_used) {
+                (true, _) => p.mark(Level::Good, "connected"),
+                (false, Some(t)) => {
+                    let days = now.saturating_sub(t) / 86_400;
+                    let ago = match days {
+                        0 => "today".to_owned(),
+                        1 => "yesterday".to_owned(),
+                        d => format!("{d} days ago"),
+                    };
+                    p.mark(Level::Off, &format!("remembered, last used {ago}"))
+                }
+                (false, None) => p.mark(Level::Off, "remembered"),
+            };
+            [
+                r.name.clone(),
+                short(&r.id).to_owned(),
+                r.peer.clone(),
+                r.priority.clone(),
+                state,
+            ]
+        })
+        .collect();
+    let header = ["NAME", "ID", "PEER", "PRIORITY", "STATE"];
+    table(&mut o, p, header, [false; 5], &rows);
+    o
 }
 
 /// The device ID of the Orpheus node `query` names: by ID, alias or name.
@@ -1204,7 +1323,7 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
         row(&mut o, p, "buffer", &format!("{} frames", l.level_frames));
         row(&mut o, p, "problems", &problems(p, c, &buffer_counts(l)));
     }
-    senders(&mut o, p, c, &s.senders);
+    senders(&mut o, p, c, &s.routes);
     o
 }
 
@@ -1343,10 +1462,10 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
 fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
     if senders.is_empty() {
         let mark = p.mark(Level::Off, "none");
-        heading(o, p, "Senders", Some(mark));
+        heading(o, p, "Routes", Some(mark));
         return;
     }
-    heading(o, p, "Senders", None);
+    heading(o, p, "Routes", None);
     let header = [
         "ID", "NAME", "PEER", "PACKETS", "BUFFER", "ASRC", "PROBLEMS",
     ];
@@ -1359,7 +1478,7 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             ];
             counts.extend(buffer_counts(&t.buffer));
             [
-                t.id.to_string(),
+                short(&t.id).to_owned(),
                 t.name.clone(),
                 peer_column(t),
                 c.packets(t.packets),
@@ -1555,7 +1674,7 @@ mod tests {
             "buffer": {"underruns": 0, "overruns": 0, "resyncs": 0,
             "level_frames": 1140}, "peak_dbfs": -12.04}},
             {"id": 1, "port": 5006}],
-        "senders": [{"id": 0, "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
+        "routes": [{"id": "5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01", "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
             "send_errors": 0, "realigns": 0, "asrc_ppm": 8.9,
             "buffer": {"underruns": 2, "overruns": 0, "resyncs": 0,
             "level_frames": 1120}}]
@@ -1590,11 +1709,30 @@ Receiver 0     ● receiving ssrc 5e1f02aa
 
 Receiver 1     ○ free, port 5006
 
-Senders
-  ID  NAME     PEER               PACKETS       BUFFER      ASRC  PROBLEMS
-  0   Kitchen  192.168.1.20:5004   120000  1120 frames  +8.9 ppm  2 underruns
+Routes
+  ID        NAME     PEER               PACKETS       BUFFER      ASRC  PROBLEMS
+  5c1e0b6a  Kitchen  192.168.1.20:5004   120000  1120 frames  +8.9 ppm  2 underruns
 ";
         assert_eq!(out, expected, "\n{out}");
+    }
+
+    #[test]
+    fn renders_routes() {
+        let routes: Vec<RouteEntry> = serde_json::from_str(
+            r#"[{"id": "5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01", "name": "Kitchen",
+                 "priority": "normal", "peer": "192.168.1.20:5004", "active": true},
+                {"id": "9f2d4c71-0000-4000-8000-000000000000", "name": "Kitchen",
+                 "priority": "high", "peer": "192.168.1.20:5006", "active": false,
+                 "last_used": 1000}]"#,
+        )
+        .unwrap();
+        let out = render_routes(&routes, Paint(false), 1000 + 3 * 86_400);
+        assert_eq!(
+            out,
+            "  NAME     ID        PEER               PRIORITY  STATE\n  \
+             Kitchen  5c1e0b6a  192.168.1.20:5004  normal    ● connected\n  \
+             Kitchen  9f2d4c71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n"
+        );
     }
 
     #[test]
@@ -1604,11 +1742,11 @@ Senders
         let r = s.receivers[0].stream.as_mut().unwrap();
         r.packets += 2000;
         r.late += 3;
-        s.senders[0].packets += 2000;
-        s.senders[0].buffer.underruns += 2;
-        let mut new = s.senders[0].clone();
-        new.id = 1;
-        s.senders.push(new);
+        s.routes[0].packets += 2000;
+        s.routes[0].buffer.underruns += 2;
+        let mut new = s.routes[0].clone();
+        new.id = "9f2d4c71-0000-4000-8000-000000000000".into();
+        s.routes.push(new);
         let out = render(&s.since(&prev), Paint(false), Counts::Rate(2.0));
         assert!(out.contains("  packets      1000/s\n"), "{out}");
         assert!(out.contains("  problems     1.5 late/s\n"), "{out}");
@@ -1616,10 +1754,10 @@ Senders
             out.contains("1000/s  1120 frames  +8.9 ppm  1 underrun/s\n"),
             "{out}"
         );
-        // A sender that appeared since the last sample counts from now.
+        // A route that appeared since the last sample counts from now.
         assert!(
             out.contains(
-                "  1   Kitchen  192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"
+                "  9f2d4c71  Kitchen  192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"
             ),
             "{out}"
         );
@@ -1630,7 +1768,7 @@ Senders
         let mut s: Status = serde_json::from_str(STATUS).unwrap();
         s.receivers[0].stream.as_mut().unwrap().ignored = 42;
         s.receivers[1].sender = Some("Laptop".into());
-        s.senders[0].enabled = false;
+        s.routes[0].enabled = false;
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
             out.contains("Receiver 1     ○ connected to Laptop, off\n"),
@@ -1642,7 +1780,7 @@ Senders
             "{out}"
         );
 
-        s.senders[0].receiver = Some(PeerLink {
+        s.routes[0].receiver = Some(PeerLink {
             state: "disconnected".into(),
             policy: None,
         });
@@ -1660,11 +1798,11 @@ Senders
         r.sender = Some("Laptop".into());
         r.state = Some("muted".into());
         r.priority = Some("high".into());
-        s.senders[0].receiver = Some(PeerLink {
+        s.routes[0].receiver = Some(PeerLink {
             state: "connected".into(),
             policy: Some("muted".into()),
         });
-        s.senders[0].priority = Some("high".into());
+        s.routes[0].priority = Some("high".into());
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
             out.contains("Receiver 0     ○ receiving from Laptop, muted\n"),
@@ -1721,12 +1859,12 @@ Senders
     fn shows_network_warnings() {
         let mut s: Status = serde_json::from_str(STATUS).unwrap();
         s.warnings.push(Warning {
-            message: "sender 0: Kitchen is on Wi-Fi; expect dropouts".into(),
+            message: "route Kitchen: Kitchen is on Wi-Fi; expect dropouts".into(),
         });
         s.receivers[0].stream.as_mut().unwrap().jitter_us = Some(4210);
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
-            out.contains("\nWarnings\n  ● sender 0: Kitchen is on Wi-Fi; expect dropouts\n"),
+            out.contains("\nWarnings\n  ● route Kitchen: Kitchen is on Wi-Fi; expect dropouts\n"),
             "{out}"
         );
         assert!(out.contains("  jitter       4.21 ms\n"), "{out}");

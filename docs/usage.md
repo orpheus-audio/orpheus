@@ -14,19 +14,21 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 
 | Command | Effect |
 |---|---|
-| `status` | Shows the node's ID, name, version, clock, receivers and senders. |
+| `status` | Shows the node's ID, name, version, clock, receivers and routes. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
 | `nodes` | Lists the other nodes the node found on the network, with ID, address, version and link (`wired` or `Wi-Fi`, as each node announces it). Nodes that stopped stay listed as offline. A node with an [alias](#aliases-and-pins) is shown as `Alias (Name)`. |
-| `connect PEER [--name NAME] [--priority high] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a sink called `NAME` (the peer's name if none is given), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. `--priority high` plays over the peer's other streams (see [several streams](#several-streams)). The connection is kept across restarts. |
+| `connect PEER [--name NAME] [--priority high] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a route: a sink called `NAME` (the route's name from before, else the peer's name), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. `--priority high` plays over the peer's other streams (see [several streams](#several-streams)). The route is kept across restarts. |
 | `connect PEER --send-only [--name NAME]` | Only sends; the peer's receiver is left alone. For devices without NMOS, and receivers set to accept any stream. |
-| `disconnect ID` | Stops a sender, removes its sink and disconnects the peer's receiver. The ID is shown by `connect` and `status`. |
+| `routes` | Lists the routes: the ones that run and the ones [remembered](#routes) from before. |
+| `disconnect ROUTE` | Stops a route, removes its sink and disconnects the peer's receiver. The route is remembered. `ROUTE` is its name, or its ID or the start of it, as `routes` shows. |
+| `forget ROUTE` | Forgets a route, so that the next `connect` starts a new one; a route that runs is disconnected first. |
 | `alias NODE ALIAS` | Gives another node a name of your own, shown instead of the one it announces (see [aliases and pins](#aliases-and-pins)). `alias NODE --remove` removes it. |
 | `pin NODE`, `unpin NODE` | Keeps another node listed while it is offline, also after a restart, or stops doing so. |
 | `outputs` | Lists the node's outputs with their [types](#output-types), and which receivers play on each. |
 | `set-type OUTPUT TYPE` | Sets what kind of device an output is; `auto` goes back to the detected type. `OUTPUT` is the name or description from `outputs`, or a part of either that only one output has. |
 
 `--json` prints the node's JSON responses instead of text: the status as the
-[HTTP API](#http-api) returns it, the node list, the outputs, and after `connect` the new sender (`id`, `name`,
+[HTTP API](#http-api) returns it, the node list, the outputs, the routes, and after `connect` the route (`id`, `name`,
 `destination`, and the peer's `receiver`). Scripts
 should use it, because the text output may change. With `--watch` it prints
 one line per sample:
@@ -53,7 +55,7 @@ Every connection gets a receiver of its own: a node always has one free
 receiver more than it has connections, up to `[receiver]
 max` (see [several streams](#several-streams)). A node connects to the same
 peer only once per priority; a second `connect` fails with `409 already
-connected to … as sender N`, while one with another `--priority` is
+connected to … as route ID`, while one with another `--priority` is
 allowed.
 
 `PEER` is one of:
@@ -117,9 +119,26 @@ A receiver plays only the sender connected to it, unless it is set to
 A host name that resolves to both IPv4 and IPv6 is reached over IPv4, which
 every receiver listens on.
 
-Senders and their connections are kept in `routes.json` in the [state
-directory](configuration.md#files). When `orpheusd` starts again it
-recreates the senders under the same IDs and sinks.
+### Routes
+
+A route is what `connect` makes: a sink on this node, streamed to a
+receiver of the peer. Its ID stays the same as long as the node remembers
+the route, and everything that should be the same next time hangs on it:
+
+- the sink's machine name, `orpheus.send.<ID>`, so that applications the
+  desktop's volume control moved there find it again, as does the
+  [output type](#output-types) set for it;
+- the source the stream announces (`a=x-orpheus-source` in the SDP file,
+  and its NMOS source ID): the peer remembers by it on which output and at
+  what volume the stream plays.
+
+`disconnect` stops a route but remembers it. The next `connect` to the
+same peer with the same priority brings it back with its ID and its name,
+so the stream plays on the peer exactly as before. `forget` drops it.
+Routes are kept in `routes.json` in the [state
+directory](configuration.md#files); `orpheusd` starts the ones that ran
+again when it starts. How long disconnected routes are remembered is set
+in [`[routes]`](configuration.md#routes).
 
 ## Several streams
 
@@ -195,7 +214,7 @@ or address. They are local: other nodes don't see them.
 desk  B73AQ0P0  orpheusd 0.0.1
 
 Warnings
-  ● sender 0: Kitchen is on Wi-Fi; expect dropouts
+  ● route Kitchen: Kitchen is on Wi-Fi; expect dropouts
 
 Clock          ● PTP, settled
   interface    enp3s0 (IPv4)
@@ -328,9 +347,10 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | Method and path | Effect |
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows); see [below](#the-status-json). |
-| `POST /x-orpheus/v1/senders` | Starts a sender and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": 0, "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
-| `DELETE /x-orpheus/v1/senders/{id}` | Stops a sender and disconnects the peer's receiver. Returns `204`, or `404` if there is no such sender. |
-| `GET /x-orpheus/v1/senders/{id}/sdp` | The sender's stream as an SDP file (`application/sdp`). |
+| `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, and for remembered ones `last_used` (Unix seconds). |
+| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "<uuid>", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
+| `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
+| `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
 | `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receivers`: the IDs of the receivers that play there. |
 | `PUT /x-orpheus/v1/outputs/{name}` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
@@ -354,8 +374,8 @@ The same OpenAPI document is printed by `orpheusd --openapi`.
      "stream": {"listen": "[::]:5004", "packets": 120000, "peak_dbfs": -12.0, "…": "…"}},
     {"id": 1, "uuid": "…", "port": 5006, "priority": "normal", "output": "hifi"}
   ],
-  "senders": [
-    {"id": 0, "name": "Kitchen", "peer": "192.168.1.20:5004", "priority": "normal",
+  "routes": [
+    {"id": "5c1e0b6a-…", "name": "Kitchen", "peer": "192.168.1.20:5004", "priority": "normal",
      "packets": 120000, "…": "…",
      "receiver": {"api": "http://192.168.1.20:7480", "id": "…",
                   "state": "connected", "policy": "muted"}}
@@ -371,7 +391,7 @@ The same OpenAPI document is printed by `orpheusd --openapi`.
   is there while the receiver runs; `state` is what the
   [policy](#several-streams) does to it: `silent`, `playing`, `muted` or
   `ducked`.
-- `senders[].receiver`: the peer's receiver, absent with `send_only`.
+- `routes`: the routes that run. `routes[].receiver`: the peer's receiver, absent with `send_only`.
   `state` is `connecting`, `connected`, `disconnected` or `unreachable`;
   `policy` is `muted` or `ducked` while the peer holds the stream back.
 - `warnings`: a list of `{kind, on, sender, message}`, see
@@ -379,7 +399,7 @@ The same OpenAPI document is printed by `orpheusd --openapi`.
 
 ```sh
 curl -s localhost:7480/x-orpheus/v1/status | jq .clock
-curl -s -X POST localhost:7480/x-orpheus/v1/senders \
+curl -s -X POST localhost:7480/x-orpheus/v1/routes \
   -H 'content-type: application/json' -d '{"peer": "Kitchen"}'
 ```
 
@@ -472,19 +492,21 @@ L24/48000/2, payload type 97, 1 ms packets, the PTP grandmaster and domain
 (`ts-refclk`) and `mediaclk:direct=0`:
 
 ```sh
-curl -s localhost:7480/x-orpheus/v1/senders/0/sdp
+curl -s localhost:7480/x-orpheus/v1/routes/<id>/sdp
 ```
 
 Without PTP the SDP names the sender's own clock (`ts-refclk:localmac=…`).
 The session name (`s=`) is the node's name; receivers name their playback
-stream after it. Two attributes are Orpheus' own, and other receivers
+stream after it. Three attributes are Orpheus' own, and other receivers
 ignore them: `a=x-orpheus-node:<id>` names the sending node, so its
-receiver can check back that the sender still exists, and
+receiver can check back that the sender still exists,
+`a=x-orpheus-source:<id>` names what is sent (the [route](#routes)), and
 `a=x-orpheus-priority:high` marks a [high-priority](#several-streams)
 connection.
 
-Resource IDs are derived from the node ID, so they stay the same across
-restarts. Each receiver carries tags of its own:
+Resource IDs are derived from the node ID, and a sender's from its
+route, so they stay the same across restarts and reconnects. A route's
+NMOS source ID is the route ID. Each receiver carries tags of its own:
 
 - `urn:x-orpheus:form-factor`: the [type](#output-types) of the output it
   plays on;

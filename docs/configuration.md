@@ -7,7 +7,7 @@ A node keeps its files where the XDG base directory specification says:
 ```text
 ~/.config/orpheus/config.toml   configuration, optional, hand-edited
 ~/.local/state/orpheus/id       device ID, created on first start
-~/.local/state/orpheus/routes.json  senders and connections, kept across restarts
+~/.local/state/orpheus/routes.json  routes and connections, kept across restarts
 ~/.local/state/orpheus/outputs.json types set for outputs (`orpheusctl set-type`)
 ~/.local/state/orpheus/peers.json   aliases and pins of other nodes
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
@@ -87,7 +87,7 @@ settle_threshold_us = 100
 | `listen` | `[::]:7480` | Address and port of the HTTP API. `[::]` accepts IPv4 and IPv6; where IPv6 is disabled the node falls back to `0.0.0.0`. Use `127.0.0.1:7480` to keep the API local. |
 
 The API has no authentication yet. Anyone who can reach the port can start
-and stop senders.
+and stop routes.
 
 ### `[audio]`
 
@@ -156,13 +156,24 @@ ignored until the first has been quiet for a second.
 Receivers play on the default output. To play a stream on another one,
 move it (named after the sending node, else "Orpheus") in `pavucontrol`
 or with `wpctl`; WirePlumber remembers the output and the volume per
-sending node. Other nodes are told what kind of device that output is;
+source, which for another Orpheus node is its [route](usage.md#routes). Other nodes are told what kind of device that output is;
 see [output types](usage.md#output-types). Types are set per output over
 the API, not in this file.
 
 Which streams go where is routing, which belongs to the API, not to this
-file: senders and connections are kept in `routes.json` in the state
+file: routes and connections are kept in `routes.json` in the state
 directory and restored at start.
+
+### `[routes]`
+
+How long a disconnected [route](usage.md#routes) is remembered, so that
+connecting the same peer again brings it back as it was. Routes to
+[pinned](usage.md#aliases-and-pins) nodes are kept regardless.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_age_days` | `365` | Forget a route this many days after it last ran. |
+| `max_entries` | `100` | Forget the oldest routes beyond this many. |
 
 ### `[ptp]`
 

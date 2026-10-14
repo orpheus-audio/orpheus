@@ -103,7 +103,7 @@ const BASE: &str = "/x-orpheus/v1";
         (name = "settings", description = "Settings that can change while the node runs"),
         (name = "outputs", description = "The audio system's outputs and their types"),
         (name = "receivers", description = "Streams this node plays"),
-        (name = "senders", description = "Streams this node sends"),
+        (name = "routes", description = "Where this node sends: a sink each, streamed to a peer"),
         (name = "discovery", description = "Other nodes on the network"),
         (name = "events", description = "State pushed over a WebSocket"),
     ),
@@ -133,7 +133,8 @@ struct Status {
     duck_db: f32,
     /// The receivers: one per connection and a free one.
     receivers: Vec<ReceiverEntry>,
-    senders: Vec<SenderEntry>,
+    /// The routes that run.
+    routes: Vec<SenderEntry>,
     /// Problems with the network paths of the clock and the streams.
     warnings: Vec<crate::health::Warning>,
 }
@@ -236,7 +237,8 @@ pub enum ClockSource {
 
 #[derive(Serialize, ToSchema)]
 struct SenderEntry {
-    #[schema(value_type = u32)]
+    /// Route ID.
+    #[schema(value_type = String)]
     id: SenderId,
     #[serde(flatten)]
     status: SenderStatus,
@@ -248,6 +250,31 @@ struct SenderEntry {
     receiver: Option<crate::connection::PeerLink>,
 }
 
+/// A route this node runs or remembers.
+#[derive(Serialize, ToSchema)]
+pub struct RouteEntry {
+    /// Stays the same while the route is remembered; it also names the
+    /// source the receivers recognize.
+    #[schema(value_type = String)]
+    id: SenderId,
+    /// Name of the sink.
+    name: String,
+    #[schema(value_type = String, example = "normal")]
+    priority: Priority,
+    /// Where it sends, or sent to.
+    #[schema(value_type = String, example = "192.168.1.20:5004")]
+    peer: SocketAddr,
+    /// The peer's Orpheus device ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    /// Whether it runs; otherwise it is remembered from before and comes
+    /// back when connecting the same peer with the same priority.
+    active: bool,
+    /// When a remembered route last ran, in seconds since the Unix epoch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_used: Option<u64>,
+}
+
 #[derive(Deserialize, ToSchema)]
 struct NewSender {
     /// The node to send to: its name or ID as discovered, its host name or
@@ -256,7 +283,8 @@ struct NewSender {
     /// IPv6 with a port as `[addr]:port`.
     #[schema(example = "Kitchen")]
     peer: String,
-    /// Name of the sink; defaults to the peer's name.
+    /// Name of the sink; defaults to the name the route had before, else
+    /// the peer's name.
     name: Option<String>,
     /// Only send; don't connect a receiver on the peer. For receivers
     /// without an NMOS API, or set to accept any stream.
@@ -275,7 +303,8 @@ struct NewSender {
 
 #[derive(Serialize, ToSchema)]
 struct Created {
-    #[schema(value_type = u32)]
+    /// Route ID; the one it had if it was remembered.
+    #[schema(value_type = String)]
     id: SenderId,
     /// Name of the sink.
     name: String,
@@ -291,7 +320,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(status))
         .routes(routes!(settings, change_settings))
-        .routes(routes!(add_sender))
+        .routes(routes!(list_routes, add_sender))
         .routes(routes!(remove_sender))
         .routes(routes!(sender_sdp))
         .routes(routes!(nodes))
@@ -344,6 +373,7 @@ pub fn snapshot(node: &Node, topic: Topic) -> serde_json::Value {
         Topic::Nodes => serde_json::to_value(nodes_of(node)),
         Topic::Outputs => serde_json::to_value(outputs_of(node)),
         Topic::Settings => serde_json::to_value(SettingsView::of(&node.settings.lock().unwrap())),
+        Topic::Routes => serde_json::to_value(routes_of(node)),
     }
     .unwrap_or_default()
 }
@@ -417,7 +447,7 @@ fn status_of(node: &Node) -> Status {
         policy: settings.policy,
         duck_db: settings.duck_db,
         receivers,
-        senders: engine
+        routes: engine
             .senders
             .into_iter()
             .map(|(id, status)| SenderEntry {
@@ -431,18 +461,59 @@ fn status_of(node: &Node) -> Status {
     }
 }
 
+fn routes_of(node: &Node) -> Vec<RouteEntry> {
+    let engine = node
+        .engine
+        .as_ref()
+        .map(|e| e.lock().unwrap().status().senders)
+        .unwrap_or_default();
+    let conns = node.connections.lock().unwrap();
+    let active = engine.into_iter().map(|(id, s)| RouteEntry {
+        id,
+        name: s.name,
+        priority: conns.sender_priority(id),
+        peer: s.peer,
+        node: conns.sender_node(id),
+        active: true,
+        last_used: None,
+    });
+    let cached = conns.cached().iter().map(|c| RouteEntry {
+        id: c.id,
+        name: c.name.clone(),
+        priority: c.priority,
+        peer: c.peer,
+        node: c.node.clone(),
+        active: false,
+        last_used: Some(c.used),
+    });
+    active.chain(cached).collect()
+}
+
+/// The routes that run, then the ones remembered, most recently used
+/// first.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/routes",
+    tag = "routes",
+    responses((status = OK, description = "Routes", body = Vec<RouteEntry>)),
+)]
+async fn list_routes(State(node): State<Arc<Node>>) -> Json<Vec<RouteEntry>> {
+    Json(routes_of(&node))
+}
+
 /// Sends this node's audio to a peer: creates a sink named after it and
 /// streams what is played into it to a free receiver of the peer, which is
 /// connected to the sender through the peer's IS-05 API. Both ends are
 /// activated through IS-05, where they can then be redirected or paused.
-/// The sender is kept across restarts.
+/// The route is kept across restarts. A route to the peer with the same
+/// priority remembered from before comes back with its ID and name.
 #[utoipa::path(
     post,
-    path = "/x-orpheus/v1/senders",
-    tag = "senders",
+    path = "/x-orpheus/v1/routes",
+    tag = "routes",
     request_body = NewSender,
     responses(
-        (status = CREATED, description = "Sender started", body = Created),
+        (status = CREATED, description = "Route started", body = Created),
         (status = BAD_REQUEST, description = "The peer does not resolve", body = String, content_type = "text/plain"),
         (status = CONFLICT, description = "The peer has no free receiver, or this node is already connected to it with the same priority", body = String, content_type = "text/plain"),
         (status = BAD_GATEWAY, description = "The peer cannot be reached or refused the connection", body = String, content_type = "text/plain"),
@@ -483,35 +554,47 @@ async fn add_sender(
             receiver: Some(c.receiver),
         }
     };
-    tracing::info!(id = created.id, peer = %created.destination, name = %created.name, "sender started");
+    tracing::info!(id = %created.id, peer = %created.destination, name = %created.name, "sender started");
     Ok((StatusCode::CREATED, Json(created)))
 }
 
-/// Stops a sender, removes its sink and forgets it. The peer's receiver it
-/// was connected to is disconnected, if it can be reached.
+#[derive(Deserialize, utoipa::IntoParams)]
+struct RemoveQuery {
+    /// Also forget the route, so that connecting the peer again starts a
+    /// new one; works on remembered routes too.
+    #[serde(default)]
+    forget: bool,
+}
+
+/// Disconnects a route: stops its sender and removes its sink. The peer's
+/// receiver it was connected to is disconnected, if it can be reached. The
+/// route is remembered unless `forget` is set.
 #[utoipa::path(
     delete,
-    path = "/x-orpheus/v1/senders/{id}",
-    tag = "senders",
-    params(("id" = u32, Path, description = "Sender ID from the status")),
+    path = "/x-orpheus/v1/routes/{id}",
+    tag = "routes",
+    params(("id" = String, Path, description = "Route ID"), RemoveQuery),
     responses(
-        (status = NO_CONTENT, description = "Stopped"),
-        (status = NOT_FOUND, description = "No such sender", body = String, content_type = "text/plain"),
+        (status = NO_CONTENT, description = "Disconnected or forgotten"),
+        (status = NOT_FOUND, description = "No such route", body = String, content_type = "text/plain"),
         (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
     ),
 )]
 async fn remove_sender(
     State(node): State<Arc<Node>>,
     Path(id): Path<SenderId>,
+    Query(q): Query<RemoveQuery>,
 ) -> Result<StatusCode, ApiError> {
-    let removed = tokio::task::spawn_blocking(move || crate::connection::remove_sender(&node, id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let forget = q.forget;
+    let removed =
+        tokio::task::spawn_blocking(move || crate::connection::remove_sender(&node, id, forget))
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
     if removed {
-        tracing::info!(id, "sender stopped");
+        tracing::info!(%id, forget, "route disconnected");
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, format!("no sender {id}")))
+        Err((StatusCode::NOT_FOUND, format!("no route {id}")))
     }
 }
 
@@ -519,12 +602,12 @@ async fn remove_sender(
 /// sender's NMOS resource links to it as `manifest_href`.
 #[utoipa::path(
     get,
-    path = "/x-orpheus/v1/senders/{id}/sdp",
-    tag = "senders",
-    params(("id" = u32, Path, description = "Sender ID from the status")),
+    path = "/x-orpheus/v1/routes/{id}/sdp",
+    tag = "routes",
+    params(("id" = String, Path, description = "Route ID")),
     responses(
         (status = OK, description = "The SDP file", body = String, content_type = "application/sdp"),
-        (status = NOT_FOUND, description = "No such sender", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "No such route running", body = String, content_type = "text/plain"),
     ),
 )]
 async fn sender_sdp(
@@ -535,7 +618,7 @@ async fn sender_sdp(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(|sdp| ([(header::CONTENT_TYPE, "application/sdp")], sdp))
-        .ok_or((StatusCode::NOT_FOUND, format!("no sender {id}")))
+        .ok_or((StatusCode::NOT_FOUND, format!("no route {id} running")))
 }
 
 /// The settings in effect and where each comes from.
@@ -772,10 +855,10 @@ struct EventsQuery {
 /// Opens a WebSocket that pushes snapshots instead of being polled. Each
 /// text message is one topic's full state, as its GET returns it:
 /// `{"topic": "status", "data": {…}}`. The topics are `status`, `nodes`
-/// (`null` while mDNS is not running), `outputs` and `settings`. Every
-/// topic asked for comes once on connecting, then again whenever it
-/// changed: `nodes` and `settings` within 250 ms, `status` and `outputs`
-/// at most once a second. Messages from the client are ignored.
+/// (`null` while mDNS is not running), `outputs`, `settings` and `routes`.
+/// Every topic asked for comes once on connecting, then again whenever it
+/// changed: `nodes`, `settings` and `routes` within 250 ms, `status` and
+/// `outputs` at most once a second. Messages from the client are ignored.
 #[utoipa::path(
     get,
     path = "/x-orpheus/v1/events",
@@ -1030,9 +1113,9 @@ mod tests {
                 "/x-orpheus/v1/outputs",
                 "/x-orpheus/v1/outputs/{name}",
                 "/x-orpheus/v1/receivers/{id}/output",
-                "/x-orpheus/v1/senders",
-                "/x-orpheus/v1/senders/{id}",
-                "/x-orpheus/v1/senders/{id}/sdp",
+                "/x-orpheus/v1/routes",
+                "/x-orpheus/v1/routes/{id}",
+                "/x-orpheus/v1/routes/{id}/sdp",
                 "/x-orpheus/v1/settings",
                 "/x-orpheus/v1/status",
             ]

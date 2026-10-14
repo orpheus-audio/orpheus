@@ -32,7 +32,8 @@ struct Loopback {
     stats: Arc<PortStats>,
 }
 
-pub type SenderId = u32;
+/// Senders are named by the route they serve, which outlives them.
+pub type SenderId = uuid::Uuid;
 pub type ReceiverId = u32;
 
 /// A snapshot of everything the engine runs.
@@ -46,7 +47,6 @@ pub struct EngineStatus {
 pub struct Engine {
     // Routes go before the backend they live in.
     senders: BTreeMap<SenderId, Sender>,
-    next_sender: SenderId,
     receivers: BTreeMap<ReceiverId, Receiver>,
     loopback: Option<Loopback>,
     clock: Arc<dyn Clock>,
@@ -57,7 +57,6 @@ impl Engine {
     pub fn new(backend: Box<dyn AudioBackend>, clock: Arc<dyn Clock>) -> Self {
         Self {
             senders: BTreeMap::new(),
-            next_sender: 0,
             receivers: BTreeMap::new(),
             loopback: None,
             clock,
@@ -122,24 +121,10 @@ impl Engine {
         self.receivers.remove(&id).is_some()
     }
 
-    /// The ID the next sender will get, for naming it.
-    pub fn next_sender_id(&self) -> SenderId {
-        self.next_sender
-    }
-
-    /// Starts a sender and returns its ID.
-    pub fn add_sender(&mut self, cfg: &SenderConfig) -> Result<SenderId, BackendError> {
-        let id = self.next_sender;
-        self.insert_sender(id, cfg)?;
-        Ok(id)
-    }
-
-    /// Starts a sender under a given ID, e.g. one restored from before a
-    /// restart, replacing a sender with that ID.
+    /// Starts a sender, replacing one with the same ID.
     pub fn insert_sender(&mut self, id: SenderId, cfg: &SenderConfig) -> Result<(), BackendError> {
         self.senders.remove(&id);
         let sender = Sender::start(self.backend.as_mut(), self.clock.clone(), cfg)?;
-        self.next_sender = self.next_sender.max(id + 1);
         self.senders.insert(id, sender);
         Ok(())
     }

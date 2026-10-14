@@ -67,15 +67,18 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
         .unwrap();
     let listen = engine.status().receivers[0].1.listen;
     engine
-        .add_sender(&SenderConfig {
-            name: "tx".into(),
-            description: "tx".into(),
-            format,
-            encoding: Encoding::L24,
-            peer: listen,
-            remote: OutputType::Generic,
-            block_frames: Some(QUANTUM as u32),
-        })
+        .insert_sender(
+            SenderId::from_u128(1),
+            &SenderConfig {
+                name: "tx".into(),
+                description: "tx".into(),
+                format,
+                encoding: Encoding::L24,
+                peer: listen,
+                remote: OutputType::Generic,
+                block_frames: Some(QUANTUM as u32),
+            },
+        )
         .unwrap();
     let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
     let mut playback = fake.playbacks.lock().unwrap().pop().unwrap();
@@ -198,16 +201,20 @@ fn routes_and_filters_change_at_runtime() {
         )
         .unwrap();
     let listen = engine.status().receivers[0].1.listen;
-    let id = engine
-        .add_sender(&SenderConfig {
-            name: "tx".into(),
-            description: "tx".into(),
-            format: AudioFormat::AES67,
-            encoding: Encoding::L24,
-            peer: listen,
-            remote: OutputType::Generic,
-            block_frames: Some(QUANTUM as u32),
-        })
+    let id = SenderId::from_u128(1);
+    engine
+        .insert_sender(
+            id,
+            &SenderConfig {
+                name: "tx".into(),
+                description: "tx".into(),
+                format: AudioFormat::AES67,
+                encoding: Encoding::L24,
+                peer: listen,
+                remote: OutputType::Generic,
+                block_frames: Some(QUANTUM as u32),
+            },
+        )
         .unwrap();
     let (taken, ignored) = counts_over(&engine, 100);
     assert!(taken > 50 && ignored == 0, "{taken} {ignored}");
@@ -256,7 +263,11 @@ fn routes_and_filters_change_at_runtime() {
     thread::sleep(Duration::from_millis(20));
     let (taken, _) = counts_over(&engine, 100);
     assert!(taken > 50, "{taken}");
-    assert!(!engine.set_sender_route(id + 1, route).unwrap());
+    assert!(
+        !engine
+            .set_sender_route(SenderId::from_u128(2), route)
+            .unwrap()
+    );
 }
 
 /// Two receivers, one muted: the muted one plays silence but still hears
@@ -287,15 +298,18 @@ fn gain_mutes_and_the_meter_hears_through_it() {
     }
     let listen = engine.status().receivers[0].1.listen;
     engine
-        .add_sender(&SenderConfig {
-            name: "tx".into(),
-            description: "tx".into(),
-            format,
-            encoding: Encoding::L24,
-            peer: listen,
-            remote: OutputType::Generic,
-            block_frames: Some(QUANTUM as u32),
-        })
+        .insert_sender(
+            SenderId::from_u128(1),
+            &SenderConfig {
+                name: "tx".into(),
+                description: "tx".into(),
+                format,
+                encoding: Encoding::L24,
+                peer: listen,
+                remote: OutputType::Generic,
+                block_frames: Some(QUANTUM as u32),
+            },
+        )
         .unwrap();
     let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
     let mut playback = fake.playbacks.lock().unwrap().remove(0);

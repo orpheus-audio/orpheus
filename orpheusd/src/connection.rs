@@ -3,10 +3,16 @@
 //!
 //! Each port has staged parameters, which controllers patch, and active
 //! ones, which the engine runs. Staged parameters become active at once or
-//! at a scheduled time. `POST /x-orpheus/v1/senders` creates a sender and
+//! at a scheduled time. `POST /x-orpheus/v1/routes` creates a sender and
 //! activates its destination the same way; unless asked to only send, it
 //! also connects a free receiver on the peer to it, through the peer's
 //! IS-05 API, and disconnects it again when the sender goes.
+//!
+//! A sender serves a route, and is named by the route's ID: its sink, its
+//! NMOS resources and the source its SDP file announces. A disconnected
+//! route is remembered (`[routes]` limits how long), and connecting the
+//! same peer with the same priority again brings it back under its ID, so
+//! that applications find the same sink and receivers the same source.
 //!
 //! Each connection has a receiver of its own, and there is always one free
 //! receiver more, up to `[receiver] max`. Receiver `k` (NMOS ID from
@@ -48,7 +54,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::Node;
-use crate::config::{Accept, RTP_PORT};
+use crate::config::{Accept, RTP_PORT, RoutesConfig};
 use crate::nmos::FORMAT;
 use crate::nmos::{self, error};
 use crate::outputs;
@@ -78,6 +84,9 @@ pub struct Connections {
     free_since: BTreeMap<ReceiverId, Instant>,
     /// What each sender is connected to.
     links: BTreeMap<SenderId, Link>,
+    /// The routes remembered while they don't run, most recent first.
+    cached: Vec<Cached>,
+    limits: RoutesConfig,
     /// Where the active parameters are saved.
     path: PathBuf,
     /// Numbers scheduled activations, so a cancelled one never fires.
@@ -147,7 +156,53 @@ enum PortId {
 #[derive(Default, Serialize, Deserialize)]
 struct Saved {
     senders: Vec<SavedSender>,
+    #[serde(default)]
+    cached: Vec<Cached>,
     receivers: BTreeMap<ReceiverId, ReceiverParams>,
+}
+
+/// A route remembered while it doesn't run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Cached {
+    pub id: SenderId,
+    /// Name of the sink.
+    pub name: String,
+    /// The user named the sink; otherwise it follows the peer's name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    named: bool,
+    #[serde(default)]
+    pub priority: Priority,
+    /// The peer's API; absent if the route only sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api: Option<String>,
+    /// The peer's Orpheus device ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Where it sent to.
+    pub peer: SocketAddr,
+    /// When it last ran, in seconds since the Unix epoch.
+    pub used: u64,
+}
+
+impl Cached {
+    /// Whether it is the route to `peer`'s receivers with `priority`.
+    fn connects(&self, peer: &peer::Peer, priority: Priority) -> bool {
+        self.priority == priority
+            && (self.api.as_deref() == Some(&peer.api)
+                || (self.api.is_some() && self.node.is_some() && self.node == peer.node))
+    }
+
+    /// Whether it is the route that only sends to `peer` with `priority`.
+    fn sends(&self, peer: SocketAddr, priority: Priority) -> bool {
+        self.priority == priority && self.api.is_none() && self.peer == peer
+    }
+}
+
+/// Seconds since the Unix epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 #[derive(Serialize, Deserialize)]
@@ -239,12 +294,14 @@ pub struct Connected {
 }
 
 impl Connections {
-    pub fn new(path: PathBuf) -> Self {
+    pub fn new(path: PathBuf, limits: RoutesConfig) -> Self {
         Self {
             senders: BTreeMap::new(),
             receivers: BTreeMap::new(),
             free_since: BTreeMap::new(),
             links: BTreeMap::new(),
+            cached: Vec::new(),
+            limits,
             path,
             generation: 0,
         }
@@ -288,9 +345,37 @@ impl Connections {
             .collect()
     }
 
+    /// The routes remembered while they don't run, most recent first.
+    pub fn cached(&self) -> &[Cached] {
+        &self.cached
+    }
+
+    /// Forgets cached routes beyond the limits, oldest first; routes to
+    /// pinned nodes stay.
+    fn evict(&mut self, peers: &Peers) {
+        let max_age = u64::from(self.limits.max_age_days) * 86_400;
+        let max_entries = self.limits.max_entries as usize;
+        let now = unix_now();
+        let pinned = |c: &Cached| c.node.as_deref().is_some_and(|n| peers.pinned(n));
+        self.cached.sort_by_key(|c| std::cmp::Reverse(c.used));
+        let mut kept = 0;
+        self.cached.retain(|c| {
+            if pinned(c) {
+                return true;
+            }
+            kept += 1;
+            kept <= max_entries && now.saturating_sub(c.used) <= max_age
+        });
+    }
+
     /// The senders routed here.
     pub fn sender_ids(&self) -> Vec<SenderId> {
         self.senders.keys().copied().collect()
+    }
+
+    /// The Orpheus device ID of the peer sender `id` is connected to.
+    pub fn sender_node(&self, id: SenderId) -> Option<String> {
+        self.links.get(&id)?.receiver.as_ref()?.node.clone()
     }
 
     /// The priority each sender announces.
@@ -349,6 +434,7 @@ impl Connections {
                     })
                 })
                 .collect(),
+            cached: self.cached.clone(),
             receivers: self
                 .receivers
                 .iter()
@@ -386,6 +472,8 @@ pub fn restore(node: &Node) {
         }),
         Err(_) => Saved::default(),
     };
+    conns.cached = saved.cached;
+    conns.evict(&node.peers.lock().unwrap());
     let mut engine = engine.lock().unwrap();
 
     if node.receiver.enabled {
@@ -417,13 +505,13 @@ pub fn restore(node: &Node) {
             .and_then(|()| apply_sender(&mut engine, s.id, &s.requested));
         match started {
             Ok(active) => {
-                tracing::info!(id = s.id, %peer, "sender restored");
+                tracing::info!(id = %s.id, %peer, "sender restored");
                 conns.senders.insert(s.id, Port::new(s.requested, active));
                 conns.links.insert(s.id, s.link);
             }
             Err((_, e)) => {
                 engine.remove_sender(s.id);
-                tracing::warn!(id = s.id, %peer, error = %e, "restoring sender");
+                tracing::warn!(id = %s.id, %peer, error = %e, "restoring sender");
             }
         }
     }
@@ -457,25 +545,37 @@ fn destination(p: &SenderParams) -> Option<SocketAddr> {
 }
 
 /// Starts a sender to `peer` and activates that destination, without
-/// telling the peer.
+/// telling the peer. A route that only sent there with that priority
+/// before comes back under its ID.
 pub fn add_sender(
     node: &Node,
     peer: SocketAddr,
     name: String,
     priority: Priority,
 ) -> Result<SenderId, Fail> {
+    let cached = node
+        .connections
+        .lock()
+        .unwrap()
+        .cached
+        .iter()
+        .find(|c| c.sends(peer, priority))
+        .cloned();
     let link = Link {
         named: true,
         priority,
         ..Link::default()
     };
-    start_sender(node, peer, name, link)
+    let id = cached.map_or_else(Uuid::new_v4, |c| c.id);
+    start_sender(node, id, peer, name, link)
 }
 
 /// Connects this node to a peer, both ends: picks a free receiver there,
 /// starts a sender to it and connects the receiver to the sender. If the
 /// receiver refuses, the sender goes again. A second connection to the
-/// same peer is refused unless it has another priority.
+/// same peer is refused unless it has another priority. A route to the
+/// peer with that priority remembered from before comes back under its ID,
+/// and with its name unless another is given.
 pub fn connect(
     node: &Node,
     peer: &str,
@@ -485,7 +585,7 @@ pub fn connect(
 ) -> Result<Connected, Fail> {
     let found = peer::resolve(node, peer)?;
     let shown = found.name.clone().unwrap_or_else(|| peer.to_owned());
-    let ours: Vec<Uuid> = {
+    let (ours, cached) = {
         let conns = node.connections.lock().unwrap();
         let same = conns.links.iter().find(|(_, l)| {
             l.priority == priority && l.receiver.as_ref().is_some_and(|r| r.on(&found))
@@ -493,18 +593,28 @@ pub fn connect(
         if let Some((n, _)) = same {
             return Err((
                 StatusCode::CONFLICT,
-                format!("already connected to {shown} as sender {n}"),
+                format!("already connected to {shown} as route {n}"),
             ));
         }
-        conns
+        let ours: Vec<Uuid> = conns
             .senders
             .keys()
             .map(|&n| uuid_of(node, PortId::Sender(n)))
-            .collect()
+            .collect();
+        let cached = conns
+            .cached
+            .iter()
+            .find(|c| c.connects(&found, priority))
+            .cloned();
+        (ours, cached)
     };
     let target = peer::find_receiver(&found, &ours, force)?;
-    let named = name.is_some();
-    let name = name.unwrap_or(shown);
+    let (named, name) = match (name, &cached) {
+        (Some(n), _) => (true, n),
+        (None, Some(c)) if c.named => (true, c.name.clone()),
+        (None, _) => (false, shown),
+    };
+    let id = cached.as_ref().map_or_else(Uuid::new_v4, |c| c.id);
     let to = PeerReceiver {
         api: found.api.clone(),
         id: target.receiver,
@@ -520,8 +630,9 @@ pub fn connect(
         output: target.output,
         receiver: Some(to.clone()),
     };
-    let id = start_sender(
+    start_sender(
         node,
+        id,
         SocketAddr::new(found.ip, target.port),
         name.clone(),
         link,
@@ -532,7 +643,7 @@ pub fn connect(
         }
         // Another sender connected the receiver at the same moment.
         tracing::info!(
-            id,
+            %id,
             "another sender took the peer's receiver; trying another"
         );
         let again = peer::find_receiver(&found, &ours, false)?;
@@ -552,7 +663,7 @@ pub fn connect(
     let target = match attached {
         Ok(t) => t,
         Err(e) => {
-            stop_sender(node, id)?;
+            stop_sender(node, id, cached.is_some())?;
             return Err(e);
         }
     };
@@ -627,7 +738,7 @@ fn move_to(node: &Node, id: SenderId, to: PeerReceiver, destination: SocketAddr)
     let moved = retarget(node, id, to.clone(), destination).and_then(|()| attach(node, id, &to));
     let ok = matches!(moved, Ok(true));
     if let Err((_, e)) = &moved {
-        tracing::warn!(id, error = %e, "connecting the peer's receiver");
+        tracing::warn!(%id, error = %e, "connecting the peer's receiver");
     }
     if let Some(link) = node.connections.lock().unwrap().links.get_mut(&id) {
         link.displaced &= !ok;
@@ -643,10 +754,17 @@ fn move_to(node: &Node, id: SenderId, to: PeerReceiver, destination: SocketAddr)
     ok
 }
 
-fn start_sender(node: &Node, peer: SocketAddr, name: String, link: Link) -> Result<SenderId, Fail> {
+/// Starts the sender of route `id`, taking it from the cache if it was
+/// there.
+fn start_sender(
+    node: &Node,
+    id: SenderId,
+    peer: SocketAddr,
+    name: String,
+    link: Link,
+) -> Result<SenderId, Fail> {
     let mut conns = node.connections.lock().unwrap();
     let mut engine = lock_engine(node)?;
-    let id = engine.next_sender_id();
     let remote = sink_type(node, id, &link);
     engine
         .insert_sender(id, &sender_config(node, id, name, peer, remote))
@@ -677,23 +795,34 @@ fn start_sender(node: &Node, peer: SocketAddr, name: String, link: Link) -> Resu
     };
     conns.senders.insert(id, Port::new(params, active));
     conns.links.insert(id, link);
+    conns.cached.retain(|c| c.id != id);
     conns.save(Some(&engine));
     Ok(id)
 }
 
-/// Stops a sender and disconnects the peer's receiver we connected to it;
-/// false if there is no such sender. The sender goes even if the peer
-/// cannot be reached.
-pub fn remove_sender(node: &Node, id: SenderId) -> Result<bool, Fail> {
+/// Disconnects route `id`: stops its sender and disconnects the peer's
+/// receiver we connected to it, even if the peer cannot be reached. The
+/// route is remembered, unless `forget`, which also drops a route that
+/// doesn't run. False if there is no such route.
+pub fn remove_sender(node: &Node, id: SenderId, forget: bool) -> Result<bool, Fail> {
     let uuid = uuid_of(node, PortId::Sender(id));
     let link = node.connections.lock().unwrap().links.get(&id).cloned();
-    let removed = stop_sender(node, id)?;
+    let removed = stop_sender(node, id, !forget)?;
     if let Some(to) = link.and_then(|l| l.receiver)
         && let Err((_, e)) = peer::release(&to, uuid)
     {
-        tracing::warn!(id, error = %e, "disconnecting the peer's receiver");
+        tracing::warn!(%id, error = %e, "disconnecting the peer's receiver");
     }
-    Ok(removed)
+    let mut conns = node.connections.lock().unwrap();
+    let cached = conns.cached.len();
+    if forget {
+        conns.cached.retain(|c| c.id != id);
+    }
+    let dropped = conns.cached.len() < cached;
+    if dropped {
+        conns.save(node.engine.as_ref().map(|e| e.lock().unwrap()).as_deref());
+    }
+    Ok(removed || dropped)
 }
 
 /// The type a sender's sink shows: the user's, else the peer's.
@@ -837,7 +966,7 @@ fn check_peers(node: &Node, watch: &mut Watch) {
         last.announced = announced;
         last.asked = Some(Instant::now());
         if source_moved(node, id) {
-            tracing::info!(id, "this node's address changed; telling the peer");
+            tracing::info!(%id, "this node's address changed; telling the peer");
             if let Some(dest) = destination_of(node, id) {
                 move_to(node, id, to, dest);
             }
@@ -885,7 +1014,7 @@ pub fn rename_peer(node: &Node, dev: &str) {
         for (&id, link) in &conns.links {
             let to_dev = link.receiver.as_ref().and_then(|r| r.node.as_deref()) == Some(dev);
             if to_dev && !link.named {
-                tracing::info!(id, %name, "renaming the sink to the peer");
+                tracing::info!(%id, %name, "renaming the sink to the peer");
                 engine.rename_sender(id, name);
                 renamed = true;
             }
@@ -945,7 +1074,7 @@ fn follow(node: &Node, id: SenderId, to: PeerReceiver, ip: IpAddr, name: &str) {
     let Some(mut dest) = destination_of(node, id) else {
         return;
     };
-    tracing::info!(id, %ip, "{name} moved to another address; following it");
+    tracing::info!(%id, %ip, "{name} moved to another address; following it");
     dest = SocketAddr::new(ip, dest.port());
     move_to(node, id, to, dest);
 }
@@ -978,10 +1107,10 @@ fn reclaim(node: &Node, id: SenderId, from: &PeerReceiver) {
                 ..from.clone()
             };
             if move_to(node, id, to, dest) {
-                tracing::info!(id, receiver = %t.receiver, "moved to a free receiver of the peer; resuming");
+                tracing::info!(%id, receiver = %t.receiver, "moved to a free receiver of the peer; resuming");
             }
         }
-        Err((_, e)) => tracing::debug!(id, error = %e, "no free receiver to move to"),
+        Err((_, e)) => tracing::debug!(%id, error = %e, "no free receiver to move to"),
     }
 }
 
@@ -1097,7 +1226,7 @@ fn update_link(
     match playing {
         Err((_, e)) => {
             if was != PeerState::Unreachable {
-                tracing::warn!(id, error = %e, "peer unreachable");
+                tracing::warn!(%id, error = %e, "peer unreachable");
             }
             link.state = PeerState::Unreachable;
             link.jitter = false;
@@ -1106,7 +1235,7 @@ fn update_link(
         Ok(p) => {
             link.jitter = p.jitter;
             if p.held != link.held {
-                tracing::info!(id, held = ?p.held, "the peer's policy changed what it does to the stream");
+                tracing::info!(%id, held = ?p.held, "the peer's policy changed what it does to the stream");
                 link.held = p.held;
             }
             // A receiver that plays nothing was released on purpose, unless
@@ -1122,7 +1251,7 @@ fn update_link(
                 PeerState::Disconnected
             };
             if p.output != link.output {
-                tracing::info!(id, output = %p.output, "peer's output changed");
+                tracing::info!(%id, output = %p.output, "peer's output changed");
                 link.output = p.output;
                 changed = true;
             }
@@ -1140,15 +1269,15 @@ fn update_link(
         match state {
             PeerState::Disconnected => {
                 tracing::warn!(
-                    id,
+                    %id,
                     "the peer's receiver plays another sender or none; pausing"
                 )
             }
             PeerState::Connected if was == PeerState::Disconnected => {
-                tracing::info!(id, "the peer's receiver plays the sender again; resuming")
+                tracing::info!(%id, "the peer's receiver plays the sender again; resuming")
             }
             PeerState::Connected if was == PeerState::Unreachable => {
-                tracing::info!(id, "peer reachable again")
+                tracing::info!(%id, "peer reachable again")
             }
             _ => {}
         }
@@ -1164,7 +1293,7 @@ fn update_link(
         .find(|(n, _)| *n == id)
         .map(|(_, s)| s.name);
     if let Some(name) = rename.filter(|n| current.as_ref().is_some_and(|c| c != n)) {
-        tracing::info!(id, %name, "peer renamed; renaming its sink");
+        tracing::info!(%id, %name, "peer renamed; renaming its sink");
         engine.rename_sender(id, &name);
         changed = true;
     }
@@ -1174,14 +1303,40 @@ fn update_link(
     displaced
 }
 
-/// Stops a sender, here only.
-fn stop_sender(node: &Node, id: SenderId) -> Result<bool, Fail> {
+/// Stops a sender, here only; with `keep`, its route is remembered.
+fn stop_sender(node: &Node, id: SenderId, keep: bool) -> Result<bool, Fail> {
     let mut conns = node.connections.lock().unwrap();
     let mut engine = lock_engine(node)?;
-    if let Some(mut port) = conns.senders.remove(&id) {
+    let port = conns.senders.remove(&id);
+    let link = conns.links.remove(&id);
+    let name = engine
+        .status()
+        .senders
+        .into_iter()
+        .find(|(n, _)| *n == id)
+        .map(|(_, s)| s.name);
+    if let Some(mut port) = port {
         port.cancel();
+        if keep
+            && let (Some(link), Some(name), Some(peer)) = (link, name, destination(&port.active))
+        {
+            conns.cached.retain(|c| c.id != id);
+            conns.cached.insert(
+                0,
+                Cached {
+                    id,
+                    name,
+                    named: link.named,
+                    priority: link.priority,
+                    api: link.receiver.as_ref().map(|r| r.api.clone()),
+                    node: link.receiver.and_then(|r| r.node),
+                    peer,
+                    used: unix_now(),
+                },
+            );
+            conns.evict(&node.peers.lock().unwrap());
+        }
     }
-    conns.links.remove(&id);
     let removed = engine.remove_sender(id);
     conns.save(Some(&engine));
     Ok(removed)
@@ -1380,12 +1535,22 @@ fn apply_receiver(
         engine.remove_receiver(id);
         return Ok(resolved(port));
     }
-    // The audio system remembers the stream's volume and output by this.
-    let from = stream
+    // The audio system remembers the stream's volume and output by this:
+    // what is sent, as the sender names it, else the session, else where
+    // it comes from.
+    let restore_key = stream
         .as_ref()
-        .and_then(|s| s.node.clone())
-        .or_else(|| leg.source_ip.or(leg.multicast_ip).map(|ip| ip.to_string()));
-    let restore_key = from.map(|f| format!("orpheus.from.{f}"));
+        .and_then(|s| {
+            s.source_id
+                .as_ref()
+                .map(|id| format!("orpheus.source.{id}"))
+                .or_else(|| s.session.as_ref().map(|o| format!("orpheus.session.{o}")))
+        })
+        .or_else(|| {
+            leg.source_ip
+                .or(leg.multicast_ip)
+                .map(|ip| format!("orpheus.from.{ip}"))
+        });
     // The playback stream is named after the sender.
     let name = stream
         .as_ref()
@@ -2023,6 +2188,80 @@ mod tests {
 
     const SDP: &str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=x\r\nc=IN IP4 10.0.0.2\r\nt=0 0\r\n\
                        m=audio 5004 RTP/AVP 97\r\na=rtpmap:97 L24/48000/2\r\n";
+
+    fn cached(n: u128, node: Option<&str>, used: u64) -> Cached {
+        Cached {
+            id: Uuid::from_u128(n),
+            name: format!("route {n}"),
+            named: false,
+            priority: Priority::Normal,
+            api: Some(format!("http://10.0.0.{n}:7480")),
+            node: node.map(Into::into),
+            peer: "10.0.0.2:5004".parse().unwrap(),
+            used,
+        }
+    }
+
+    #[test]
+    fn remembered_routes_match_peer_and_priority() {
+        let c = cached(1, Some("NODE1"), 0);
+        let peer = |api: &str, node: Option<&str>| peer::Peer {
+            api: api.into(),
+            ip: "10.0.0.9".parse().unwrap(),
+            name: None,
+            node: node.map(Into::into),
+        };
+        assert!(c.connects(&peer("http://10.0.0.1:7480", None), Priority::Normal));
+        // The peer moved to another address.
+        assert!(c.connects(
+            &peer("http://10.0.0.9:7480", Some("NODE1")),
+            Priority::Normal
+        ));
+        assert!(!c.connects(&peer("http://10.0.0.1:7480", None), Priority::High));
+        assert!(!c.connects(
+            &peer("http://10.0.0.9:7480", Some("NODE2")),
+            Priority::Normal
+        ));
+        assert!(!c.connects(&peer("http://10.0.0.9:7480", None), Priority::Normal));
+        assert!(!c.sends(c.peer, Priority::Normal));
+
+        let only = Cached {
+            api: None,
+            node: None,
+            ..c
+        };
+        assert!(only.sends(only.peer, Priority::Normal));
+        assert!(!only.sends("10.0.0.3:5004".parse().unwrap(), Priority::Normal));
+        assert!(!only.connects(&peer("http://10.0.0.1:7480", None), Priority::Normal));
+    }
+
+    #[test]
+    fn eviction_keeps_recent_and_pinned_routes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peers.json");
+        std::fs::write(&path, r#"{"PINNED": {"pinned": true}}"#).unwrap();
+        let peers = Peers::load(path);
+        let now = unix_now();
+        let day = 86_400;
+        let mut conns = Connections::new(
+            dir.path().join("routes.json"),
+            RoutesConfig {
+                max_age_days: 30,
+                max_entries: 2,
+            },
+        );
+        conns.cached = vec![
+            cached(1, None, now - 40 * day),
+            cached(2, Some("PINNED"), now - 400 * day),
+            cached(3, None, now - day),
+            cached(4, None, now - 2 * day),
+            cached(5, None, now - 3 * day),
+        ];
+        conns.evict(&peers);
+        let ids: Vec<u128> = conns.cached.iter().map(|c| c.id.as_u128()).collect();
+        // Most recent first; too old or beyond two gone, pinned kept.
+        assert_eq!(ids, [3, 4, 2]);
+    }
 
     #[test]
     fn receivers_check_their_transport_file() {

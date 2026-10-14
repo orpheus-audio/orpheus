@@ -14,7 +14,7 @@ use orpheus_engine::{Output, ReceiverId, SenderId};
 
 use crate::api::Node;
 
-/// Machine names of the sinks to other nodes: `orpheus.send.<id>`.
+/// Machine names of the sinks to other nodes: `orpheus.send.<route ID>`.
 pub fn sender_sink(id: SenderId) -> String {
     format!("orpheus.send.{id}")
 }

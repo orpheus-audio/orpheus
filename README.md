@@ -55,9 +55,9 @@ out of the second machine's default output. A node plays several streams at
 once; which ones are heard is its [policy](docs/usage.md#several-streams).
 
 ```sh
-orpheusctl status          # clock, receivers and senders
+orpheusctl status          # clock, receivers and routes
 orpheusctl status --watch  # the same, refreshed every second
-orpheusctl disconnect 0    # stop sender 0, disconnect the receiver
+orpheusctl disconnect Kitchen  # stop sending, disconnect the receiver
 ```
 
 `orpheusctl` talks to `http://localhost:7480` by default. Use `--node URL`
