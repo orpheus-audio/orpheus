@@ -89,6 +89,21 @@ enum Command {
         #[arg(name = "TYPE")]
         kind: String,
     },
+    /// Show the settings that can change while the node runs, and where
+    /// each comes from: the default, config.toml, or `set`.
+    Settings,
+    /// Change settings, kept across restarts (config.toml is not touched).
+    Set {
+        /// SECTION.KEY=VALUE, e.g. receiver.policy=mix or ptp.domain=1.
+        #[arg(required = true, value_name = "SECTION.KEY=VALUE")]
+        settings: Vec<String>,
+    },
+    /// Undo `set`: go back to config.toml or the default.
+    Reset {
+        /// SECTION.KEY, or SECTION for all of its keys.
+        #[arg(required = true, value_name = "SECTION[.KEY]")]
+        keys: Vec<String>,
+    },
     /// Stop a sender started with `connect` and disconnect the peer's
     /// receiver.
     Disconnect {
@@ -457,6 +472,45 @@ fn main() -> Result<()> {
             let id = find_node(base, &node)?;
             change_node(base, &id, serde_json::json!({ "pinned": false }))?;
         }
+        Command::Settings => {
+            let raw = get(&format!("{base}/x-orpheus/v1/settings"))?;
+            print_settings(&raw, cli.json)?;
+        }
+        Command::Set { settings } => {
+            let mut patch = serde_json::Map::new();
+            for s in &settings {
+                let (path, value) = s
+                    .split_once('=')
+                    .with_context(|| format!("{s}: expected SECTION.KEY=VALUE"))?;
+                let (section, key) = path
+                    .split_once('.')
+                    .with_context(|| format!("{path}: expected SECTION.KEY"))?;
+                // Numbers and booleans as such, anything else as a string.
+                let value = match serde_json::from_str::<serde_json::Value>(value) {
+                    Ok(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => v,
+                    _ => serde_json::Value::String(value.to_owned()),
+                };
+                section_of(&mut patch, section).insert(key.to_owned(), value);
+            }
+            let raw = change_settings(base, patch.into())?;
+            print_settings(&raw, cli.json)?;
+        }
+        Command::Reset { keys } => {
+            let mut patch = serde_json::Map::new();
+            for k in &keys {
+                match k.split_once('.') {
+                    Some((section, key)) => {
+                        section_of(&mut patch, section)
+                            .insert(key.to_owned(), serde_json::Value::Null);
+                    }
+                    None => {
+                        patch.insert(k.clone(), serde_json::Value::Null);
+                    }
+                }
+            }
+            let raw = change_settings(base, patch.into())?;
+            print_settings(&raw, cli.json)?;
+        }
         Command::Disconnect { id } => {
             let url = format!("{base}/x-orpheus/v1/senders/{id}");
             ureq::delete(&url)
@@ -496,6 +550,44 @@ fn change_node(base: &str, id: &str, body: serde_json::Value) -> Result<()> {
         .with_context(|| format!("changing node {id} via {url}"))?;
     let text = r.body_mut().read_to_string()?;
     anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
+    Ok(())
+}
+
+/// The object for `section` in a settings patch.
+fn section_of<'a>(
+    patch: &'a mut serde_json::Map<String, serde_json::Value>,
+    section: &str,
+) -> &'a mut serde_json::Map<String, serde_json::Value> {
+    patch
+        .entry(section)
+        .or_insert_with(|| serde_json::Value::Object(Default::default()))
+        .as_object_mut()
+        .expect("sections are objects")
+}
+
+/// PATCHes the node's settings; returns the settings now in effect.
+fn change_settings(base: &str, patch: serde_json::Value) -> Result<String> {
+    let url = format!("{base}/x-orpheus/v1/settings");
+    let mut r = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+        .patch(&url)
+        .content_type("application/merge-patch+json")
+        .send(patch.to_string())
+        .with_context(|| format!("changing settings via {url}"))?;
+    let text = r.body_mut().read_to_string()?;
+    anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
+    Ok(text)
+}
+
+fn print_settings(raw: &str, json: bool) -> Result<()> {
+    if json {
+        println!("{}", raw.trim_end());
+    } else {
+        let v: serde_json::Value = serde_json::from_str(raw).context("reading the settings")?;
+        print!("{}", render_settings(&v, Paint::detect()));
+    }
     Ok(())
 }
 
@@ -1054,6 +1146,31 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
         .collect();
     let header = ["OUTPUT", "TYPE", "NAME", ""];
     table(&mut o, p, header, [false; 4], &rows);
+    o
+}
+
+/// The settings, one per line, with where each comes from.
+fn render_settings(v: &serde_json::Value, p: Paint) -> String {
+    let mut rows = Vec::new();
+    let sections = v.as_object().into_iter().flatten();
+    for (section, keys) in sections.filter(|(s, _)| *s != "sources") {
+        for (key, value) in keys.as_object().into_iter().flatten() {
+            let value = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => "-".into(),
+                other => other.to_string(),
+            };
+            let from = v["sources"][section][key].as_str().unwrap_or("default");
+            let from = if from == "default" {
+                p.dim(from)
+            } else {
+                from.to_owned()
+            };
+            rows.push([format!("{section}.{key}"), value, from]);
+        }
+    }
+    let mut o = String::new();
+    table(&mut o, p, ["SETTING", "VALUE", "FROM"], [false; 3], &rows);
     o
 }
 

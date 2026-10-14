@@ -42,8 +42,12 @@ pub struct Node {
     /// Staged and active routing (IS-05). Lock it before the engine.
     pub connections: Mutex<crate::connection::Connections>,
     pub block_frames: Option<u32>,
-    /// The receivers' settings.
+    /// The receivers' settings from the config file. Those that can change
+    /// at runtime (`accept`, `policy`, `duck_db`, `link_offset_ms`) are read
+    /// from `settings` instead.
     pub receiver: crate::config::ReceiverConfig,
+    /// Settings that can change at runtime. Lock it last.
+    pub settings: Mutex<crate::settings::Store>,
     /// The user's output types. Lock it last.
     pub outputs: Mutex<crate::outputs::Overrides>,
     /// Warnings about the network paths. Lock it last.
@@ -52,6 +56,13 @@ pub struct Node {
     pub mixer: Mutex<crate::policy::Mixer>,
     /// Aliases and pins of other nodes. Lock it last.
     pub peers: Mutex<crate::peers::Peers>,
+}
+
+impl Node {
+    /// The settings in effect.
+    pub fn settings(&self) -> crate::settings::Settings {
+        self.settings.lock().unwrap().get().clone()
+    }
 }
 
 /// An error status with a plain-text message.
@@ -69,6 +80,7 @@ const BASE: &str = "/x-orpheus/v1";
     servers((url = "/", description = "The node serving this document")),
     tags(
         (name = "node", description = "The node itself"),
+        (name = "settings", description = "Settings that can change while the node runs"),
         (name = "outputs", description = "The audio system's outputs and their types"),
         (name = "senders", description = "Streams this node sends"),
         (name = "discovery", description = "Other nodes on the network"),
@@ -245,6 +257,7 @@ struct Created {
 fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(status))
+        .routes(routes!(settings, change_settings))
         .routes(routes!(add_sender))
         .routes(routes!(remove_sender))
         .routes(routes!(sender_sdp))
@@ -339,6 +352,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
         })
         .collect();
     drop(mixer);
+    let settings = node.settings().receiver;
     Json(Status {
         id: node.id.to_string(),
         name: node.name.clone(),
@@ -355,9 +369,9 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
             },
         },
         loopback: engine.loopback,
-        accept: node.receiver.accept,
-        policy: node.receiver.policy,
-        duck_db: node.receiver.duck_db,
+        accept: settings.accept,
+        policy: settings.policy,
+        duck_db: settings.duck_db,
         receivers,
         senders: engine
             .senders
@@ -478,6 +492,86 @@ async fn sender_sdp(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
         .map(|sdp| ([(header::CONTENT_TYPE, "application/sdp")], sdp))
         .ok_or((StatusCode::NOT_FOUND, format!("no sender {id}")))
+}
+
+/// The settings in effect and where each comes from.
+#[derive(Serialize, ToSchema)]
+struct SettingsView {
+    #[serde(flatten)]
+    settings: crate::settings::Settings,
+    /// By section and key: `default`, `config` (config.toml) or `api`.
+    #[schema(value_type = BTreeMap<String, BTreeMap<String, crate::settings::Source>>)]
+    sources: BTreeMap<String, BTreeMap<String, crate::settings::Source>>,
+}
+
+impl SettingsView {
+    fn of(store: &crate::settings::Store) -> Self {
+        Self {
+            settings: store.get().clone(),
+            sources: store.sources(),
+        }
+    }
+}
+
+/// The settings that can change while the node runs: the clock and the
+/// receivers. Each comes from the default, config.toml, or a change over
+/// the API, which wins.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/settings",
+    tag = "settings",
+    responses((status = OK, description = "The settings in effect", body = SettingsView)),
+)]
+async fn settings(State(node): State<Arc<Node>>) -> Json<SettingsView> {
+    Json(SettingsView::of(&node.settings.lock().unwrap()))
+}
+
+/// Changes settings, as a JSON merge patch: `{"receiver": {"policy":
+/// "mix"}}` sets a value, `null` in place of a value goes back to
+/// config.toml or the default. Kept across restarts, in the state
+/// directory; config.toml is not touched. A change of the clock settings
+/// restarts PTP without the clock jumping; a change of `link_offset_ms`
+/// restarts the running streams.
+#[utoipa::path(
+    patch,
+    path = "/x-orpheus/v1/settings",
+    tag = "settings",
+    request_body(content = serde_json::Value, description = "Sections of keys to change", content_type = "application/merge-patch+json"),
+    responses(
+        (status = OK, description = "The settings now in effect", body = SettingsView),
+        (status = BAD_REQUEST, description = "An unknown or invalid setting, or PTP could not start with it; nothing changed", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn change_settings(
+    State(node): State<Arc<Node>>,
+    Json(patch): Json<serde_json::Value>,
+) -> Result<Json<SettingsView>, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let mut store = node.settings.lock().unwrap();
+        let change = store
+            .patch(&patch)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let old = store.get().clone();
+        let new = change.settings.clone();
+        if new.ptp != old.ptp
+            && let Some(ptp) = &node.ptp
+        {
+            ptp.reconfigure(crate::settings::ptp_config(&new.ptp))
+                .map_err(|e| (StatusCode::BAD_REQUEST, format!("PTP: {e}")))?;
+            tracing::info!(settings = ?new.ptp, "PTP restarted");
+        }
+        store.commit(change);
+        let view = SettingsView::of(&store);
+        drop(store);
+        let r = (&old.receiver, &new.receiver);
+        if r.0.accept != r.1.accept || r.0.link_offset_ms != r.1.link_offset_ms {
+            crate::connection::reapply_receivers(&node);
+        }
+        tracing::info!(%patch, "settings changed");
+        Ok(Json(view))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// The other nodes found over mDNS: Orpheus nodes and other NMOS nodes,
@@ -763,6 +857,7 @@ mod tests {
                 "/x-orpheus/v1/senders",
                 "/x-orpheus/v1/senders/{id}",
                 "/x-orpheus/v1/senders/{id}/sdp",
+                "/x-orpheus/v1/settings",
                 "/x-orpheus/v1/status",
             ]
         );

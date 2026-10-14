@@ -771,6 +771,22 @@ pub async fn watch_peers(node: Arc<Node>) {
     }
 }
 
+/// Applies changed receiver settings (`accept`, `link_offset_ms`) to every
+/// receiver: starts or stops free ones and restarts running streams with
+/// the new link offset.
+pub fn reapply_receivers(node: &Node) {
+    let Some(engine) = &node.engine else {
+        return;
+    };
+    let conns = node.connections.lock().unwrap();
+    let mut engine = engine.lock().unwrap();
+    for (&id, port) in &conns.receivers {
+        if let Err((_, e)) = apply_receiver(node, &mut engine, id, &port.active) {
+            tracing::warn!(id, error = %e, "applying the settings to a receiver");
+        }
+    }
+}
+
 /// Drops free receivers that are no longer needed.
 fn tend_receivers(node: &Node) {
     let Some(engine) = &node.engine else {
@@ -1358,8 +1374,8 @@ fn apply_receiver(
         ..p.clone()
     };
 
-    let runs =
-        p.master_enable && leg.rtp_enabled && (connected || node.receiver.accept == Accept::Any);
+    let settings = node.settings().receiver;
+    let runs = p.master_enable && leg.rtp_enabled && (connected || settings.accept == Accept::Any);
     if !runs {
         engine.remove_receiver(id);
         return Ok(resolved(port));
@@ -1382,7 +1398,9 @@ fn apply_receiver(
             format!("receiving on port {port}: {e}"),
         )
     };
-    if engine.receiver_restore_key(id) != Some(restore_key.as_deref()) {
+    let started = engine.receiver_restore_key(id) == Some(restore_key.as_deref())
+        && engine.receiver_link_offset(id) == Some(settings.link_offset_ms);
+    if !started {
         engine
             .start_receiver(
                 id,
@@ -1392,7 +1410,7 @@ fn apply_receiver(
                     format: FORMAT,
                     encoding: nmos::ENCODING,
                     listen,
-                    link_offset_ms: node.receiver.link_offset_ms,
+                    link_offset_ms: settings.link_offset_ms,
                     block_frames: node.block_frames,
                     gain: 1.0,
                     restore_key,

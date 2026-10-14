@@ -183,6 +183,11 @@ impl Engine {
         self.receivers.get(&id).map(Receiver::restore_key)
     }
 
+    /// The link offset receiver `id` runs with, if it runs.
+    pub fn receiver_link_offset(&self, id: ReceiverId) -> Option<u32> {
+        self.receivers.get(&id).map(Receiver::link_offset_ms)
+    }
+
     /// Fades a receiver to `gain` (0 to 1); returns whether it exists.
     pub fn set_receiver_gain(&mut self, id: ReceiverId, gain: f32) -> bool {
         self.receivers.get(&id).map(|r| r.set_gain(gain)).is_some()

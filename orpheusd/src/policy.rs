@@ -138,6 +138,7 @@ fn apply(node: &Node) {
     let Some(engine) = &node.engine else {
         return;
     };
+    let settings = node.settings().receiver;
     let priorities = node.connections.lock().unwrap().receiver_priorities();
     let mut engine = engine.lock().unwrap();
     let mut mixer = node.mixer.lock().unwrap();
@@ -164,9 +165,9 @@ fn apply(node: &Node) {
         .since
         .retain(|id, _| inputs.iter().any(|i| i.id == *id));
 
-    let ducked = 10f32.powf(-node.receiver.duck_db / 20.0);
+    let ducked = 10f32.powf(-settings.duck_db / 20.0);
     let mut states = BTreeMap::new();
-    for (id, state, gain) in decide(node.receiver.policy, &inputs) {
+    for (id, state, gain) in decide(settings.policy, &inputs) {
         engine.set_receiver_gain(
             id,
             match gain {

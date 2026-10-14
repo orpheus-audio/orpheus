@@ -367,6 +367,10 @@ impl Receiver {
         self.restore_key.as_deref()
     }
 
+    pub fn link_offset_ms(&self) -> u32 {
+        self.link_offset_ms
+    }
+
     /// Fades to `gain` (0 to 1) over up to [`RAMP_MS`].
     pub fn set_gain(&self, gain: f32) {
         self.gain.store(gain.clamp(0.0, 1.0).to_bits(), Relaxed);

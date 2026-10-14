@@ -25,6 +25,9 @@ pub struct Config {
     /// Icon names for other nodes' outputs, by output type, replacing the
     /// defaults (Linux: XDG icon names).
     pub icons: BTreeMap<OutputType, String>,
+    /// The keys the file sets, as `section.key`.
+    #[serde(skip)]
+    pub keys: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -250,8 +253,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
             Ok(s) => {
-                let config: Self =
+                let mut config: Self =
                     toml::from_str(&s).with_context(|| format!("parsing {}", path.display()))?;
+                config.keys = keys(&s);
                 config
                     .check()
                     .with_context(|| format!("checking {}", path.display()))?;
@@ -271,16 +275,33 @@ impl Config {
         if u32::from(r.port) + 2 * (u32::from(r.max) - 1) > u32::from(u16::MAX) {
             anyhow::bail!("[receiver] port + 2 × (max − 1) must stay below 65536");
         }
-        if !(0.0..=96.0).contains(&r.duck_db) {
-            anyhow::bail!("[receiver] duck_db must be 0 to 96");
-        }
-        Ok(())
+        crate::settings::Settings::from_config(self)
+            .check()
+            .map_err(anyhow::Error::msg)
     }
 
     /// The configured name, or the hostname if none is set.
     pub fn name(&self) -> String {
         self.name.clone().unwrap_or_else(hostname)
     }
+}
+
+/// The keys a config file sets, as `section.key` (or `key` at the top);
+/// empty if it doesn't parse.
+pub fn keys(toml: &str) -> Vec<String> {
+    let Ok(table) = toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    table
+        .iter()
+        .flat_map(|(name, value)| match value {
+            toml::Value::Table(section) => section
+                .keys()
+                .map(|key| format!("{name}.{key}"))
+                .collect::<Vec<_>>(),
+            _ => vec![name.clone()],
+        })
+        .collect()
 }
 
 /// The machine's host name.

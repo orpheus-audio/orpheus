@@ -11,6 +11,7 @@ mod outputs;
 mod peer;
 mod peers;
 mod policy;
+mod settings;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -18,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, anyhow};
 use axum::ServiceExt;
 use axum::extract::Request;
-use orpheus_clock::ptp::{PtpClock, PtpConfig};
+use orpheus_clock::ptp::PtpClock;
 use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
 use orpheus_discovery::{Announcement, Discovery};
@@ -59,7 +60,8 @@ async fn main() -> Result<()> {
         "starting"
     );
 
-    let (clock, ptp) = start_clock(&config);
+    let settings = settings::Store::load(&config, home.state_dir().join("settings.json"));
+    let (clock, ptp) = start_clock(&config, settings.get());
     let mut icons = Icons::default();
     for (&kind, name) in &config.icons {
         icons.set(kind, name.as_str());
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
         )),
         block_frames: config.audio.block_frames(AudioFormat::AES67.rate),
         receiver: config.receiver.clone(),
+        settings: Mutex::new(settings),
         outputs: Mutex::new(outputs::Overrides::load(
             home.state_dir().join("outputs.json"),
         )),
@@ -229,22 +232,13 @@ fn timescale() -> Timescale {
 }
 
 /// Starts PTP if enabled, falling back to the system clock.
-fn start_clock(config: &Config) -> (Arc<dyn Clock>, Option<Arc<PtpClock>>) {
+fn start_clock(
+    config: &Config,
+    settings: &settings::Settings,
+) -> (Arc<dyn Clock>, Option<Arc<PtpClock>>) {
     let scale = timescale();
-    let p = &config.ptp;
-    if p.enabled {
-        let cfg = PtpConfig {
-            interface: p.interface.clone(),
-            transport: p.transport,
-            domain: p.domain,
-            priority1: p.priority1,
-            priority2: p.priority2,
-            slave_only: p.slave_only,
-            step_threshold_us: p.step_threshold_us,
-            settle_threshold_us: p.settle_threshold_us,
-            timescale: scale,
-        };
-        match PtpClock::start(cfg) {
+    if config.ptp.enabled {
+        match PtpClock::start(settings::ptp_config(&settings.ptp), scale) {
             Ok(ptp) => {
                 let ptp = Arc::new(ptp);
                 return (ptp.clone(), Some(ptp));

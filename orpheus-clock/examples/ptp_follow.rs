@@ -21,10 +21,10 @@ fn main() {
     let cfg = PtpConfig {
         interface,
         priority1: arg(5, 250.0) as u8,
-        timescale: Timescale::tai().skewed(skew, (offset_ms * 1e6) as i64),
         ..Default::default()
     };
-    let clock = PtpClock::start(cfg).unwrap_or_else(|e| {
+    let timescale = Timescale::tai().skewed(skew, (offset_ms * 1e6) as i64);
+    let clock = PtpClock::start(cfg, timescale).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(1)
     });

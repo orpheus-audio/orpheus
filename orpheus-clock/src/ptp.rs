@@ -111,8 +111,6 @@ pub struct PtpConfig {
     pub step_threshold_us: u32,
     /// Offset under which the clock counts as settled.
     pub settle_threshold_us: u32,
-    /// The time base the virtual clock runs on top of.
-    pub timescale: Timescale,
 }
 
 impl Default for PtpConfig {
@@ -126,7 +124,6 @@ impl Default for PtpConfig {
             slave_only: false,
             step_threshold_us: 1000,
             settle_threshold_us: 100,
-            timescale: Timescale::tai(),
         }
     }
 }
@@ -271,46 +268,41 @@ impl statime::Clock for PortClock {
 /// A media clock synchronized over PTP. Stops when dropped.
 pub struct PtpClock {
     shared: Arc<Shared>,
+    port: Mutex<PortThread>,
+}
+
+/// The thread running the PTP port.
+struct PortThread {
+    cfg: PtpConfig,
     stop: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
 
+impl PortThread {
+    fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 impl PtpClock {
     /// Opens the PTP sockets and starts following (or being) the
-    /// grandmaster in a background thread.
-    pub fn start(cfg: PtpConfig) -> io::Result<Self> {
-        let interface = match &cfg.interface {
-            Some(name) => name.parse::<InterfaceName>().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("bad interface {name:?}"),
-                )
-            })?,
-            None => default_interface()?,
-        };
-        let mac = interfaces()?
-            .get(&interface)
-            .and_then(|i| i.mac())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("interface {interface} has no MAC address"),
-                )
-            })?;
-        let transport = match cfg.transport {
-            PtpTransport::Auto => auto_transport(interface)?,
-            t => t,
-        };
-        let identity = eui64(mac);
+    /// grandmaster in a background thread. The virtual clock runs on top of
+    /// `timescale`.
+    pub fn start(cfg: PtpConfig, timescale: Timescale) -> io::Result<Self> {
         let shared = Arc::new(Shared {
-            clock: Mutex::new(OverlayClock::new(Base(cfg.timescale))),
+            clock: Mutex::new(OverlayClock::new(Base(timescale))),
             status: Mutex::new(PtpStatus {
-                interface: interface.to_string(),
-                transport,
+                interface: String::new(),
+                transport: PtpTransport::Ipv4,
                 domain: cfg.domain,
-                identity: format_identity(identity),
+                identity: String::new(),
                 state: PtpState::Initializing,
-                grandmaster: format_identity(identity),
+                grandmaster: String::new(),
                 offset_ns: None,
                 mean_delay_ns: None,
                 frequency_ppm: 0.0,
@@ -320,53 +312,119 @@ impl PtpClock {
             steps: AtomicU64::new(0),
             frequency_ppm: AtomicU64::new(0f64.to_bits()),
         });
-
-        let (ready_tx, ready_rx) = mpsc::channel();
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let thread = thread::Builder::new().name("orpheus-ptp".into()).spawn({
-            let shared = shared.clone();
-            move || {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                match rt {
-                    Ok(rt) => rt.block_on(async {
-                        let port = PortSetup {
-                            cfg,
-                            interface,
-                            identity,
-                            shared,
-                            ready: ready_tx,
-                            stop: stop_rx,
-                        };
-                        match transport {
-                            PtpTransport::Ipv6 => run::<SocketAddrV6>(port).await,
-                            _ => run::<SocketAddrV4>(port).await,
-                        }
-                    }),
-                    Err(e) => {
-                        let _ = ready_tx.send(Err(e));
-                    }
-                }
-            }
-        })?;
-        let ready = ready_rx
-            .recv()
-            .unwrap_or_else(|_| Err(io::Error::other("PTP thread exited")));
-        if let Err(e) = ready {
-            let _ = thread.join();
-            return Err(e);
-        }
+        let port = spawn(cfg, &shared)?;
         Ok(Self {
             shared,
-            stop: Some(stop_tx),
-            thread: Some(thread),
+            port: Mutex::new(port),
         })
+    }
+
+    /// Restarts PTP with other settings. The clock keeps running and its
+    /// frequency correction, so it does not jump. If PTP can't start with
+    /// the new settings, it goes on with the old ones and returns the
+    /// error.
+    pub fn reconfigure(&self, cfg: PtpConfig) -> io::Result<()> {
+        let mut port = self.port.lock().unwrap();
+        port.stop();
+        match spawn(cfg, &self.shared) {
+            Ok(new) => {
+                *port = new;
+                Ok(())
+            }
+            Err(e) => {
+                let old = port.cfg.clone();
+                *port = spawn(old, &self.shared)?;
+                Err(e)
+            }
+        }
     }
 
     pub fn status(&self) -> PtpStatus {
         self.shared.status.lock().unwrap().clone()
     }
+}
+
+/// Opens the PTP sockets for `cfg` and runs the port in a background
+/// thread, on the virtual clock in `shared`.
+fn spawn(cfg: PtpConfig, shared: &Arc<Shared>) -> io::Result<PortThread> {
+    let interface = match &cfg.interface {
+        Some(name) => name.parse::<InterfaceName>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad interface {name:?}"),
+            )
+        })?,
+        None => default_interface()?,
+    };
+    let mac = interfaces()?
+        .get(&interface)
+        .and_then(|i| i.mac())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("interface {interface} has no MAC address"),
+            )
+        })?;
+    let transport = match cfg.transport {
+        PtpTransport::Auto => auto_transport(interface)?,
+        t => t,
+    };
+    let identity = eui64(mac);
+    {
+        let mut status = shared.status.lock().unwrap();
+        status.interface = interface.to_string();
+        status.transport = transport;
+        status.domain = cfg.domain;
+        status.identity = format_identity(identity);
+        status.state = PtpState::Initializing;
+        status.grandmaster = format_identity(identity);
+        status.offset_ns = None;
+        status.mean_delay_ns = None;
+        status.settled = false;
+    }
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let thread = thread::Builder::new().name("orpheus-ptp".into()).spawn({
+        let shared = shared.clone();
+        let cfg = cfg.clone();
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match rt {
+                Ok(rt) => rt.block_on(async {
+                    let port = PortSetup {
+                        cfg,
+                        interface,
+                        identity,
+                        shared,
+                        ready: ready_tx,
+                        stop: stop_rx,
+                    };
+                    match transport {
+                        PtpTransport::Ipv6 => run::<SocketAddrV6>(port).await,
+                        _ => run::<SocketAddrV4>(port).await,
+                    }
+                }),
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                }
+            }
+        }
+    })?;
+    let ready = ready_rx
+        .recv()
+        .unwrap_or_else(|_| Err(io::Error::other("PTP thread exited")));
+    if let Err(e) = ready {
+        let _ = thread.join();
+        return Err(e);
+    }
+    Ok(PortThread {
+        cfg,
+        stop: Some(stop_tx),
+        thread: Some(thread),
+    })
 }
 
 impl Clock for PtpClock {
@@ -377,12 +435,7 @@ impl Clock for PtpClock {
 
 impl Drop for PtpClock {
     fn drop(&mut self) {
-        if let Some(stop) = self.stop.take() {
-            let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.port.lock().unwrap().stop();
     }
 }
 
@@ -1144,8 +1197,11 @@ mod tests {
         let mut clock = PortClock(shared.clone());
         let ptp = PtpClock {
             shared: shared.clone(),
-            stop: None,
-            thread: None,
+            port: Mutex::new(PortThread {
+                cfg: PtpConfig::default(),
+                stop: None,
+                thread: None,
+            }),
         };
         let system = crate::SystemClock::new();
         let diff = |ptp: &PtpClock| ptp.now_ns() as i64 - system.now_ns() as i64;
