@@ -68,7 +68,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
     let listen = engine.status().receivers[0].1.listen;
     engine
         .insert_sender(
-            SenderId::from_u128(1),
+            SenderId::from_bits(1),
             &SenderConfig {
                 name: "tx".into(),
                 description: "tx".into(),
@@ -201,7 +201,7 @@ fn routes_and_filters_change_at_runtime() {
         )
         .unwrap();
     let listen = engine.status().receivers[0].1.listen;
-    let id = SenderId::from_u128(1);
+    let id = SenderId::from_bits(1);
     engine
         .insert_sender(
             id,
@@ -265,7 +265,7 @@ fn routes_and_filters_change_at_runtime() {
     assert!(taken > 50, "{taken}");
     assert!(
         !engine
-            .set_sender_route(SenderId::from_u128(2), route)
+            .set_sender_route(SenderId::from_bits(2), route)
             .unwrap()
     );
 }
@@ -299,7 +299,7 @@ fn gain_mutes_and_the_meter_hears_through_it() {
     let listen = engine.status().receivers[0].1.listen;
     engine
         .insert_sender(
-            SenderId::from_u128(1),
+            SenderId::from_bits(1),
             &SenderConfig {
                 name: "tx".into(),
                 description: "tx".into(),

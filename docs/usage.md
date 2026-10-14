@@ -122,8 +122,9 @@ every receiver listens on.
 ### Routes
 
 A route is what `connect` makes: a sink on this node, streamed to a
-receiver of the peer. Its ID stays the same as long as the node remembers
-the route, and everything that should be the same next time hangs on it:
+receiver of the peer. Its ID, 8 characters like a node ID (`K7QM3XRA`),
+stays the same as long as the node remembers the route, and everything
+that should be the same next time hangs on it:
 
 - the sink's machine name, `orpheus.send.<ID>`, so that applications the
   desktop's volume control moved there find it again, as does the
@@ -348,7 +349,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows); see [below](#the-status-json). |
 | `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, and for remembered ones `last_used` (Unix seconds). |
-| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "<uuid>", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
+| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
 | `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
 | `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receivers`: the IDs of the receivers that play there. |
@@ -500,13 +501,14 @@ The session name (`s=`) is the node's name; receivers name their playback
 stream after it. Three attributes are Orpheus' own, and other receivers
 ignore them: `a=x-orpheus-node:<id>` names the sending node, so its
 receiver can check back that the sender still exists,
-`a=x-orpheus-source:<id>` names what is sent (the [route](#routes)), and
+`a=x-orpheus-source:<uuid>` names what is sent (the [route](#routes)'s
+NMOS source), and
 `a=x-orpheus-priority:high` marks a [high-priority](#several-streams)
 connection.
 
 Resource IDs are derived from the node ID, and a sender's from its
 route, so they stay the same across restarts and reconnects. A route's
-NMOS source ID is the route ID. Each receiver carries tags of its own:
+NMOS source ID is derived from the node and route IDs. Each receiver carries tags of its own:
 
 - `urn:x-orpheus:form-factor`: the [type](#output-types) of the output it
   plays on;

@@ -15,8 +15,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
 use axum::{Json, Router};
 use orpheus_clock::Timescale;
-use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
+use orpheus_core::{AudioFormat, DeviceId};
 use orpheus_engine::sender::PAYLOAD_TYPE;
 use orpheus_engine::{ReceiverId, SenderId};
 use orpheus_nmos::is04::{self, *};
@@ -269,8 +269,8 @@ fn snapshot(node: &Node) -> Snapshot {
 
     for ((n, s), active) in engine.senders.iter().zip(sender_active) {
         let uuid = resource_id(dev, &format!("sender/{n}"));
-        // The route's ID, which the SDP file announces as the source too.
-        let source_id = *n;
+        // The SDP file announces it too, so receivers know the route.
+        let source_id = source_uuid(dev, *n);
         let flow_id = resource_id(dev, &format!("flow/{n}"));
         let base = |id| Base {
             description: format!("to {}", s.peer),
@@ -344,6 +344,12 @@ fn snapshot(node: &Node) -> Snapshot {
     snap
 }
 
+/// The NMOS source of route `id`: what is sent, the same for as long as
+/// the route is remembered.
+pub fn source_uuid(device: DeviceId, id: SenderId) -> Uuid {
+    resource_id(device, &format!("source/{id}"))
+}
+
 /// The SDP file of sender `id`, or `None` if there is no such sender.
 pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
     let snap = refresh(node);
@@ -352,7 +358,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         (conns.sender_active(id)?.clone(), conns.sender_priority(id))
     };
     let node_id = node.id.to_string();
-    let source_id = id.to_string();
+    let source_id = source_uuid(node.id, id).to_string();
     let uuid = resource_id(node.id, &format!("sender/{id}"));
     let sender = snap.senders.iter().find(|s| s.base.id == uuid)?;
     let leg = active.transport_params.first()?;

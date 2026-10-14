@@ -14,5 +14,5 @@ pub mod rtp;
 pub mod timebase;
 
 pub use format::AudioFormat;
-pub use id::DeviceId;
+pub use id::{DeviceId, RouteId};
 pub use output::OutputType;

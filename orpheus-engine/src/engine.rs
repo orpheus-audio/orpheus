@@ -33,7 +33,7 @@ struct Loopback {
 }
 
 /// Senders are named by the route they serve, which outlives them.
-pub type SenderId = uuid::Uuid;
+pub type SenderId = orpheus_core::RouteId;
 pub type ReceiverId = u32;
 
 /// A snapshot of everything the engine runs.

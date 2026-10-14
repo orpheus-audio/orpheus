@@ -456,7 +456,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 } else {
                     "send only"
                 };
-                println!("route {} \"{name}\" → {to} ({how})", short(&c.id));
+                println!("route {} \"{name}\" → {to} ({how})", c.id);
             }
         }
         Command::Nodes => {
@@ -620,7 +620,20 @@ fn find_route(base: &str, query: &str) -> Result<String> {
         .filter(|r| r.name.to_lowercase() == q)
         .collect();
     let found = match by_name[..] {
-        [] => routes.iter().filter(|r| r.id.starts_with(&q)).collect(),
+        [] => {
+            // Read as the daemon reads IDs: any case, `O` as 0, `I` and `L`
+            // as 1, hyphens ignored.
+            let id: String = query
+                .chars()
+                .filter(|&c| c != '-')
+                .map(|c| match c.to_ascii_uppercase() {
+                    'O' => '0',
+                    'I' | 'L' => '1',
+                    c => c,
+                })
+                .collect();
+            routes.iter().filter(|r| r.id.starts_with(&id)).collect()
+        }
         _ => by_name,
     };
     match found[..] {
@@ -630,16 +643,11 @@ fn find_route(base: &str, query: &str) -> Result<String> {
             "{query:?} matches routes {}; give the ID",
             found
                 .iter()
-                .map(|r| short(&r.id))
+                .map(|r| r.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
     }
-}
-
-/// The start of a route ID, enough to tell routes apart.
-fn short(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
 }
 
 /// Seconds since the Unix epoch.
@@ -674,7 +682,7 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
             };
             [
                 r.name.clone(),
-                short(&r.id).to_owned(),
+                r.id.clone(),
                 r.peer.clone(),
                 r.priority.clone(),
                 state,
@@ -1478,7 +1486,7 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
             ];
             counts.extend(buffer_counts(&t.buffer));
             [
-                short(&t.id).to_owned(),
+                t.id.clone(),
                 t.name.clone(),
                 peer_column(t),
                 c.packets(t.packets),
@@ -1674,7 +1682,7 @@ mod tests {
             "buffer": {"underruns": 0, "overruns": 0, "resyncs": 0,
             "level_frames": 1140}, "peak_dbfs": -12.04}},
             {"id": 1, "port": 5006}],
-        "routes": [{"id": "5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01", "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
+        "routes": [{"id": "K7QM3XRA", "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
             "send_errors": 0, "realigns": 0, "asrc_ppm": 8.9,
             "buffer": {"underruns": 2, "overruns": 0, "resyncs": 0,
             "level_frames": 1120}}]
@@ -1711,7 +1719,7 @@ Receiver 1     ○ free, port 5006
 
 Routes
   ID        NAME     PEER               PACKETS       BUFFER      ASRC  PROBLEMS
-  5c1e0b6a  Kitchen  192.168.1.20:5004   120000  1120 frames  +8.9 ppm  2 underruns
+  K7QM3XRA  Kitchen  192.168.1.20:5004   120000  1120 frames  +8.9 ppm  2 underruns
 ";
         assert_eq!(out, expected, "\n{out}");
     }
@@ -1719,9 +1727,9 @@ Routes
     #[test]
     fn renders_routes() {
         let routes: Vec<RouteEntry> = serde_json::from_str(
-            r#"[{"id": "5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01", "name": "Kitchen",
+            r#"[{"id": "K7QM3XRA", "name": "Kitchen",
                  "priority": "normal", "peer": "192.168.1.20:5004", "active": true},
-                {"id": "9f2d4c71-0000-4000-8000-000000000000", "name": "Kitchen",
+                {"id": "9F2D4C71", "name": "Kitchen",
                  "priority": "high", "peer": "192.168.1.20:5006", "active": false,
                  "last_used": 1000}]"#,
         )
@@ -1730,8 +1738,8 @@ Routes
         assert_eq!(
             out,
             "  NAME     ID        PEER               PRIORITY  STATE\n  \
-             Kitchen  5c1e0b6a  192.168.1.20:5004  normal    ● connected\n  \
-             Kitchen  9f2d4c71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n"
+             Kitchen  K7QM3XRA  192.168.1.20:5004  normal    ● connected\n  \
+             Kitchen  9F2D4C71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n"
         );
     }
 
@@ -1745,7 +1753,7 @@ Routes
         s.routes[0].packets += 2000;
         s.routes[0].buffer.underruns += 2;
         let mut new = s.routes[0].clone();
-        new.id = "9f2d4c71-0000-4000-8000-000000000000".into();
+        new.id = "9F2D4C71".into();
         s.routes.push(new);
         let out = render(&s.since(&prev), Paint(false), Counts::Rate(2.0));
         assert!(out.contains("  packets      1000/s\n"), "{out}");
@@ -1757,7 +1765,7 @@ Routes
         // A route that appeared since the last sample counts from now.
         assert!(
             out.contains(
-                "  9f2d4c71  Kitchen  192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"
+                "  9F2D4C71  Kitchen  192.168.1.20:5004      0/s  1120 frames  +8.9 ppm  none\n"
             ),
             "{out}"
         );

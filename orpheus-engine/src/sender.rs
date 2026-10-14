@@ -36,7 +36,7 @@ const JITTER_MARGIN_MS: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct SenderConfig {
-    /// Machine name of the sink, e.g. `orpheus.send.0`.
+    /// Machine name of the sink, e.g. `orpheus.send.K7QM3XRA`.
     pub name: String,
     /// Name of the sink shown to the user.
     pub description: String,

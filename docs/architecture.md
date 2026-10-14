@@ -147,13 +147,16 @@ follows the sender's and the node's resource versions, so it changes when the
 destination or the PTP grandmaster does.
 
 Resource IDs are UUIDv5 from the node ID and the resource's path
-(`node`, `device`, `receiver/0`, `sender/<route ID>`, …). A sender is
-named by its route: a random UUID made by the first `connect` to a peer
+(`node`, `device`, `receiver/0`, `sender/<route ID>`, `source/<route ID>`,
+…). A sender is named by its route: a random ID like the node ID (40 bits,
+8 characters of Crockford Base32, unique among the node's routes), made by
+the first `connect` to a peer
 with a priority, kept in `routes.json` while the route runs and after it
 is disconnected (within the `[routes]` limits), and reused by the next
 `connect` to the same peer (by API or node ID) with the same priority. The
-route ID is also the sender's NMOS source ID, `a=x-orpheus-source` in its
-SDP file, and part of its sink's name (`orpheus.send.<route ID>`). A
+route ID names its sink (`orpheus.send.<route ID>`) and appears in logs,
+the API and orpheusctl; the sender's NMOS source ID, derived from it, is
+`a=x-orpheus-source` in its SDP file, globally unique. A
 receiver hands the audio system `orpheus.source.<ID>` as the stream's
 `application.id`, which WirePlumber keys the output and volume it
 restores on; streams from other senders fall back to the SDP origin's user

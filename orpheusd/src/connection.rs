@@ -345,6 +345,16 @@ impl Connections {
             .collect()
     }
 
+    /// A random route ID that no running or remembered route has.
+    fn new_id(&self) -> SenderId {
+        loop {
+            let id = SenderId::generate().expect("OS random source");
+            if !self.senders.contains_key(&id) && self.cached.iter().all(|c| c.id != id) {
+                return id;
+            }
+        }
+    }
+
     /// The routes remembered while they don't run, most recent first.
     pub fn cached(&self) -> &[Cached] {
         &self.cached
@@ -553,20 +563,19 @@ pub fn add_sender(
     name: String,
     priority: Priority,
 ) -> Result<SenderId, Fail> {
-    let cached = node
-        .connections
-        .lock()
-        .unwrap()
-        .cached
-        .iter()
-        .find(|c| c.sends(peer, priority))
-        .cloned();
+    let id = {
+        let conns = node.connections.lock().unwrap();
+        conns
+            .cached
+            .iter()
+            .find(|c| c.sends(peer, priority))
+            .map_or_else(|| conns.new_id(), |c| c.id)
+    };
     let link = Link {
         named: true,
         priority,
         ..Link::default()
     };
-    let id = cached.map_or_else(Uuid::new_v4, |c| c.id);
     start_sender(node, id, peer, name, link)
 }
 
@@ -585,7 +594,7 @@ pub fn connect(
 ) -> Result<Connected, Fail> {
     let found = peer::resolve(node, peer)?;
     let shown = found.name.clone().unwrap_or_else(|| peer.to_owned());
-    let (ours, cached) = {
+    let (ours, cached, id) = {
         let conns = node.connections.lock().unwrap();
         let same = conns.links.iter().find(|(_, l)| {
             l.priority == priority && l.receiver.as_ref().is_some_and(|r| r.on(&found))
@@ -606,7 +615,8 @@ pub fn connect(
             .iter()
             .find(|c| c.connects(&found, priority))
             .cloned();
-        (ours, cached)
+        let id = cached.as_ref().map_or_else(|| conns.new_id(), |c| c.id);
+        (ours, cached, id)
     };
     let target = peer::find_receiver(&found, &ours, force)?;
     let (named, name) = match (name, &cached) {
@@ -614,7 +624,6 @@ pub fn connect(
         (None, Some(c)) if c.named => (true, c.name.clone()),
         (None, _) => (false, shown),
     };
-    let id = cached.as_ref().map_or_else(Uuid::new_v4, |c| c.id);
     let to = PeerReceiver {
         api: found.api.clone(),
         id: target.receiver,
@@ -2189,9 +2198,9 @@ mod tests {
     const SDP: &str = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=x\r\nc=IN IP4 10.0.0.2\r\nt=0 0\r\n\
                        m=audio 5004 RTP/AVP 97\r\na=rtpmap:97 L24/48000/2\r\n";
 
-    fn cached(n: u128, node: Option<&str>, used: u64) -> Cached {
+    fn cached(n: u64, node: Option<&str>, used: u64) -> Cached {
         Cached {
-            id: Uuid::from_u128(n),
+            id: SenderId::from_bits(n),
             name: format!("route {n}"),
             named: false,
             priority: Priority::Normal,
@@ -2258,7 +2267,7 @@ mod tests {
             cached(5, None, now - 3 * day),
         ];
         conns.evict(&peers);
-        let ids: Vec<u128> = conns.cached.iter().map(|c| c.id.as_u128()).collect();
+        let ids: Vec<u64> = conns.cached.iter().map(|c| c.id.bits()).collect();
         // Most recent first; too old or beyond two gone, pinned kept.
         assert_eq!(ids, [3, 4, 2]);
     }
