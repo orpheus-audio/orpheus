@@ -32,6 +32,10 @@ sudo setcap cap_net_bind_service=+ep target/release/orpheusd
 target/release/orpheusd
 ```
 
+With [just](https://just.systems), `just run` does all three and asks for
+sudo only when the capability is missing; see
+[development](docs/development.md#building) for the other build profiles.
+
 Without the capability the node still runs, but it falls back to the system
 clock; see [clock](docs/clock.md).
 

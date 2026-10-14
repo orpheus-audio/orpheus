@@ -20,3 +20,11 @@ repository = "https://github.com/orpheus-audio/orpheus"
 [workspace.dependencies]
 orpheus-core = { path = "orpheus-core", version = "0.0.1" }
 serde = { version = "1", features = ["derive"] }
+
+# Release build with whole-program optimization: slow to build, for running
+# a node for long. `just build optimized` also optimizes for the build machine's
+# CPU, so such binaries do not run on other machines.
+[profile.optimized]
+inherits = "release"
+lto = "fat"
+codegen-units = 1

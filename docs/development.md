@@ -7,6 +7,19 @@ cargo build --workspace
 cargo test --workspace
 ```
 
+The [justfile](../justfile) has shortcuts. `just build [profile]` builds
+`orpheusd` and `orpheusctl` and runs `setcap` on `orpheusd` if it needs it
+(asking for sudo); `just run [profile]` also starts it. `just check` runs
+rustfmt, clippy and the tests. The profiles:
+
+- `dev`: a debug build, the fastest to rebuild; for trying out changes.
+- `release` (the default): for normal use.
+- `optimized`: adds fat LTO, one codegen unit and `-C target-cpu=native`;
+  for running a node for long. It takes several times as long to build as
+  `release`, and its binaries run only on CPUs like the one that built them,
+  so build it on each machine rather than copying it. It lives in
+  `target/optimized`, so it does not invalidate the other builds.
+
 The PipeWire bindings need the PipeWire development headers and clang.
 
 `cargo build --workspace --examples` builds only the examples, not
