@@ -85,6 +85,12 @@ pub trait StreamControl: Send {
     fn output(&self) -> Option<String> {
         None
     }
+    /// For a playback stream: plays on output `name`, or with `None` on
+    /// the default output again. The audio system remembers this the way
+    /// it remembers a move by the user.
+    fn set_output(&self, _name: Option<&str>) -> Result<(), BackendError> {
+        Err("this audio system cannot move streams".into())
+    }
 }
 
 /// Keeps a backend stream alive; dropping it removes the stream.
@@ -124,6 +130,15 @@ impl StreamHandle {
     /// The output a playback stream plays on, where the backend knows.
     pub fn output(&self) -> Option<String> {
         self.control.as_ref().and_then(|c| c.output())
+    }
+
+    /// Moves a playback stream to output `name`, or with `None` back to
+    /// the default output.
+    pub fn set_output(&self, name: Option<&str>) -> Result<(), BackendError> {
+        match &self.control {
+            Some(c) => c.set_output(name),
+            None => Err("this audio system cannot move streams".into()),
+        }
     }
 }
 

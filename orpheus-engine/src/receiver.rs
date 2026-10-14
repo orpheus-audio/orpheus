@@ -381,6 +381,12 @@ impl Receiver {
         self.playback.output()
     }
 
+    /// Moves the playback stream to output `name`, or with `None` back to
+    /// the default output.
+    pub fn set_output(&self, name: Option<&str>) -> Result<(), BackendError> {
+        self.playback.set_output(name)
+    }
+
     /// Moves to another UDP port, keeping the group joined.
     pub fn set_port(&self, port: u16) -> io::Result<()> {
         let current = self.filter.filter.lock().unwrap();

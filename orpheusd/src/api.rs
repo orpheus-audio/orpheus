@@ -102,6 +102,7 @@ const BASE: &str = "/x-orpheus/v1";
         (name = "node", description = "The node itself"),
         (name = "settings", description = "Settings that can change while the node runs"),
         (name = "outputs", description = "The audio system's outputs and their types"),
+        (name = "receivers", description = "Streams this node plays"),
         (name = "senders", description = "Streams this node sends"),
         (name = "discovery", description = "Other nodes on the network"),
         (name = "events", description = "State pushed over a WebSocket"),
@@ -193,6 +194,13 @@ struct OutputEntry {
     /// The receivers whose streams play here.
     #[schema(value_type = Vec<u32>)]
     receivers: Vec<ReceiverId>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct PlayOn {
+    /// Machine name of the output, as `/x-orpheus/v1/outputs` lists it.
+    #[schema(example = "alsa_output.pci-0000_00_1f.3.analog-stereo")]
+    output: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -290,6 +298,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(change_node))
         .routes(routes!(outputs))
         .routes(routes!(set_output_type, clear_output_type))
+        .routes(routes!(set_receiver_output, clear_receiver_output))
         .routes(routes!(events))
         .split_for_parts()
 }
@@ -858,6 +867,79 @@ async fn clear_output_type(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
+/// Plays a receiver's stream on an output. The audio system remembers the
+/// output for the sending node, as it does when the user moves the stream,
+/// and plays its streams there again later, on any receiver.
+#[utoipa::path(
+    put,
+    path = "/x-orpheus/v1/receivers/{id}/output",
+    tag = "receivers",
+    params(("id" = u32, Path, description = "Receiver ID from the status")),
+    request_body = PlayOn,
+    responses(
+        (status = NO_CONTENT, description = "Moved"),
+        (status = NOT_FOUND, description = "No such output, or the receiver is not playing", body = String, content_type = "text/plain"),
+        (status = CONFLICT, description = "The audio system cannot move the stream", body = String, content_type = "text/plain"),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn set_receiver_output(
+    State(node): State<Arc<Node>>,
+    Path(id): Path<ReceiverId>,
+    Json(req): Json<PlayOn>,
+) -> Result<StatusCode, ApiError> {
+    tokio::task::spawn_blocking(move || play_on(&node, id, Some(&req.output)))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+/// Plays a receiver's stream on the default output again, also later for
+/// the sending node.
+#[utoipa::path(
+    delete,
+    path = "/x-orpheus/v1/receivers/{id}/output",
+    tag = "receivers",
+    params(("id" = u32, Path, description = "Receiver ID from the status")),
+    responses(
+        (status = NO_CONTENT, description = "Back on the default output"),
+        (status = NOT_FOUND, description = "The receiver is not playing", body = String, content_type = "text/plain"),
+        (status = CONFLICT, description = "The audio system cannot move the stream", body = String, content_type = "text/plain"),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn clear_receiver_output(
+    State(node): State<Arc<Node>>,
+    Path(id): Path<ReceiverId>,
+) -> Result<StatusCode, ApiError> {
+    tokio::task::spawn_blocking(move || play_on(&node, id, None))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+/// Moves receiver `id`'s stream to `output`, or with `None` to the
+/// default output.
+fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCode, ApiError> {
+    let Some(engine) = &node.engine else {
+        return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
+    };
+    if let Some(name) = output
+        && crate::outputs::View::of(node).find(name).is_none()
+    {
+        return Err((StatusCode::NOT_FOUND, format!("no output {name}")));
+    }
+    match engine.lock().unwrap().set_receiver_output(id, output) {
+        Ok(true) => {
+            tracing::info!(id, output = output.unwrap_or("default"), "receiver output");
+            Ok(StatusCode::NO_CONTENT)
+        }
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            format!("receiver {id} is not playing"),
+        )),
+        Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
+    }
+}
+
 /// Overrides an output's type, or with `None` stops overriding it, and
 /// passes it on to the sink if it is one to another node.
 fn set_type(node: &Node, name: &str, kind: Option<OutputType>) -> bool {
@@ -947,6 +1029,7 @@ mod tests {
                 "/x-orpheus/v1/nodes/{id}",
                 "/x-orpheus/v1/outputs",
                 "/x-orpheus/v1/outputs/{name}",
+                "/x-orpheus/v1/receivers/{id}/output",
                 "/x-orpheus/v1/senders",
                 "/x-orpheus/v1/senders/{id}",
                 "/x-orpheus/v1/senders/{id}/sdp",

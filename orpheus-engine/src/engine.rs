@@ -212,6 +212,19 @@ impl Engine {
         self.receivers.get(&id).and_then(Receiver::output)
     }
 
+    /// Moves a receiver's stream to output `name`, or with `None` back to
+    /// the default output; `Ok(false)` if the receiver is not running.
+    pub fn set_receiver_output(
+        &self,
+        id: ReceiverId,
+        name: Option<&str>,
+    ) -> Result<bool, BackendError> {
+        match self.receivers.get(&id) {
+            Some(r) => r.set_output(name).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
     /// Changes the kind of output a sender's sink shows; returns whether
     /// the sender exists.
     pub fn set_sender_remote(&mut self, id: SenderId, remote: OutputType) -> bool {

@@ -107,6 +107,8 @@ enum Command {
     Describe(u64, String),
     /// Changes the kind of output a sink leads to: its icon name and type.
     SetRemote(u64, Option<String>, OutputType),
+    /// Moves a playback stream to an output, or back to the default one.
+    Move(u64, Option<String>, mpsc::SyncSender<Result<(), String>>),
     Quit,
 }
 
@@ -209,6 +211,14 @@ impl StreamControl for Control {
 
     fn output(&self) -> Option<String> {
         self.graph.lock().unwrap().linked_sink(self.id)
+    }
+
+    fn set_output(&self, name: Option<&str>) -> Result<(), BackendError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.tx
+            .send(Command::Move(self.id, name.map(str::to_owned), reply))
+            .map_err(|_| "PipeWire thread is gone")?;
+        Ok(result.recv().map_err(|_| "PipeWire thread is gone")??)
     }
 }
 
@@ -320,7 +330,8 @@ fn run(
             return;
         }
     };
-    let _outputs = match watch_graph(&core, graph.clone()) {
+    let metadata: Rc<RefCell<Option<(u32, pw::metadata::Metadata)>>> = Rc::default();
+    let _outputs = match watch_graph(&core, graph.clone(), metadata.clone()) {
         Ok(v) => Some(v),
         Err(e) => {
             tracing::warn!(error = %e, "cannot follow the outputs; announcing a generic one");
@@ -337,60 +348,82 @@ fn run(
 
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
-    let _receiver = rx.attach(mainloop.loop_(), {
-        let mainloop = mainloop.clone();
-        let streams = streams.clone();
-        let groups = groups.clone();
-        move |cmd| match cmd {
-            Command::Create {
-                id,
-                spec,
-                icon,
-                kind,
-                reply,
-            } => {
-                let result = create_stream(
-                    &core,
-                    &spec,
-                    icon.as_deref(),
+    let _receiver =
+        rx.attach(mainloop.loop_(), {
+            let mainloop = mainloop.clone();
+            let streams = streams.clone();
+            let groups = groups.clone();
+            move |cmd| match cmd {
+                Command::Create {
+                    id,
+                    spec,
+                    icon,
                     kind,
-                    &mut groups.borrow_mut(),
-                    (id, graph.clone()),
-                );
-                let _ = reply.send(result.map(|live| {
-                    streams.borrow_mut().insert(id, live);
-                }));
-            }
-            Command::Destroy(id) => {
-                graph.lock().unwrap().streams.remove(&id);
-                let live = streams.borrow_mut().remove(&id);
-                if let Some(group) = live.as_ref().and_then(|l| l.group.as_ref()) {
-                    groups.borrow_mut().remove(group);
-                }
-            }
-            Command::Describe(id, description) => {
-                if let Some(live) = streams.borrow().get(&id) {
-                    let d = Some(description.as_str());
-                    update_properties(
-                        &live.stream,
-                        &[(*pw::keys::NODE_DESCRIPTION, d), (*pw::keys::MEDIA_NAME, d)],
+                    reply,
+                } => {
+                    let result = create_stream(
+                        &core,
+                        &spec,
+                        icon.as_deref(),
+                        kind,
+                        &mut groups.borrow_mut(),
+                        (id, graph.clone()),
                     );
+                    let _ = reply.send(result.map(|live| {
+                        streams.borrow_mut().insert(id, live);
+                    }));
                 }
-            }
-            Command::SetRemote(id, icon, remote) => {
-                if let Some(live) = streams.borrow().get(&id) {
-                    update_properties(
-                        &live.stream,
-                        &[
-                            (*pw::keys::DEVICE_ICON_NAME, icon.as_deref()),
-                            (*pw::keys::DEVICE_FORM_FACTOR, form_factor(remote)),
-                        ],
+                Command::Destroy(id) => {
+                    graph.lock().unwrap().streams.remove(&id);
+                    let live = streams.borrow_mut().remove(&id);
+                    if let Some(group) = live.as_ref().and_then(|l| l.group.as_ref()) {
+                        groups.borrow_mut().remove(group);
+                    }
+                }
+                Command::Describe(id, description) => {
+                    if let Some(live) = streams.borrow().get(&id) {
+                        let d = Some(description.as_str());
+                        update_properties(
+                            &live.stream,
+                            &[(*pw::keys::NODE_DESCRIPTION, d), (*pw::keys::MEDIA_NAME, d)],
+                        );
+                    }
+                }
+                Command::SetRemote(id, icon, remote) => {
+                    if let Some(live) = streams.borrow().get(&id) {
+                        update_properties(
+                            &live.stream,
+                            &[
+                                (*pw::keys::DEVICE_ICON_NAME, icon.as_deref()),
+                                (*pw::keys::DEVICE_FORM_FACTOR, form_factor(remote)),
+                            ],
+                        );
+                    }
+                }
+                Command::Move(id, name, reply) => {
+                    let result = graph.lock().unwrap().target(id, name.as_deref()).and_then(
+                        |(node, serial)| {
+                            let metadata = metadata.borrow();
+                            let (_, metadata) = metadata
+                                .as_ref()
+                                .ok_or("no session manager to move streams")?;
+                            // As pulseaudio clients do; the session manager links
+                            // the stream there and remembers it.
+                            metadata.set_property(node, "target.node", None, None);
+                            metadata.set_property(
+                                node,
+                                "target.object",
+                                serial.is_some().then_some("Spa:Id"),
+                                serial.as_deref(),
+                            );
+                            Ok(())
+                        },
                     );
+                    let _ = reply.send(result);
                 }
+                Command::Quit => mainloop.quit(),
             }
-            Command::Quit => mainloop.quit(),
-        }
-    });
+        });
 
     let _ = ready.send(Ok(()));
     mainloop.run();
@@ -596,6 +629,8 @@ struct Sink {
     name: String,
     description: String,
     kind: OutputType,
+    /// `object.serial`, by which streams are moved here.
+    serial: String,
 }
 
 impl Graph {
@@ -624,6 +659,24 @@ impl Graph {
             .find_map(|(_, input)| self.sinks.get(input))
             .map(|s| s.name.clone())
     }
+
+    /// The node ID of stream `id` and the serial of output `name`, for
+    /// moving the one to the other; no serial for the default output.
+    fn target(&self, id: u64, name: Option<&str>) -> Result<(u32, Option<String>), String> {
+        let node = *self
+            .streams
+            .get(&id)
+            .ok_or("the stream is not in the audio system yet")?;
+        let Some(name) = name else {
+            return Ok((node, None));
+        };
+        let sink = self
+            .sinks
+            .values()
+            .find(|s| s.name == name && !s.serial.is_empty())
+            .ok_or_else(|| format!("no output {name}"))?;
+        Ok((node, Some(sink.serial.clone())))
+    }
 }
 
 /// Follows the audio sinks, the default one and the links into them,
@@ -632,6 +685,8 @@ impl Graph {
 fn watch_graph(
     core: &pw::core::CoreRc,
     graph: Arc<Mutex<Graph>>,
+    // The session manager's default metadata and its global ID.
+    default_metadata: Rc<RefCell<Option<(u32, pw::metadata::Metadata)>>>,
 ) -> Result<Box<dyn Any>, pw::Error> {
     let registry = core.get_registry_rc()?;
     // Proxies and their listeners, which only this thread may touch.
@@ -642,6 +697,7 @@ fn watch_graph(
             let registry = registry.downgrade();
             let proxies = proxies.clone();
             let graph = graph.clone();
+            let default_metadata = default_metadata.clone();
             move |global| {
                 let Some(registry) = registry.upgrade() else {
                     return;
@@ -682,6 +738,7 @@ fn watch_graph(
                                         name: get(*pw::keys::NODE_NAME),
                                         description: get(*pw::keys::NODE_DESCRIPTION),
                                         kind: output_type(|k| props.get(k)),
+                                        serial: get("object.serial"),
                                     };
                                     graph.lock().unwrap().sinks.insert(id, sink);
                                 }
@@ -709,9 +766,8 @@ fn watch_graph(
                                 }
                             })
                             .register();
-                        proxies
-                            .borrow_mut()
-                            .insert(id, Box::new((metadata, listener)));
+                        proxies.borrow_mut().insert(id, Box::new(listener));
+                        *default_metadata.borrow_mut() = Some((id, metadata));
                     }
                     _ => {}
                 }
@@ -722,6 +778,10 @@ fn watch_graph(
             let graph = graph.clone();
             move |id| {
                 proxies.borrow_mut().remove(&id);
+                let mut metadata = default_metadata.borrow_mut();
+                if metadata.as_ref().is_some_and(|(m, _)| *m == id) {
+                    *metadata = None;
+                }
                 let mut g = graph.lock().unwrap();
                 g.sinks.remove(&id);
                 g.links.remove(&id);

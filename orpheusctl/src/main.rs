@@ -92,6 +92,15 @@ enum Command {
         #[arg(name = "TYPE")]
         kind: String,
     },
+    /// Play a receiver's stream on another output. The node remembers it
+    /// for the sending node and plays its streams there again later.
+    Play {
+        /// Receiver ID, as shown by `status`.
+        receiver: u32,
+        /// The output: its name or description, or a unique part of either;
+        /// `default` goes back to the default output.
+        output: String,
+    },
     /// Show the settings that can change while the node runs, and where
     /// each comes from: the default, config.toml, or `set`.
     Settings,
@@ -475,6 +484,22 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     .put(&url)
                     .send_json(serde_json::json!({ "type": kind }))?;
                 reply(r).with_context(|| format!("setting {kind} via {url}"))?;
+            }
+        }
+        Command::Play { receiver, output } => {
+            let url = format!("{base}/x-orpheus/v1/receivers/{receiver}/output");
+            if output == "default" {
+                let r = agent().delete(&url).call()?;
+                reply(r).with_context(|| format!("moving via {url}"))?;
+            } else {
+                let outputs: Vec<Output> =
+                    serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
+                        .context("reading the outputs")?;
+                let o = find_output(&outputs, &output)?;
+                let r = agent()
+                    .put(&url)
+                    .send_json(serde_json::json!({ "output": o.name }))?;
+                reply(r).with_context(|| format!("moving via {url}"))?;
             }
         }
         Command::Alias {
