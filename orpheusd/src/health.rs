@@ -47,8 +47,11 @@ const LINK_CHECK: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WarningKind {
-    /// The stream or PTP leaves this node over Wi-Fi.
+    /// The stream leaves this node over Wi-Fi, or the clock follows a
+    /// grandmaster over Wi-Fi.
     Wifi,
+    /// Other nodes would follow this node's clock over Wi-Fi.
+    WifiGrandmaster,
     /// A multicast stream goes over Wi-Fi, where the access point sends it
     /// at its lowest rate to every client.
     MulticastWifi,
@@ -197,16 +200,34 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
         message,
     };
     let mut found = vec![];
-    if network::is_wireless(&s.interface) {
-        found.push(warn(
-            WarningKind::Wifi,
-            format!(
-                "PTP runs over Wi-Fi ({}): the clock may not settle, and rooms drift apart",
-                s.interface
-            ),
-        ));
-    }
     let following = matches!(s.state, PtpState::Slave | PtpState::Uncalibrated);
+    if network::is_wireless(&s.interface) {
+        // Wi-Fi hurts the nodes that follow, so a grandmaster on Wi-Fi is
+        // fine on its own but a problem for every other node.
+        found.push(if following {
+            warn(
+                WarningKind::Wifi,
+                format!(
+                    "PTP runs over Wi-Fi ({}): the clock may not settle, and rooms drift apart",
+                    s.interface
+                ),
+            )
+        } else {
+            let role = if matches!(s.state, PtpState::Master) {
+                "is"
+            } else {
+                "may become"
+            };
+            warn(
+                WarningKind::WifiGrandmaster,
+                format!(
+                    "this node {role} the PTP grandmaster over Wi-Fi ({}): nodes that follow \
+                     its clock may not settle; give a wired node a lower ptp.priority1",
+                    s.interface
+                ),
+            )
+        });
+    }
     if let Some(delay) = s.mean_delay_ns.filter(|_| following) {
         let ms = delay as f64 / 1e6;
         if ms > PTP_DELAY_LIMIT_MS {

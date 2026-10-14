@@ -391,7 +391,8 @@ appears (`WARN`) and when it is resolved (`INFO`):
 
 | `kind` | On | Meaning |
 |---|---|---|
-| `wifi` | clock, receiver, sender | PTP or the stream leaves this node over Wi-Fi. Wi-Fi delays packets by milliseconds and holds back multicast, so expect dropouts and clocks that don't settle. |
+| `wifi` | clock, receiver, sender | The stream leaves this node over Wi-Fi, or the clock follows its grandmaster over Wi-Fi. Wi-Fi delays packets by milliseconds and holds back multicast, so expect dropouts and clocks that don't settle. |
+| `wifi_grandmaster` | clock | PTP runs over Wi-Fi on a node that does not follow another clock, so it is or may become the grandmaster. That does not hurt this node, but nodes that follow its clock may not settle. Give a wired node a lower `ptp.priority1` so that it becomes the grandmaster. |
 | `multicast_wifi` | receiver, sender | A [multicast](#multicast-interop) stream goes over Wi-Fi, where the access point sends it at its lowest rate to every client. |
 | `peer_wifi` | receiver, sender | The node at the other end is on Wi-Fi, as it announces. |
 | `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). |
