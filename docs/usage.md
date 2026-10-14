@@ -2,11 +2,13 @@
 
 ## `orpheusctl`
 
-`orpheusctl` controls any node over its HTTP API. It talks to
-`http://localhost:7480` unless told otherwise:
+`orpheusctl` controls any node over its HTTP API. It talks to the node on
+this machine unless told otherwise. `--node` takes a host name or address,
+whose API is on port 7480, or the URL of the API:
 
 ```sh
-orpheusctl --node http://kitchen.local:7480 status
+orpheusctl --node kitchen.local status
+orpheusctl status --node 192.168.1.20:7481
 ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 ```
 

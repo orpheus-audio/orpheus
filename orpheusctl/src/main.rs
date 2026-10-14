@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write as _};
+use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -11,8 +12,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Base URL of the node to talk to.
-    #[arg(long, default_value = "http://localhost:7480", env = "ORPHEUS_NODE")]
+    /// The node to talk to: a host name or address (API on port 7480) or
+    /// the URL of its API.
+    #[arg(long, global = true, default_value = "localhost", env = "ORPHEUS_NODE")]
     node: String,
     /// Print the node's JSON responses instead of text.
     #[arg(long, global = true)]
@@ -364,9 +366,26 @@ impl Buffer {
     }
 }
 
-fn main() -> Result<()> {
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    let base = cli.node.trim_end_matches('/');
+    let base = node_url(&cli.node);
+    match run(cli, &base) {
+        Ok(()) => ExitCode::SUCCESS,
+        // The reader went away, as with `| head`.
+        Err(e)
+            if e.downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) =>
+        {
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprint!("{}", render_error(&e, &base, Paint::detect_stderr()));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run(cli: Cli, base: &str) -> Result<()> {
     match cli.command {
         Command::Status { watch: None } => {
             let (raw, s) = status(base)?;
@@ -416,10 +435,7 @@ fn main() -> Result<()> {
         }
         Command::Nodes => {
             let url = format!("{base}/x-orpheus/v1/nodes");
-            let raw = ureq::get(&url)
-                .call()
-                .and_then(|mut r| r.body_mut().read_to_string())
-                .with_context(|| format!("querying {url}"))?;
+            let raw = get(&url)?;
             if cli.json {
                 println!("{}", raw.trim_end());
             } else {
@@ -445,14 +461,16 @@ fn main() -> Result<()> {
             let o = find_output(&outputs, &output)?;
             let url = format!("{base}/x-orpheus/v1/outputs/{}", encode(&o.name));
             if kind == "auto" {
-                match ureq::delete(&url).call() {
-                    Ok(_) | Err(ureq::Error::StatusCode(404)) => {}
-                    Err(e) => return Err(e).with_context(|| format!("resetting via {url}")),
+                let r = agent().delete(&url).call()?;
+                // Nothing to reset.
+                if r.status() != 404 {
+                    reply(r).with_context(|| format!("resetting via {url}"))?;
                 }
             } else {
-                ureq::put(&url)
-                    .send_json(serde_json::json!({ "type": kind }))
-                    .with_context(|| format!("setting {kind} via {url}"))?;
+                let r = agent()
+                    .put(&url)
+                    .send_json(serde_json::json!({ "type": kind }))?;
+                reply(r).with_context(|| format!("setting {kind} via {url}"))?;
             }
         }
         Command::Alias {
@@ -513,8 +531,7 @@ fn main() -> Result<()> {
         }
         Command::Disconnect { id } => {
             let url = format!("{base}/x-orpheus/v1/senders/{id}");
-            ureq::delete(&url)
-                .call()
+            reply(agent().delete(&url).call()?)
                 .with_context(|| format!("stopping sender {id} via {url}"))?;
         }
     }
@@ -541,16 +558,11 @@ fn find_node(base: &str, query: &str) -> Result<String> {
 /// Changes another node's alias or pin.
 fn change_node(base: &str, id: &str, body: serde_json::Value) -> Result<()> {
     let url = format!("{base}/x-orpheus/v1/nodes/{id}");
-    let mut r = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    let r = agent()
         .patch(&url)
         .send_json(body)
         .with_context(|| format!("changing node {id} via {url}"))?;
-    let text = r.body_mut().read_to_string()?;
-    anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
-    Ok(())
+    reply(r).map(drop)
 }
 
 /// The object for `section` in a settings patch.
@@ -568,17 +580,12 @@ fn section_of<'a>(
 /// PATCHes the node's settings; returns the settings now in effect.
 fn change_settings(base: &str, patch: serde_json::Value) -> Result<String> {
     let url = format!("{base}/x-orpheus/v1/settings");
-    let mut r = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
+    let r = agent()
         .patch(&url)
         .content_type("application/merge-patch+json")
         .send(patch.to_string())
         .with_context(|| format!("changing settings via {url}"))?;
-    let text = r.body_mut().read_to_string()?;
-    anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
-    Ok(text)
+    reply(r)
 }
 
 fn print_settings(raw: &str, json: bool) -> Result<()> {
@@ -591,11 +598,142 @@ fn print_settings(raw: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The body of a reply; an error status becomes a [`Refused`] error.
+fn reply(mut r: ureq::http::Response<ureq::Body>) -> Result<String> {
+    let text = r.body_mut().read_to_string()?;
+    if r.status().is_success() {
+        return Ok(text);
+    }
+    // Orpheus answers in plain text, NMOS in JSON with an "error" field.
+    let message = serde_json::from_str::<serde_json::Value>(&text)
+        .ok()
+        .and_then(|v| v.get("error")?.as_str().map(str::to_owned))
+        .unwrap_or_else(|| text.trim().to_owned());
+    Err(Refused {
+        status: r.status().as_u16(),
+        message,
+    }
+    .into())
+}
+
+/// The node answered, but with an error status.
+#[derive(Debug)]
+struct Refused {
+    status: u16,
+    message: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the node refused: {} (HTTP {})",
+            self.message, self.status
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Why the node at `base` could not be reached, if that is what `e` means.
+fn unreachable(e: &anyhow::Error) -> Option<String> {
+    use std::io::ErrorKind;
+    e.chain().find_map(|c| {
+        let io = match c.downcast_ref::<ureq::Error>()? {
+            ureq::Error::Io(io) => io,
+            ureq::Error::HostNotFound => return Some("host not found".into()),
+            ureq::Error::ConnectionFailed => return Some("connection failed".into()),
+            ureq::Error::Timeout(_) => return Some("timed out".into()),
+            _ => return None,
+        };
+        let reason = match io.kind() {
+            ErrorKind::ConnectionRefused => "connection refused",
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => "connection reset",
+            ErrorKind::HostUnreachable => "host unreachable",
+            ErrorKind::NetworkUnreachable => "network unreachable",
+            ErrorKind::TimedOut => "timed out",
+            ErrorKind::AddrNotAvailable => "address not available",
+            // Name resolution has no kind of its own.
+            _ if io.to_string().contains("lookup address") => "host not found",
+            _ => return None,
+        };
+        Some(reason.into())
+    })
+}
+
+/// The API URL for `--node`: a URL as it is, a bare host on port 7480.
+fn node_url(node: &str) -> String {
+    let node = node.trim_end_matches('/');
+    if node.contains("://") {
+        return node.to_owned();
+    }
+    if node.parse::<std::net::Ipv6Addr>().is_ok() {
+        return format!("http://[{node}]:7480");
+    }
+    // A port follows the last colon, after the brackets of an IPv6 address.
+    let has_port = node
+        .rsplit_once(':')
+        .is_some_and(|(_, port)| port.parse::<u16>().is_ok());
+    if has_port {
+        format!("http://{node}")
+    } else {
+        format!("http://{node}:7480")
+    }
+}
+
+/// Whether `base` points at this machine.
+fn is_local(base: &str) -> bool {
+    let Some(host) = base
+        .parse::<ureq::http::Uri>()
+        .ok()
+        .and_then(|u| u.host().map(str::to_owned))
+    else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// An error as `orpheusctl` shows it: a red dot, the message and, for a node
+/// that cannot be reached, what to check.
+fn render_error(e: &anyhow::Error, base: &str, p: Paint) -> String {
+    match unreachable(e) {
+        // Nothing listens here, so orpheusd is not running.
+        Some(reason) if reason == "connection refused" && is_local(base) => format!(
+            "{}\n  {}\n",
+            p.mark(Level::Bad, "orpheusd is not running on this machine"),
+            p.dim("Start it with orpheusd, or choose a node with --node or ORPHEUS_NODE."),
+        ),
+        Some(reason) => format!(
+            "{}\n  {}\n",
+            p.mark(Level::Bad, &format!("no Orpheus node at {base}: {reason}")),
+            p.dim("Is orpheusd running there? Choose a node with --node or ORPHEUS_NODE."),
+        ),
+        None => format!("{}\n", p.mark(Level::Bad, &format!("{e:#}"))),
+    }
+}
+
+/// An agent that leaves error statuses to [`reply`] and gives up quickly on
+/// a node that does not answer.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(3)))
+        .build()
+        .new_agent()
+}
+
 /// GETs a body as text.
 fn get(url: &str) -> Result<String> {
-    ureq::get(url)
+    agent()
+        .get(url)
         .call()
-        .and_then(|mut r| r.body_mut().read_to_string())
+        .map_err(anyhow::Error::from)
+        .and_then(reply)
         .with_context(|| format!("querying {url}"))
 }
 
@@ -642,24 +780,14 @@ fn encode(segment: &str) -> String {
 
 /// POSTs JSON; an error status becomes an error with the node's message.
 fn post(url: &str, body: impl Serialize) -> Result<String> {
-    let mut r = ureq::Agent::config_builder()
-        .http_status_as_error(false)
-        .build()
-        .new_agent()
-        .post(url)
-        .send_json(body)?;
-    let text = r.body_mut().read_to_string()?;
-    anyhow::ensure!(r.status().is_success(), "{}: {}", r.status(), text.trim());
-    Ok(text)
+    let r = agent().post(url).send_json(body)?;
+    reply(r)
 }
 
 /// The status as the node sent it, and parsed.
 fn status(base: &str) -> Result<(String, Status)> {
     let url = format!("{base}/x-orpheus/v1/status");
-    let raw = ureq::get(&url)
-        .call()
-        .and_then(|mut r| r.body_mut().read_to_string())
-        .with_context(|| format!("querying {url}"))?;
+    let raw = get(&url)?;
     let s = serde_json::from_str(&raw).with_context(|| format!("reading status from {url}"))?;
     Ok((raw, s))
 }
@@ -691,8 +819,7 @@ fn watch(base: &str, interval: Duration, json: bool) -> Result<()> {
             }
             Err(e) => {
                 prev = None;
-                let mark = paint.mark(Level::Bad, &format!("{e:#}"));
-                Some(format!("{mark}\n"))
+                Some(render_error(&e, base, paint))
             }
         };
         if let Some(frame) = frame {
@@ -762,7 +889,7 @@ impl Counts {
 /// Width of the key column, so that values line up under section headlines.
 const KEY: usize = 11;
 
-/// ANSI styling, on only when stdout is a terminal and `NO_COLOR` is unset.
+/// ANSI styling, on only when the output is a terminal and `NO_COLOR` is unset.
 #[derive(Clone, Copy)]
 struct Paint(bool);
 
@@ -776,8 +903,16 @@ enum Level {
 
 impl Paint {
     fn detect() -> Self {
-        let no_color = std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty());
-        Self(std::io::stdout().is_terminal() && !no_color)
+        Self(std::io::stdout().is_terminal() && !Self::no_color())
+    }
+
+    /// For messages on stderr.
+    fn detect_stderr() -> Self {
+        Self(std::io::stderr().is_terminal() && !Self::no_color())
+    }
+
+    fn no_color() -> bool {
+        std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty())
     }
 
     fn sgr(self, code: &str, s: &str) -> String {
@@ -1482,5 +1617,52 @@ Senders
 ";
         assert_eq!(render_nodes(&nodes, Paint(false)), expected);
         assert_eq!(render_nodes(&[], Paint(false)), "○ no other nodes found\n");
+    }
+
+    #[test]
+    fn node_urls() {
+        assert_eq!(node_url("localhost"), "http://localhost:7480");
+        assert_eq!(node_url("kitchen.local:7481"), "http://kitchen.local:7481");
+        assert_eq!(node_url("192.168.1.20"), "http://192.168.1.20:7480");
+        assert_eq!(node_url("fd00::20"), "http://[fd00::20]:7480");
+        assert_eq!(node_url("[fd00::20]"), "http://[fd00::20]:7480");
+        assert_eq!(node_url("[fd00::20]:7481"), "http://[fd00::20]:7481");
+        assert_eq!(node_url("https://node.example/"), "https://node.example");
+    }
+
+    #[test]
+    fn local() {
+        assert!(is_local("http://localhost:7480"));
+        assert!(is_local("http://127.0.0.1:7480"));
+        assert!(is_local("http://[::1]:7480"));
+        assert!(!is_local("http://kitchen.local:7480"));
+        assert!(!is_local("http://[fd00::20]:7480"));
+    }
+
+    #[test]
+    fn errors() {
+        let base = "http://localhost:7480";
+        let refused = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let e = anyhow::Error::from(ureq::Error::Io(refused)).context("querying");
+        assert_eq!(
+            render_error(&e, base, Paint(false)),
+            "● orpheusd is not running on this machine
+  Start it with orpheusd, or choose a node with --node or ORPHEUS_NODE.
+"
+        );
+        assert_eq!(
+            render_error(&e, "http://kitchen.local:7480", Paint(false)),
+            "● no Orpheus node at http://kitchen.local:7480: connection refused
+  Is orpheusd running there? Choose a node with --node or ORPHEUS_NODE.
+"
+        );
+        let e = anyhow::Error::from(Refused {
+            status: 400,
+            message: "empty alias".into(),
+        });
+        assert_eq!(
+            render_error(&e, base, Paint(false)),
+            "● the node refused: empty alias (HTTP 400)\n"
+        );
     }
 }
