@@ -156,6 +156,9 @@ fn ipv4() -> String {
 
 #[derive(Clone, Deserialize)]
 struct Ptp {
+    running: bool,
+    error: Option<String>,
+    holdover: bool,
     interface: String,
     /// Missing from older nodes, which only spoke IPv4.
     #[serde(default = "ipv4")]
@@ -1037,6 +1040,21 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
 }
 
 fn clock(o: &mut String, p: Paint, t: &Ptp) {
+    if !t.running {
+        let mark = if t.holdover {
+            p.mark(Level::Bad, "PTP stopped, holding over")
+        } else {
+            p.mark(Level::Bad, "PTP not running, system clock")
+        };
+        heading(o, p, "Clock", Some(mark));
+        row(o, p, "error", t.error.as_deref().unwrap_or("-"));
+        if !t.interface.is_empty() {
+            row(o, p, "interface", &t.interface);
+        }
+        row(o, p, "frequency", &format!("{:+.2} ppm", t.frequency_ppm));
+        row(o, p, "steps", &t.steps.to_string());
+        return;
+    }
     let mark = match t.state.as_str() {
         "faulty" | "disabled" => p.mark(Level::Bad, &format!("PTP, {}", t.state)),
         _ if t.settled => p.mark(Level::Good, "PTP, settled"),
@@ -1354,6 +1372,7 @@ mod tests {
     const STATUS: &str = r#"{
         "id": "B73AQ0P0", "name": "desk", "version": "0.0.1", "audio": true,
         "clock": {"source": "ptp", "ptp": {
+            "running": true, "holdover": false,
             "interface": "enp3s0", "transport": "ipv4",
             "identity": "4cb04a.fffe.50a582", "state": "slave",
             "grandmaster": "9c6b00.fffe.1a2b3c", "offset_ns": -412,
@@ -1663,6 +1682,37 @@ Senders
         assert_eq!(
             render_error(&e, base, Paint(false)),
             "● the node refused: empty alias (HTTP 400)\n"
+        );
+    }
+
+    #[test]
+    fn clock_holdover() {
+        let t = Ptp {
+            running: false,
+            error: Some("interface wlan0 is down".into()),
+            holdover: true,
+            interface: "wlan0".into(),
+            transport: "ipv4".into(),
+            identity: "4cb04a.fffe.50a582".into(),
+            state: "faulty".into(),
+            grandmaster: "9c6b00.fffe.1a2b3c".into(),
+            offset_ns: None,
+            mean_delay_ns: None,
+            frequency_ppm: 12.31,
+            steps: 1,
+            settled: false,
+        };
+        let mut o = String::new();
+        clock(&mut o, Paint(false), &t);
+        assert_eq!(
+            o,
+            "
+Clock          ● PTP stopped, holding over
+  error        interface wlan0 is down
+  interface    wlan0
+  frequency    +12.31 ppm
+  steps        1
+"
         );
     }
 }

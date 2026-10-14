@@ -59,6 +59,22 @@ pub struct Node {
 }
 
 impl Node {
+    /// Where the media clock comes from, and the PTP status if PTP is on.
+    pub fn clock(&self) -> (ClockSource, Option<PtpStatus>) {
+        let Some(ptp) = &self.ptp else {
+            return (ClockSource::System, None);
+        };
+        let status = ptp.status();
+        let source = if status.running {
+            ClockSource::Ptp
+        } else if status.holdover {
+            ClockSource::Holdover
+        } else {
+            ClockSource::System
+        };
+        (source, Some(status))
+    }
+
     /// The settings in effect.
     pub fn settings(&self) -> crate::settings::Settings {
         self.settings.lock().unwrap().get().clone()
@@ -187,17 +203,21 @@ struct SetType {
 #[derive(Serialize, ToSchema)]
 struct ClockInfo {
     source: ClockSource,
-    /// Present when the source is PTP.
+    /// Present when PTP is on, also while it is not running.
     #[serde(skip_serializing_if = "Option::is_none")]
     ptp: Option<PtpStatus>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
-enum ClockSource {
+pub enum ClockSource {
     /// Synchronized with the other nodes over PTP.
     Ptp,
-    /// The system clock, kept in step by NTP at best.
+    /// PTP stopped after following a grandmaster; the clock runs on with
+    /// its time and rate.
+    Holdover,
+    /// The system clock, kept in step by NTP at best: PTP is off or has
+    /// not run yet.
     System,
 }
 
@@ -358,15 +378,9 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
         name: node.name.clone(),
         version: env!("CARGO_PKG_VERSION"),
         audio: node.engine.is_some(),
-        clock: match &node.ptp {
-            Some(ptp) => ClockInfo {
-                source: ClockSource::Ptp,
-                ptp: Some(ptp.status()),
-            },
-            None => ClockInfo {
-                source: ClockSource::System,
-                ptp: None,
-            },
+        clock: {
+            let (source, ptp) = node.clock();
+            ClockInfo { source, ptp }
         },
         loopback: engine.loopback,
         accept: settings.accept,

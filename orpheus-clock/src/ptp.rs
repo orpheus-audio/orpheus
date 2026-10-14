@@ -16,6 +16,13 @@
 //! been within the settle threshold of the grandmaster, or when this node is
 //! the grandmaster.
 //!
+//! The clock exists whether or not PTP runs. Until PTP starts it is the
+//! system clock. If PTP can't start, or its interface goes away, the port
+//! tries again every few seconds and whenever the interfaces change, while
+//! the clock runs on with its last frequency correction (holdover). It
+//! never falls back to the bare system clock, which would make it jump.
+//! With no interface configured, PTP follows the default route.
+//!
 //! PTP runs over UDP on IPv4 (as AES67 and Dante expect) or IPv6; nodes on
 //! different transports do not see each other. By default a node uses IPv4
 //! if its interface has an IPv4 address, IPv6 otherwise.
@@ -28,7 +35,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
@@ -46,13 +53,13 @@ use statime::port::{
 };
 use statime::time::{Duration, Interval, Time};
 use statime::{OverlayClock, PtpInstance, PtpInstanceState};
-use timestamped_socket::interface::{InterfaceName, interfaces};
+use timestamped_socket::interface::{ChangeDetector, InterfaceName, interfaces};
 use timestamped_socket::networkaddress::MulticastJoinable;
 use timestamped_socket::socket::{
     InterfaceTimestampMode, Open, Socket, Timestamp, open_interface_udp4, open_interface_udp6,
 };
 use tokio::sync::oneshot;
-use tokio::time::{Instant, sleep_until};
+use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::{Clock, Timescale};
 
@@ -78,6 +85,13 @@ const DELAY_SAMPLES: usize = 15;
 /// A sync and a delay measurement further apart than this are not paired:
 /// the clock's frequency error between them would bias the delay.
 const DELAY_PAIR_NS: f64 = 250_000_000.0;
+
+/// How long to wait before trying again to start PTP, unless the
+/// interfaces change first.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long to let the interfaces settle after a change before PTP tries
+/// again.
+const SETTLE_CHANGES: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// TAI − UTC announced when this node is the grandmaster.
 const UTC_OFFSET_S: i16 = 37;
@@ -168,6 +182,16 @@ impl From<PortState> for PtpState {
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct PtpStatus {
+    /// Whether the port runs. If not, `error` says why, and the clock runs
+    /// on by itself.
+    pub running: bool,
+    /// Why PTP is not running.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub error: Option<String>,
+    /// PTP stopped after the clock had followed a grandmaster: it keeps
+    /// that grandmaster's time and rate, and drifts away slowly.
+    pub holdover: bool,
+    /// Empty if none could be found.
     pub interface: String,
     /// `ipv4` or `ipv6`, never `auto`.
     pub transport: PtpTransport,
@@ -219,9 +243,37 @@ struct Shared {
     status: Mutex<PtpStatus>,
     steps: AtomicU64,
     frequency_ppm: AtomicU64,
+    /// The clock has followed a grandmaster since the start.
+    followed: AtomicBool,
 }
 
 impl Shared {
+    /// The system clock on `timescale`, with PTP not running yet.
+    fn new(timescale: Timescale, domain: u8) -> Self {
+        Self {
+            clock: Mutex::new(OverlayClock::new(Base(timescale))),
+            status: Mutex::new(PtpStatus {
+                running: false,
+                error: None,
+                holdover: false,
+                interface: String::new(),
+                transport: PtpTransport::Ipv4,
+                domain,
+                identity: String::new(),
+                state: PtpState::Initializing,
+                grandmaster: String::new(),
+                offset_ns: None,
+                mean_delay_ns: None,
+                frequency_ppm: 0.0,
+                steps: 0,
+                settled: false,
+            }),
+            steps: AtomicU64::new(0),
+            frequency_ppm: AtomicU64::new(0f64.to_bits()),
+            followed: AtomicBool::new(false),
+        }
+    }
+
     fn now(&self) -> Time {
         statime::Clock::now(&*self.clock.lock().unwrap())
     }
@@ -290,29 +342,13 @@ impl PortThread {
 }
 
 impl PtpClock {
-    /// Opens the PTP sockets and starts following (or being) the
-    /// grandmaster in a background thread. The virtual clock runs on top of
-    /// `timescale`.
+    /// Starts following (or being) the grandmaster in a background thread.
+    /// The virtual clock runs on top of `timescale`. If PTP can't start, the
+    /// thread keeps trying and the status says why; this fails only if the
+    /// thread can't be started.
     pub fn start(cfg: PtpConfig, timescale: Timescale) -> io::Result<Self> {
-        let shared = Arc::new(Shared {
-            clock: Mutex::new(OverlayClock::new(Base(timescale))),
-            status: Mutex::new(PtpStatus {
-                interface: String::new(),
-                transport: PtpTransport::Ipv4,
-                domain: cfg.domain,
-                identity: String::new(),
-                state: PtpState::Initializing,
-                grandmaster: String::new(),
-                offset_ns: None,
-                mean_delay_ns: None,
-                frequency_ppm: 0.0,
-                steps: 0,
-                settled: false,
-            }),
-            steps: AtomicU64::new(0),
-            frequency_ppm: AtomicU64::new(0f64.to_bits()),
-        });
-        let port = spawn(cfg, &shared)?;
+        let shared = Arc::new(Shared::new(timescale, cfg.domain));
+        let port = spawn(cfg, &shared, true)?;
         Ok(Self {
             shared,
             port: Mutex::new(port),
@@ -321,19 +357,19 @@ impl PtpClock {
 
     /// Restarts PTP with other settings. The clock keeps running and its
     /// frequency correction, so it does not jump. If PTP can't start with
-    /// the new settings, it goes on with the old ones and returns the
-    /// error.
+    /// the new settings, it goes on with the old ones (or keeps trying to)
+    /// and returns the error.
     pub fn reconfigure(&self, cfg: PtpConfig) -> io::Result<()> {
         let mut port = self.port.lock().unwrap();
         port.stop();
-        match spawn(cfg, &self.shared) {
+        match spawn(cfg, &self.shared, false) {
             Ok(new) => {
                 *port = new;
                 Ok(())
             }
             Err(e) => {
                 let old = port.cfg.clone();
-                *port = spawn(old, &self.shared)?;
+                *port = spawn(old, &self.shared, true)?;
                 Err(e)
             }
         }
@@ -344,45 +380,11 @@ impl PtpClock {
     }
 }
 
-/// Opens the PTP sockets for `cfg` and runs the port in a background
-/// thread, on the virtual clock in `shared`.
-fn spawn(cfg: PtpConfig, shared: &Arc<Shared>) -> io::Result<PortThread> {
-    let interface = match &cfg.interface {
-        Some(name) => name.parse::<InterfaceName>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("bad interface {name:?}"),
-            )
-        })?,
-        None => default_interface()?,
-    };
-    let mac = interfaces()?
-        .get(&interface)
-        .and_then(|i| i.mac())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("interface {interface} has no MAC address"),
-            )
-        })?;
-    let transport = match cfg.transport {
-        PtpTransport::Auto => auto_transport(interface)?,
-        t => t,
-    };
-    let identity = eui64(mac);
-    {
-        let mut status = shared.status.lock().unwrap();
-        status.interface = interface.to_string();
-        status.transport = transport;
-        status.domain = cfg.domain;
-        status.identity = format_identity(identity);
-        status.state = PtpState::Initializing;
-        status.grandmaster = format_identity(identity);
-        status.offset_ns = None;
-        status.mean_delay_ns = None;
-        status.settled = false;
-    }
-
+/// Runs PTP for `cfg` in a background thread, on the virtual clock in
+/// `shared`, and waits for the first attempt to start it. If that fails,
+/// the thread keeps trying with `keep_trying`; otherwise it ends and the
+/// error is returned.
+fn spawn(cfg: PtpConfig, shared: &Arc<Shared>, keep_trying: bool) -> io::Result<PortThread> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (stop_tx, stop_rx) = oneshot::channel();
     let thread = thread::Builder::new().name("orpheus-ptp".into()).spawn({
@@ -393,20 +395,13 @@ fn spawn(cfg: PtpConfig, shared: &Arc<Shared>) -> io::Result<PortThread> {
                 .enable_all()
                 .build();
             match rt {
-                Ok(rt) => rt.block_on(async {
-                    let port = PortSetup {
-                        cfg,
-                        interface,
-                        identity,
-                        shared,
-                        ready: ready_tx,
-                        stop: stop_rx,
-                    };
-                    match transport {
-                        PtpTransport::Ipv6 => run::<SocketAddrV6>(port).await,
-                        _ => run::<SocketAddrV4>(port).await,
-                    }
-                }),
+                Ok(rt) => rt.block_on(supervise(Supervise {
+                    cfg,
+                    shared,
+                    ready: Some(ready_tx),
+                    keep_trying,
+                    stop: stop_rx,
+                })),
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
                 }
@@ -416,7 +411,9 @@ fn spawn(cfg: PtpConfig, shared: &Arc<Shared>) -> io::Result<PortThread> {
     let ready = ready_rx
         .recv()
         .unwrap_or_else(|_| Err(io::Error::other("PTP thread exited")));
-    if let Err(e) = ready {
+    if let Err(e) = ready
+        && !keep_trying
+    {
         let _ = thread.join();
         return Err(e);
     }
@@ -726,34 +723,213 @@ fn open_sockets<A: Transport>(interface: InterfaceName) -> io::Result<Sockets<A>
 }
 
 /// What the PTP thread starts with.
-struct PortSetup {
+struct Supervise {
     cfg: PtpConfig,
-    interface: InterfaceName,
-    identity: ClockIdentity,
     shared: Arc<Shared>,
-    ready: mpsc::Sender<io::Result<()>>,
+    /// Takes the outcome of the first attempt.
+    ready: Option<mpsc::Sender<io::Result<()>>>,
+    keep_trying: bool,
     stop: oneshot::Receiver<()>,
 }
 
-async fn run<A: Transport>(setup: PortSetup) {
-    let PortSetup {
-        cfg,
-        interface,
-        identity,
-        shared,
-        ready,
-        mut stop,
-    } = setup;
-    let mut sockets = match open_sockets::<A>(interface) {
-        Ok(s) => {
-            let _ = ready.send(Ok(()));
-            s
+/// Why the port stopped.
+enum Ended {
+    /// Asked to.
+    Stopped,
+    /// It could not start.
+    Failed(io::Error),
+    /// Its interface went away or changed.
+    Lost(String),
+}
+
+/// Runs the port, starts it again when its interface changes, and keeps
+/// trying while it can't start.
+async fn supervise(mut sv: Supervise) {
+    let mut changes = ChangeDetector::new()
+        .inspect_err(|e| {
+            tracing::warn!(error = %e, "not watching the interfaces; PTP retries every 5 s only")
+        })
+        .ok();
+    let mut logged: Option<String> = None;
+    loop {
+        let ended = match resolve(&sv.cfg) {
+            Ok(link) => match link.transport {
+                PtpTransport::Ipv6 => run::<SocketAddrV6>(&mut sv, &link, &mut changes).await,
+                _ => run::<SocketAddrV4>(&mut sv, &link, &mut changes).await,
+            },
+            Err(e) => Ended::Failed(e),
+        };
+        let error = match ended {
+            Ended::Stopped => return,
+            Ended::Lost(reason) => {
+                tracing::warn!(%reason, "PTP stopped; the clock runs on by itself");
+                down(&sv.shared, &reason);
+                logged = Some(reason);
+                // Straight on to the next attempt, which may find a new
+                // interface.
+                continue;
+            }
+            Ended::Failed(e) => e,
+        };
+        let message = error.to_string();
+        if let Some(ready) = sv.ready.take() {
+            let _ = ready.send(Err(error));
+            if !sv.keep_trying {
+                return;
+            }
         }
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
+        if logged.as_ref() != Some(&message) {
+            tracing::warn!(error = %message, "PTP can't start; trying again");
         }
+        down(&sv.shared, &message);
+        logged = Some(message);
+        tokio::select! {
+            _ = &mut sv.stop => return,
+            () = sleep(RETRY) => {}
+            () = async {
+                changed(&mut changes).await;
+                sleep(SETTLE_CHANGES).await;
+            } => {}
+        }
+    }
+}
+
+/// Waits for a change to the interfaces, or forever without a detector.
+async fn changed(changes: &mut Option<ChangeDetector>) {
+    match changes {
+        Some(c) => c.wait_for_change().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Marks PTP as not running, for `error`.
+fn down(shared: &Shared, error: &str) {
+    let mut status = shared.status.lock().unwrap();
+    status.running = false;
+    status.error = Some(error.to_owned());
+    status.holdover = shared.followed.load(Relaxed);
+    status.state = PtpState::Faulty;
+    status.offset_ns = None;
+    status.mean_delay_ns = None;
+    status.settled = false;
+}
+
+/// The interface PTP runs on, and what it needs to know about it.
+#[derive(Debug, PartialEq)]
+struct Link {
+    interface: InterfaceName,
+    transport: PtpTransport,
+    identity: ClockIdentity,
+    /// Its IPv4 addresses, sorted; a new one restarts the port.
+    ipv4: Vec<Ipv4Addr>,
+}
+
+/// The interface for `cfg`, if it can carry PTP.
+fn resolve(cfg: &PtpConfig) -> io::Result<Link> {
+    let interface = match &cfg.interface {
+        Some(name) => name.parse::<InterfaceName>().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad interface {name:?}"),
+            )
+        })?,
+        None => default_interface()?,
     };
+    let data = interfaces()?.remove(&interface).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, format!("no interface {interface}"))
+    })?;
+    let mac = data.mac().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("interface {interface} has no MAC address"),
+        )
+    })?;
+    if is_down(interface) {
+        return Err(io::Error::new(
+            io::ErrorKind::NetworkDown,
+            format!("interface {interface} is down"),
+        ));
+    }
+    let ips: Vec<IpAddr> = data.ips().collect();
+    let transport = match cfg.transport {
+        PtpTransport::Auto => auto_transport(interface, &ips)?,
+        t => t,
+    };
+    let mut ipv4: Vec<Ipv4Addr> = ips
+        .iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(*v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect();
+    ipv4.sort();
+    Ok(Link {
+        interface,
+        transport,
+        identity: eui64(mac),
+        ipv4,
+    })
+}
+
+impl Link {
+    /// Why the port has to start again on another link, if it does.
+    fn lost(&self, cfg: &PtpConfig) -> Option<String> {
+        match resolve(cfg) {
+            Err(e) => Some(e.to_string()),
+            Ok(now) if now.interface != self.interface => {
+                Some(format!("the default route moved to {}", now.interface))
+            }
+            Ok(now) if now.transport != self.transport => Some(format!(
+                "interface {} changed its addresses",
+                self.interface
+            )),
+            Ok(now) if self.transport == PtpTransport::Ipv4 && now.ipv4 != self.ipv4 => {
+                Some(format!("interface {} has a new address", self.interface))
+            }
+            Ok(_) => None,
+        }
+    }
+}
+
+/// Whether the kernel reports `interface` as down. Unknown counts as up,
+/// as for tunnels and some virtual interfaces.
+fn is_down(interface: InterfaceName) -> bool {
+    let path = format!("/sys/class/net/{interface}/operstate");
+    fs::read_to_string(path)
+        .is_ok_and(|s| matches!(s.trim(), "down" | "lowerlayerdown" | "notpresent"))
+}
+
+/// Opens the sockets for `link` and runs the port until it is stopped or
+/// the link goes away.
+async fn run<A: Transport>(
+    sv: &mut Supervise,
+    link: &Link,
+    changes: &mut Option<ChangeDetector>,
+) -> Ended {
+    let (cfg, shared) = (&sv.cfg, &sv.shared);
+    let (interface, identity) = (link.interface, link.identity);
+    let mut sockets = match open_sockets::<A>(interface) {
+        Ok(s) => s,
+        Err(e) => return Ended::Failed(e),
+    };
+    {
+        let mut status = shared.status.lock().unwrap();
+        status.running = true;
+        status.error = None;
+        status.holdover = false;
+        status.interface = interface.to_string();
+        status.transport = link.transport;
+        status.domain = cfg.domain;
+        status.identity = format_identity(identity);
+        status.state = PtpState::Initializing;
+        status.grandmaster = format_identity(identity);
+        status.offset_ns = None;
+        status.mean_delay_ns = None;
+        status.settled = false;
+    }
+    if let Some(ready) = sv.ready.take() {
+        let _ = ready.send(Ok(()));
+    }
     let instance = PtpInstance::<Servo>::new(
         InstanceConfig {
             clock_identity: identity,
@@ -801,7 +977,7 @@ async fn run<A: Transport>(setup: PortSetup) {
     let mut port = instance.add_port(port_config, filter, clock.clone(), StdRng::from_entropy());
     tracing::info!(
         %interface,
-        transport = ?shared.status.lock().unwrap().transport,
+        transport = ?link.transport,
         identity = %format_identity(identity),
         "PTP running"
     );
@@ -813,7 +989,7 @@ async fn run<A: Transport>(setup: PortSetup) {
     let mut bmca_at = Instant::now();
     loop {
         instance.bmca(&mut [&mut port]);
-        publish(&instance, &port, &shared, &cfg, &mut settle);
+        publish(&instance, &port, shared, cfg, &mut settle);
         bmca_at += instance.bmca_interval();
 
         let (mut running, actions) = port.end_bmca();
@@ -825,8 +1001,12 @@ async fn run<A: Transport>(setup: PortSetup) {
 
         loop {
             let mut actions = tokio::select! {
-                _ = &mut stop => return,
+                _ = &mut sv.stop => return Ended::Stopped,
                 () = sleep_until(bmca_at) => break,
+                () = changed(changes) => match link.lost(cfg) {
+                    Some(reason) => return Ended::Lost(reason),
+                    None => PortActionIterator::empty(),
+                },
                 result = sockets.event.recv(&mut event_buf) => match result {
                     Ok(packet) => {
                         let data = &event_buf[..packet.bytes_read];
@@ -1013,6 +1193,9 @@ fn publish(
         0
     };
     let settled = state == PtpState::Master || settle.rounds >= SETTLE_ROUNDS;
+    if state == PtpState::Slave {
+        shared.followed.store(true, Relaxed);
+    }
     let grandmaster = format_identity(instance.parent_ds().grandmaster_identity);
 
     let mut status = shared.status.lock().unwrap();
@@ -1086,11 +1269,7 @@ fn default_route_v6(routes: &str) -> Option<&str> {
 }
 
 /// IPv4 if the interface has an IPv4 address, otherwise IPv6 if it has one.
-fn auto_transport(interface: InterfaceName) -> io::Result<PtpTransport> {
-    let ips: Vec<IpAddr> = interfaces()?
-        .get(&interface)
-        .map(|i| i.ips().collect())
-        .unwrap_or_default();
+fn auto_transport(interface: InterfaceName, ips: &[IpAddr]) -> io::Result<PtpTransport> {
     if ips.iter().any(IpAddr::is_ipv4) {
         Ok(PtpTransport::Ipv4)
     } else if ips.iter().any(IpAddr::is_ipv6) {
@@ -1176,24 +1355,7 @@ mod tests {
 
     #[test]
     fn overlay_follows_steps_and_frequency() {
-        let shared = Arc::new(Shared {
-            clock: Mutex::new(OverlayClock::new(Base(Timescale::tai()))),
-            status: Mutex::new(PtpStatus {
-                interface: "lo".into(),
-                transport: PtpTransport::Ipv4,
-                domain: 0,
-                identity: String::new(),
-                state: PtpState::Listening,
-                grandmaster: String::new(),
-                offset_ns: None,
-                mean_delay_ns: None,
-                frequency_ppm: 0.0,
-                steps: 0,
-                settled: false,
-            }),
-            steps: AtomicU64::new(0),
-            frequency_ppm: AtomicU64::new(0),
-        });
+        let shared = Arc::new(Shared::new(Timescale::tai(), 0));
         let mut clock = PortClock(shared.clone());
         let ptp = PtpClock {
             shared: shared.clone(),

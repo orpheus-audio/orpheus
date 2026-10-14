@@ -25,7 +25,7 @@ use orpheus_nmos::is05::ReceiverParams;
 use orpheus_nmos::sdp::{self, RefClock};
 use orpheus_nmos::{Snapshot, Uuid, resource_id};
 
-use crate::api::Node;
+use crate::api::{ClockSource, Node};
 
 const CLOCK: &str = "clk0";
 /// What every sender sends and the receiver plays.
@@ -170,15 +170,15 @@ fn snapshot(node: &Node) -> Snapshot {
             )
         });
 
-    let clock = match node.ptp.as_ref().map(|p| p.status()) {
-        Some(p) => Clock::Ptp {
+    let clock = match node.clock() {
+        (source, Some(p)) if source != ClockSource::System => Clock::Ptp {
             name: CLOCK.into(),
             traceable: false,
             version: "IEEE1588-2008",
             gmid: gmid(&p.grandmaster),
             locked: p.settled,
         },
-        None => Clock::Internal { name: CLOCK.into() },
+        _ => Clock::Internal { name: CLOCK.into() },
     };
 
     let engine = node
@@ -357,12 +357,12 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
     let destination = SocketAddr::new(leg.destination_ip.value()?, leg.destination_port.value()?);
     let source = leg.source_ip.value()?;
     let interface = interfaces().into_iter().find(|i| i.addrs.contains(&source));
-    let clock = match node.ptp.as_ref().map(|p| p.status()) {
-        Some(p) => RefClock::Ptp {
+    let clock = match node.clock() {
+        (source, Some(p)) if source != ClockSource::System => RefClock::Ptp {
             gmid: gmid(&p.grandmaster),
             domain: p.domain,
         },
-        None => RefClock::LocalMac(mac(interface
+        _ => RefClock::LocalMac(mac(interface
             .or_else(|| interfaces().into_iter().next())
             .map_or([0; 6], |i| i.mac))),
     };

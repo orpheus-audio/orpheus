@@ -65,6 +65,8 @@ pub enum WarningKind {
     PtpDelay,
     /// The PTP clock keeps stepping instead of settling.
     PtpSteps,
+    /// PTP is not running; the clock runs on by itself.
+    PtpDown,
 }
 
 /// What a warning is about.
@@ -199,6 +201,21 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
         receiver: None,
         message,
     };
+    if !s.running {
+        let why = s.error.as_deref().unwrap_or("not started");
+        let message = if s.holdover {
+            format!(
+                "PTP stopped ({why}): the clock keeps the grandmaster's last time and rate \
+                 and slowly drifts from the other nodes; PTP starts again by itself"
+            )
+        } else {
+            format!(
+                "PTP is not running ({why}): the node runs on the system clock and plays \
+                 out of step with the other nodes; PTP starts by itself once it can"
+            )
+        };
+        return vec![warn(WarningKind::PtpDown, message)];
+    }
     let mut found = vec![];
     let following = matches!(s.state, PtpState::Slave | PtpState::Uncalibrated);
     if network::is_wireless(&s.interface) {
