@@ -83,4 +83,5 @@ To start the node with your session, install the systemd user unit from
 
 ## License
 
-GPL-3.0-or-later.
+The GNU General Public License, version 3 only (`GPL-3.0-only`): see
+[LICENCE.md](LICENCE.md).

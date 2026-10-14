@@ -21,7 +21,7 @@ Linux.
   and only when one of them asks for it.
 - **Decentralized.** Every device is a node with sources and sinks. Nodes
   find each other and connect directly; a controller is optional.
-- **Open.** Orpheus is free software (GPL-3.0-or-later) and builds on open
+- **Open.** Orpheus is free software (GPL-3.0-only) and builds on open
   standards instead of proprietary protocols: AES67 for audio, PTP (IEEE 1588)
   for time, NMOS for discovery and control, mDNS for finding nodes.
 - **Interoperable.** Because the protocols are standard, Orpheus nodes can

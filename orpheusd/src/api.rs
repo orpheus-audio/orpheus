@@ -95,7 +95,7 @@ const BASE: &str = "/x-orpheus/v1";
     info(
         title = "Orpheus node API",
         description = "Orpheus extensions to the NMOS APIs of a node: status and streams.",
-        license(name = "GPL-3.0-or-later", identifier = "GPL-3.0-or-later"),
+        license(name = "GPL-3.0-only", identifier = "GPL-3.0-only"),
     ),
     servers((url = "/", description = "The node serving this document")),
     tags(
