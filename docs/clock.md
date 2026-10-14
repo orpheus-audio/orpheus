@@ -85,6 +85,14 @@ grandmaster adds about 10 s.
 Their error is roughly 15 to 30 µs, well within the default link offset of
 10 ms. Hardware timestamping is planned; see the [roadmap](roadmap.md).
 
+Some interfaces, many Wi-Fi drivers among them, give no send timestamps
+(`ethtool -T <interface>` lists no `software-transmit`). After three missing
+in a row the node logs a warning and stamps its PTP messages just before
+sending instead. That misses the time a packet spends in the kernel and
+driver, some tens of µs, which shows up as a larger `delay` and, if only one
+end stamps this way, as an offset error of about half of it. On Wi-Fi the
+network jitter is far larger anyway.
+
 **Privileges.** PTP uses UDP ports 319 (event messages) and 320 (general
 messages). Binding ports below 1024 needs `CAP_NET_BIND_SERVICE`:
 

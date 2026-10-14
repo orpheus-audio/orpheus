@@ -617,8 +617,27 @@ impl Transport for SocketAddrV6 {
 }
 
 struct Sockets<A: Transport> {
+    interface: InterfaceName,
     event: Socket<A, Open>,
     general: Socket<A, Open>,
+    /// Send timestamps missing in a row.
+    missing: u32,
+    /// The interface gives no send timestamps: event messages are stamped
+    /// just before sending instead (see [`handle_actions`]).
+    send_time: bool,
+}
+
+/// Opens a socket and joins both PTP groups on it.
+fn open_socket<A: Transport>(
+    interface: InterfaceName,
+    port: u16,
+    timestamping: InterfaceTimestampMode,
+) -> io::Result<Socket<A, Open>> {
+    let socket = A::open(interface, port, timestamping)?;
+    for link_local in [false, true] {
+        socket.join_multicast(A::group(link_local, 0), interface)?;
+    }
+    Ok(socket)
 }
 
 fn open_sockets<A: Transport>(interface: InterfaceName) -> io::Result<Sockets<A>> {
@@ -633,18 +652,24 @@ fn open_sockets<A: Transport>(interface: InterfaceName) -> io::Result<Sockets<A>
             format!("PTP {what} socket on {interface}: {e}{hint}"),
         )
     };
-    let event = A::open(interface, EVENT_PORT, InterfaceTimestampMode::SoftwareAll)
-        .map_err(|e| context("event", e))?;
-    let general = A::open(interface, GENERAL_PORT, InterfaceTimestampMode::None)
+    // `ORPHEUS_DEBUG_NO_SEND_TIMESTAMPS` acts as if the interface gave none.
+    let send_time = std::env::var_os("ORPHEUS_DEBUG_NO_SEND_TIMESTAMPS").is_some();
+    let timestamping = if send_time {
+        InterfaceTimestampMode::SoftwareRecv
+    } else {
+        InterfaceTimestampMode::SoftwareAll
+    };
+    let event =
+        open_socket(interface, EVENT_PORT, timestamping).map_err(|e| context("event", e))?;
+    let general = open_socket(interface, GENERAL_PORT, InterfaceTimestampMode::None)
         .map_err(|e| context("general", e))?;
-    for socket in [&event, &general] {
-        for link_local in [false, true] {
-            socket
-                .join_multicast(A::group(link_local, 0), interface)
-                .map_err(|e| context("multicast", e))?;
-        }
-    }
-    Ok(Sockets { event, general })
+    Ok(Sockets {
+        interface,
+        event,
+        general,
+        missing: 0,
+        send_time,
+    })
 }
 
 /// What the PTP thread starts with.
@@ -804,8 +829,19 @@ async fn run<A: Transport>(setup: PortSetup) {
     }
 }
 
+/// Send timestamps missing in a row before the interface counts as giving
+/// none. Each one costs timestamped-socket a 200 ms wait.
+const MAX_MISSING_SEND_TIMESTAMPS: u32 = 3;
+
 /// Carries out the port's actions; returns the send timestamp the port
 /// asked for, if any.
+///
+/// Some interfaces (many Wi-Fi drivers, bridges over them) give no software
+/// send timestamps. Then the time just before sending stands in. It misses
+/// the time the packet spends in the kernel and driver, a few tens of µs,
+/// which ends up in the delay estimate. After a few misses in a row the
+/// event socket is reopened without send timestamps so that sending no
+/// longer waits for them.
 async fn handle_actions<A: Transport>(
     actions: PortActionIterator<'_>,
     sockets: &mut Sockets<A>,
@@ -820,14 +856,23 @@ async fn handle_actions<A: Transport>(
                 data,
                 link_local,
             } => {
+                let before = statime::Clock::now(clock);
                 match sockets
                     .event
                     .send_to(data, A::group(link_local, EVENT_PORT))
                     .await
                 {
                     Ok(ts) => match ts.selected_timestamp() {
-                        Some(ts) => pending = Some((context, clock.time_of(ts))),
-                        None => tracing::warn!("PTP send timestamp missing"),
+                        Some(ts) => {
+                            sockets.missing = 0;
+                            pending = Some((context, clock.time_of(ts)));
+                        }
+                        None => {
+                            pending = Some((context, before));
+                            if !sockets.send_time {
+                                missing_send_timestamp(sockets);
+                            }
+                        }
                     },
                     Err(e) => tracing::warn!(error = %e, "PTP send failed"),
                 }
@@ -857,6 +902,31 @@ async fn handle_actions<A: Transport>(
         }
     }
     pending
+}
+
+/// Counts a missing send timestamp; after too many in a row switches the
+/// event socket to stamping before sending.
+fn missing_send_timestamp<A: Transport>(sockets: &mut Sockets<A>) {
+    sockets.missing += 1;
+    if sockets.missing < MAX_MISSING_SEND_TIMESTAMPS {
+        return;
+    }
+    let interface = sockets.interface;
+    // The sockets reuse the address, so the new one binds next to the old.
+    match open_socket(interface, EVENT_PORT, InterfaceTimestampMode::SoftwareRecv) {
+        Ok(event) => {
+            sockets.event = event;
+            sockets.send_time = true;
+            tracing::warn!(
+                %interface,
+                "no PTP send timestamps from the interface; using the time before sending"
+            );
+        }
+        Err(e) => {
+            sockets.missing = 0;
+            tracing::warn!(error = %e, "PTP event socket could not be reopened");
+        }
+    }
 }
 
 /// Tracks how long the clock has looked settled.

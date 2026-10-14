@@ -234,6 +234,7 @@ measure the engine's own latency.
 | `ORPHEUS_DEBUG_CLOCK_SKEW_PPM` | Testing only: run this node's clock fast by this many ppm. |
 | `ORPHEUS_DEBUG_CLOCK_OFFSET_MS` | Testing only: offset this node's clock by this many milliseconds. |
 | `ORPHEUS_DEBUG_WIRELESS` | Testing only: interfaces to treat as Wi-Fi, separated by commas, or `*` for all. |
+| `ORPHEUS_DEBUG_NO_SEND_TIMESTAMPS` | Testing only: stamp PTP messages before sending, as on an interface without send timestamps; see [clock](clock.md#ptp). |
 
 The clock variables let one machine play two nodes whose clocks disagree,
 and `ORPHEUS_DEBUG_WIRELESS` tests the [network
