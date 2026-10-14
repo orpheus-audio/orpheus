@@ -27,7 +27,8 @@ struct Cli {
 enum Command {
     /// Show the node's ID, name, version and streams.
     Status {
-        /// Refresh every SECONDS (default 1), with counters as rates.
+        /// Follow the node: refresh as it changes, at most every SECONDS
+        /// (default 1), with counters as rates.
         #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1")]
         watch: Option<f64>,
     },
@@ -642,12 +643,14 @@ impl std::error::Error for Refused {}
 fn unreachable(e: &anyhow::Error) -> Option<String> {
     use std::io::ErrorKind;
     e.chain().find_map(|c| {
-        let io = match c.downcast_ref::<ureq::Error>()? {
-            ureq::Error::Io(io) => io,
-            ureq::Error::HostNotFound => return Some("host not found".into()),
-            ureq::Error::ConnectionFailed => return Some("connection failed".into()),
-            ureq::Error::Timeout(_) => return Some("timed out".into()),
-            _ => return None,
+        let io = match c.downcast_ref::<ureq::Error>() {
+            Some(ureq::Error::Io(io)) => io,
+            Some(ureq::Error::HostNotFound) => return Some("host not found".into()),
+            Some(ureq::Error::ConnectionFailed) => return Some("connection failed".into()),
+            Some(ureq::Error::Timeout(_)) => return Some("timed out".into()),
+            Some(_) => return None,
+            // From the event stream.
+            None => c.downcast_ref::<std::io::Error>()?,
         };
         let reason = match io.kind() {
             ErrorKind::ConnectionRefused => "connection refused",
@@ -658,6 +661,7 @@ fn unreachable(e: &anyhow::Error) -> Option<String> {
             ErrorKind::AddrNotAvailable => "address not available",
             // Name resolution has no kind of its own.
             _ if io.to_string().contains("lookup address") => "host not found",
+            ErrorKind::NotFound => "host not found",
             _ => return None,
         };
         Some(reason.into())
@@ -720,12 +724,15 @@ fn render_error(e: &anyhow::Error, base: &str, p: Paint) -> String {
     }
 }
 
+/// How long to wait for a node to answer at all.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// An agent that leaves error statuses to [`reply`] and gives up quickly on
 /// a node that does not answer.
 fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .http_status_as_error(false)
-        .timeout_connect(Some(Duration::from_secs(3)))
+        .timeout_connect(Some(CONNECT_TIMEOUT))
         .build()
         .new_agent()
 }
@@ -795,60 +802,197 @@ fn status(base: &str) -> Result<(String, Status)> {
     Ok((raw, s))
 }
 
-/// Shows the status every `interval` until interrupted. On a terminal each
-/// frame replaces the last; otherwise frames follow each other. With JSON
-/// every sample is one line. Errors are shown and retried, so the node may
-/// restart meanwhile.
+/// Shows the status as the node pushes it, at most every `interval`, until
+/// interrupted. On a terminal each frame replaces the last; otherwise frames
+/// follow each other. With JSON every sample is one line. Errors are shown
+/// and the connection tried again, so the node may restart meanwhile.
 fn watch(base: &str, interval: Duration, json: bool) -> Result<()> {
     let paint = Paint::detect();
-    let tty = std::io::stdout().is_terminal();
-    let mut out = std::io::stdout().lock();
-    let mut prev: Option<(Instant, Status)> = None;
-    let mut first = true;
-    let mut next = Instant::now();
+    let mut screen = Screen {
+        out: std::io::stdout().lock(),
+        tty: std::io::stdout().is_terminal(),
+        json,
+        first: true,
+    };
     loop {
-        let fetched = status(base);
-        let now = Instant::now();
-        let frame = match fetched {
-            Ok((raw, _)) if json => Some(format!("{}\n", raw.trim_end())),
-            Ok((_, s)) => {
-                // Rates need two samples; the first frame waits for the second.
-                let frame = prev.as_ref().map(|(at, p)| {
-                    let secs = (now - *at).as_secs_f64();
-                    render(&s.since(p), paint, Counts::Rate(secs))
-                });
-                prev = Some((now, s));
-                frame
-            }
-            Err(e) => {
-                prev = None;
-                Some(render_error(&e, base, paint))
-            }
-        };
-        if let Some(frame) = frame {
-            if json {
-                out.write_all(frame.as_bytes())?;
-            } else if tty {
-                // Home, then overwrite each line and clear the rest, which
-                // flickers less than clearing the screen first.
-                let mut f = String::from(if first { "\x1b[2J\x1b[H" } else { "\x1b[H" });
-                for line in frame.lines() {
-                    let _ = writeln!(f, "{line}\x1b[K");
-                }
-                f.push_str("\x1b[J");
-                out.write_all(f.as_bytes())?;
-            } else {
-                if !first {
-                    out.write_all(b"\n")?;
-                }
-                out.write_all(frame.as_bytes())?;
-            }
-            out.flush()?;
-            first = false;
+        let e = follow(base, interval, paint, &mut screen).unwrap_err();
+        // Output that can't be written ends the watch.
+        if let Some(Unwritable(e)) = e.downcast_ref::<Unwritable>() {
+            return Err(std::io::Error::new(e.kind(), e.to_string()).into());
         }
-        next += interval;
-        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+        screen
+            .show(&render_error(&e, base, paint))
+            .map_err(|Unwritable(e)| e)?;
+        std::thread::sleep(interval);
     }
+}
+
+/// Where watched frames go.
+struct Screen<'a> {
+    out: std::io::StdoutLock<'a>,
+    tty: bool,
+    json: bool,
+    first: bool,
+}
+
+/// The watched frames could not be written.
+#[derive(Debug)]
+struct Unwritable(std::io::Error);
+
+impl std::fmt::Display for Unwritable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for Unwritable {}
+
+impl Screen<'_> {
+    fn show(&mut self, frame: &str) -> Result<(), Unwritable> {
+        self.write(frame).map_err(Unwritable)
+    }
+
+    fn write(&mut self, frame: &str) -> std::io::Result<()> {
+        if self.json {
+            self.out.write_all(frame.as_bytes())?;
+        } else if self.tty {
+            // Home, then overwrite each line and clear the rest, which
+            // flickers less than clearing the screen first.
+            let home = if self.first {
+                "\x1b[2J\x1b[H"
+            } else {
+                "\x1b[H"
+            };
+            let mut f = String::from(home);
+            for line in frame.lines() {
+                let _ = writeln!(f, "{line}\x1b[K");
+            }
+            f.push_str("\x1b[J");
+            self.out.write_all(f.as_bytes())?;
+        } else {
+            if !self.first {
+                self.out.write_all(b"\n")?;
+            }
+            self.out.write_all(frame.as_bytes())?;
+        }
+        self.first = false;
+        self.out.flush()
+    }
+}
+
+/// Shows the status pushed over one connection, until it fails. Errors
+/// writing the output come back as [`Unwritable`].
+fn follow(base: &str, interval: Duration, paint: Paint, screen: &mut Screen) -> Result<()> {
+    let mut socket = events(base, "status", interval)?;
+    // Rates need two samples: the one last shown (or the first) and a newer
+    // one. No newer one means nothing changed.
+    let mut prev: Option<(Instant, Status)> = None;
+    let mut fresh: Option<(Instant, Status)> = None;
+    let mut shown: Option<Instant> = None;
+    loop {
+        let quiet = match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                let event: Event = serde_json::from_str(&text).context("reading an event")?;
+                if screen.json {
+                    screen.show(&format!("{}\n", event.data))?;
+                    continue;
+                }
+                let s: Status = serde_json::from_value(event.data).context("reading the status")?;
+                let sample = Some((Instant::now(), s));
+                if prev.is_none() {
+                    prev = sample;
+                } else {
+                    fresh = sample;
+                }
+                false
+            }
+            Ok(tungstenite::Message::Close(_)) => anyhow::bail!("the node closed the connection"),
+            Ok(_) => continue,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                true
+            }
+            Err(
+                tungstenite::Error::ConnectionClosed
+                | tungstenite::Error::AlreadyClosed
+                | tungstenite::Error::Protocol(_),
+            ) => anyhow::bail!("the node closed the connection"),
+            Err(e) => return Err(anyhow::Error::new(e).context("reading events")),
+        };
+        if screen.json {
+            continue;
+        }
+        let now = Instant::now();
+        let due = shown.is_none_or(|t| now - t >= interval);
+        let frame = match (&prev, &fresh) {
+            (Some((at, p)), Some((t, s))) if due => {
+                let secs = (*t - *at).as_secs_f64();
+                render(&s.since(p), paint, Counts::Rate(secs))
+            }
+            // Nothing changed for a while: no counter moved.
+            (Some((_, p)), None) if quiet && due => render(&p.since(p), paint, Counts::Rate(1.0)),
+            _ => continue,
+        };
+        screen.show(&frame)?;
+        shown = Some(now);
+        if fresh.is_some() {
+            prev = fresh.take();
+        }
+    }
+}
+
+/// A message on the event stream.
+#[derive(Deserialize)]
+struct Event {
+    data: serde_json::Value,
+}
+
+/// Opens the node's event stream for `topics`; reading it times out after
+/// `timeout` without a message.
+fn events(
+    base: &str,
+    topics: &str,
+    timeout: Duration,
+) -> Result<tungstenite::WebSocket<std::net::TcpStream>> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let uri: ureq::http::Uri = base
+        .parse()
+        .with_context(|| format!("bad node URL {base}"))?;
+    anyhow::ensure!(
+        uri.scheme_str() == Some("http"),
+        "watching needs an http:// node URL, not {base}"
+    );
+    let host = uri.host().unwrap_or_default();
+    let port = uri.port_u16().unwrap_or(80);
+    let addr = (host.trim_start_matches('[').trim_end_matches(']'), port)
+        .to_socket_addrs()
+        .and_then(|mut a| a.next().ok_or_else(|| std::io::ErrorKind::NotFound.into()))
+        .with_context(|| format!("looking up {host}"))?;
+    let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .with_context(|| format!("connecting to {base}"))?;
+    stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
+    let url = format!("ws://{host}:{port}/x-orpheus/v1/events?topics={topics}");
+    let (socket, _) = tungstenite::client(url.as_str(), stream)
+        .map_err(|e| match e {
+            tungstenite::HandshakeError::Failure(tungstenite::Error::Http(r)) => Refused {
+                status: r.status().as_u16(),
+                message: r
+                    .body()
+                    .as_deref()
+                    .map(|b| String::from_utf8_lossy(b).trim().to_owned())
+                    .unwrap_or_default(),
+            }
+            .into(),
+            tungstenite::HandshakeError::Failure(e) => anyhow::Error::new(e),
+            tungstenite::HandshakeError::Interrupted(_) => anyhow::anyhow!("timed out"),
+        })
+        .with_context(|| format!("opening {url}"))?;
+    socket.get_ref().set_read_timeout(Some(timeout))?;
+    Ok(socket)
 }
 
 /// How counters are shown.

@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path, State};
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -22,6 +23,7 @@ use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
 
 use crate::config::{Accept, Policy, RTP_PORT};
+use crate::events::Topic;
 use crate::policy::State as PolicyState;
 use orpheus_core::OutputType;
 use orpheus_nmos::sdp::Priority;
@@ -56,6 +58,8 @@ pub struct Node {
     pub mixer: Mutex<crate::policy::Mixer>,
     /// Aliases and pins of other nodes. Lock it last.
     pub peers: Mutex<crate::peers::Peers>,
+    /// Snapshots for the event stream.
+    pub events: crate::events::Events,
 }
 
 impl Node {
@@ -100,6 +104,7 @@ const BASE: &str = "/x-orpheus/v1";
         (name = "outputs", description = "The audio system's outputs and their types"),
         (name = "senders", description = "Streams this node sends"),
         (name = "discovery", description = "Other nodes on the network"),
+        (name = "events", description = "State pushed over a WebSocket"),
     ),
 )]
 struct ApiDoc;
@@ -285,6 +290,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(change_node))
         .routes(routes!(outputs))
         .routes(routes!(set_output_type, clear_output_type))
+        .routes(routes!(events))
         .split_for_parts()
 }
 
@@ -319,6 +325,21 @@ pub fn router(node: Arc<Node>) -> Router {
     responses((status = OK, description = "Node status", body = Status)),
 )]
 async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
+    Json(status_of(&node))
+}
+
+/// A topic's state for the event stream, as its GET returns it.
+pub fn snapshot(node: &Node, topic: Topic) -> serde_json::Value {
+    match topic {
+        Topic::Status => serde_json::to_value(status_of(node)),
+        Topic::Nodes => serde_json::to_value(nodes_of(node)),
+        Topic::Outputs => serde_json::to_value(outputs_of(node)),
+        Topic::Settings => serde_json::to_value(SettingsView::of(&node.settings.lock().unwrap())),
+    }
+    .unwrap_or_default()
+}
+
+fn status_of(node: &Node) -> Status {
     let (ports, mut links, sender_priorities) = {
         let conns = node.connections.lock().unwrap();
         let priorities = conns.receiver_priorities();
@@ -348,7 +369,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
     };
     let engine = node.engine.as_ref().map(|e| e.lock().unwrap().status());
     let mut engine = engine.unwrap_or_default();
-    let view = crate::outputs::View::of(&node);
+    let view = crate::outputs::View::of(node);
     let mixer = node.mixer.lock().unwrap();
     let receivers = ports
         .into_iter()
@@ -360,20 +381,20 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
                 .map(|i| engine.receivers.remove(i).1);
             ReceiverEntry {
                 id,
-                uuid: crate::connection::receiver_uuid(&node, id),
+                uuid: crate::connection::receiver_uuid(node, id),
                 port,
                 sender,
                 state: stream.as_ref().and(mixer.state(id)),
                 stream,
                 priority,
-                output: view.receiver_type(&node, id),
+                output: view.receiver_type(node, id),
                 plays_on: view.receiver(id).map(|o| o.description.clone()),
             }
         })
         .collect();
     drop(mixer);
     let settings = node.settings().receiver;
-    Json(Status {
+    Status {
         id: node.id.to_string(),
         name: node.name.clone(),
         version: env!("CARGO_PKG_VERSION"),
@@ -398,7 +419,7 @@ async fn status(State(node): State<Arc<Node>>) -> Json<Status> {
             })
             .collect(),
         warnings: node.health.lock().unwrap().warnings(),
-    })
+    }
 }
 
 /// Sends this node's audio to a peer: creates a sink named after it and
@@ -601,11 +622,16 @@ async fn change_settings(
     ),
 )]
 async fn nodes(State(node): State<Arc<Node>>) -> Result<Json<Vec<crate::peers::Known>>, ApiError> {
-    let d = node.discovery.as_ref().ok_or((
+    nodes_of(&node).map(Json).ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
         "mDNS is not running".to_string(),
-    ))?;
-    Ok(Json(node.peers.lock().unwrap().list(d.nodes())))
+    ))
+}
+
+/// `None` if mDNS is not running.
+fn nodes_of(node: &Node) -> Option<Vec<crate::peers::Known>> {
+    let d = node.discovery.as_ref()?;
+    Some(node.peers.lock().unwrap().list(d.nodes()))
 }
 
 /// A change to another node's alias or pin; fields left out stay.
@@ -692,37 +718,89 @@ async fn change_node(
     responses((status = OK, description = "The outputs, by description", body = Vec<OutputEntry>)),
 )]
 async fn outputs(State(node): State<Arc<Node>>) -> Json<Vec<OutputEntry>> {
-    let list = tokio::task::spawn_blocking(move || {
-        let view = crate::outputs::View::of(&node);
-        let links = node.connections.lock().unwrap().peer_types();
-        let overrides = node.outputs.lock().unwrap();
-        view.outputs
-            .iter()
-            .map(|o| {
-                let detected = crate::outputs::sink_sender(&o.name)
-                    .and_then(|id| links.get(&id).copied())
-                    .unwrap_or(o.kind);
-                let overridden = overrides.get(&o.name);
-                OutputEntry {
-                    name: o.name.clone(),
-                    description: o.description.clone(),
-                    kind: overridden.unwrap_or(detected),
-                    detected,
-                    overridden,
-                    default: o.default,
-                    receivers: view
-                        .receivers
-                        .iter()
-                        .filter(|(_, name)| **name == o.name)
-                        .map(|(&id, _)| id)
-                        .collect(),
-                }
-            })
-            .collect()
-    })
-    .await
-    .unwrap_or_default();
+    let list = tokio::task::spawn_blocking(move || outputs_of(&node))
+        .await
+        .unwrap_or_default();
     Json(list)
+}
+
+fn outputs_of(node: &Node) -> Vec<OutputEntry> {
+    let view = crate::outputs::View::of(node);
+    let links = node.connections.lock().unwrap().peer_types();
+    let overrides = node.outputs.lock().unwrap();
+    view.outputs
+        .iter()
+        .map(|o| {
+            let detected = crate::outputs::sink_sender(&o.name)
+                .and_then(|id| links.get(&id).copied())
+                .unwrap_or(o.kind);
+            let overridden = overrides.get(&o.name);
+            OutputEntry {
+                name: o.name.clone(),
+                description: o.description.clone(),
+                kind: overridden.unwrap_or(detected),
+                detected,
+                overridden,
+                default: o.default,
+                receivers: view
+                    .receivers
+                    .iter()
+                    .filter(|(_, name)| **name == o.name)
+                    .map(|(&id, _)| id)
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+struct EventsQuery {
+    /// The topics to send, separated by commas; all if left out.
+    #[param(example = "status,nodes")]
+    topics: Option<String>,
+}
+
+/// Opens a WebSocket that pushes snapshots instead of being polled. Each
+/// text message is one topic's full state, as its GET returns it:
+/// `{"topic": "status", "data": {…}}`. The topics are `status`, `nodes`
+/// (`null` while mDNS is not running), `outputs` and `settings`. Every
+/// topic asked for comes once on connecting, then again whenever it
+/// changed: `nodes` and `settings` within 250 ms, `status` and `outputs`
+/// at most once a second. Messages from the client are ignored.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/events",
+    tag = "events",
+    params(EventsQuery),
+    responses(
+        (status = SWITCHING_PROTOCOLS, description = "WebSocket opened"),
+        (status = BAD_REQUEST, description = "Unknown topic, or not a WebSocket request", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn events(
+    State(node): State<Arc<Node>>,
+    Query(q): Query<EventsQuery>,
+    ws: WebSocketUpgrade,
+) -> Result<axum::response::Response, ApiError> {
+    let topics = match q.topics.as_deref() {
+        None => Topic::ALL.to_vec(),
+        Some(list) => list
+            .split(',')
+            .map(|t| {
+                serde_json::from_value(serde_json::Value::String(t.trim().to_owned())).map_err(
+                    |_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!(
+                                "unknown topic {t:?}; expected status, nodes, outputs or settings"
+                            ),
+                        )
+                    },
+                )
+            })
+            .collect::<Result<_, _>>()?,
+    };
+    Ok(ws.on_upgrade(move |socket| crate::events::serve(socket, node, topics)))
 }
 
 /// Sets the type of an output, overriding what was detected. Kept across
@@ -864,6 +942,7 @@ mod tests {
         assert_eq!(
             paths,
             [
+                "/x-orpheus/v1/events",
                 "/x-orpheus/v1/nodes",
                 "/x-orpheus/v1/nodes/{id}",
                 "/x-orpheus/v1/outputs",

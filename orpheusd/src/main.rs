@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod connection;
+mod events;
 mod health;
 mod home;
 mod network;
@@ -106,6 +107,7 @@ async fn main() -> Result<()> {
         health: Mutex::default(),
         mixer: Mutex::default(),
         peers: Mutex::new(peers::Peers::load(home.state_dir().join("peers.json"))),
+        events: events::Events::default(),
     });
     connection::restore(&node);
 
@@ -113,6 +115,7 @@ async fn main() -> Result<()> {
     let peers = tokio::spawn(connection::watch_peers(node.clone()));
     let health = tokio::spawn(health::watch(node.clone()));
     let mixer = tokio::spawn(policy::run(node.clone()));
+    let events = tokio::spawn(events::watch(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -122,6 +125,7 @@ async fn main() -> Result<()> {
     refresh.abort();
     peers.abort();
     health.abort();
+    events.abort();
     mixer.abort();
     let _ = refresh.await;
     let _ = peers.await;
