@@ -7,7 +7,10 @@
 //! has no receiver claims one at once.
 //!
 //! Either way a route whose peer has no free receiver waits for one
-//! ([`PeerState::Busy`]) and tries again every few seconds.
+//! ([`PeerState::Busy`]) and tries again every few seconds. One whose peer
+//! has no receiver that can play the stream ([`PeerState::Incompatible`])
+//! tries again when the peer's receivers change, or every minute if
+//! discovery doesn't tell.
 
 use std::collections::BTreeSet;
 
@@ -21,6 +24,10 @@ const SOUND_MS: u64 = 500;
 
 /// How often a sender waiting for a free receiver tries again.
 const BUSY_RETRY: Duration = Duration::from_secs(5);
+
+/// How often a sender whose peer has no fitting receiver tries again, if
+/// discovery doesn't say when the peer's receivers change.
+const UNFIT_RETRY: Duration = Duration::from_secs(60);
 
 /// What the last round saw.
 #[derive(Default)]
@@ -64,6 +71,15 @@ fn decide(node: &Node, seen: &mut Seen) -> Vec<(SenderId, Action)> {
     let Some(engine) = &node.engine else {
         return vec![];
     };
+    // Before the locks below: the peers' receiver change counters.
+    let counters: BTreeMap<String, Option<u8>> = node
+        .discovery
+        .as_ref()
+        .map(|d| d.nodes())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|n| Some((n.id?, n.receivers)))
+        .collect();
     let settings = node.settings().sender;
     let on_play = settings.claim == Claim::OnPlay;
     let release_after = Duration::from_secs(settings.release_after_s.into());
@@ -92,6 +108,16 @@ fn decide(node: &Node, seen: &mut Seen) -> Vec<(SenderId, Action)> {
         // Routes restored at start have no time: they may go at once.
         let retry = link.since.is_none_or(|t| t.elapsed() >= BUSY_RETRY);
         let held = link.since.is_some_and(|t| t.elapsed() < release_after);
+        let counter = to
+            .node
+            .as_ref()
+            .and_then(|n| counters.get(n))
+            .copied()
+            .flatten();
+        let refit = match (counter, link.unfit_at) {
+            (Some(now), Some(then)) => now != then,
+            _ => link.since.is_none_or(|t| t.elapsed() >= UNFIT_RETRY),
+        };
         let quiet = !held
             && s.silent_ms
                 .is_none_or(|ms| ms >= release_after.as_millis() as u64);
@@ -107,8 +133,13 @@ fn decide(node: &Node, seen: &mut Seen) -> Vec<(SenderId, Action)> {
                 link.since = Some(now);
                 actions.push((id, Action::Claim { first: false }));
             }
-            PeerState::Busy if on_play && quiet => {
-                tracing::info!(%id, "silent; no longer waiting for a free receiver");
+            PeerState::Incompatible if wanted && refit => {
+                link.state = PeerState::Connecting;
+                link.since = Some(now);
+                actions.push((id, Action::Claim { first: false }));
+            }
+            PeerState::Busy | PeerState::Incompatible if on_play && quiet => {
+                tracing::info!(%id, "silent; no longer waiting for a receiver");
                 link.state = PeerState::Idle;
                 link.since = Some(now);
             }
@@ -144,7 +175,8 @@ fn humanize(d: Duration) -> String {
 }
 
 /// Connects a free receiver of route `id`'s peer to it and resumes the
-/// sender, which fades in; if the peer has none, the route waits for one.
+/// sender, which fades in; if the peer has none, the route waits for one,
+/// and if none fits, for the peer's receivers to change.
 fn claim(node: &Node, id: SenderId, first: bool) {
     let from = {
         let conns = node.connections.lock().unwrap();
@@ -176,10 +208,15 @@ fn claim(node: &Node, id: SenderId, first: bool) {
         retarget(node, id, to.clone(), dest)?;
         attach(node, id, &to)
     });
+    let mut unfit = None;
     let ok = match claimed {
         Ok(true) => true,
         Ok(false) => {
             tracing::debug!(%id, "another sender took the free receiver meanwhile");
+            false
+        }
+        Err((StatusCode::UNPROCESSABLE_ENTITY, e)) => {
+            unfit = Some(e);
             false
         }
         Err((_, e)) => {
@@ -187,19 +224,34 @@ fn claim(node: &Node, id: SenderId, first: bool) {
             false
         }
     };
+    // What discovery says about the peer's receivers now, before the lock.
+    let counter = from.node.as_ref().and_then(|n| {
+        let nodes = node.discovery.as_ref()?.nodes();
+        nodes
+            .into_iter()
+            .find(|d| d.id.as_ref() == Some(n))?
+            .receivers
+    });
     let mut conns = node.connections.lock().unwrap();
     let Some(link) = conns.links.get_mut(&id) else {
         return;
     };
     link.since = Some(Instant::now());
+    link.unfit_at = counter.filter(|_| unfit.is_some());
     link.state = if ok {
         link.displaced = false;
         PeerState::Connected
+    } else if unfit.is_some() {
+        PeerState::Incompatible
     } else {
         PeerState::Busy
     };
     if ok {
         tracing::info!(%id, "claimed a receiver of the peer; sending");
+    } else if let Some(e) = unfit {
+        if first {
+            tracing::warn!(%id, error = %e, "none of the peer's receivers can play the stream; waiting for one that can");
+        }
     } else if first {
         tracing::info!(%id, "the peer has no free receiver; waiting for one");
     }

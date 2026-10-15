@@ -96,8 +96,9 @@ affected.
   connected at the same moment; try again.
 - `422 resolving …`: no node of that name was discovered, and the name is
   not a host name either. `orpheusctl nodes` lists the names known.
-- `422 … has no receiver for L24/48000/2`: none of the peer's receivers can
-  play the stream.
+- `422 … has no receiver for L24/48000/2: …`: none of the peer's
+  receivers can play the stream; the message names the first capability
+  that doesn't fit, for example `channel count 2; it takes 8`.
 - `502 … no answer`: the peer's API is unreachable: wrong address, the node
   is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
   whether the node was discovered and under which address.
@@ -124,7 +125,8 @@ affected.
    - no receiver at all: they are disabled in `[receiver]`.
 
    On the sending node, a sender shown as `(disconnected, paused)`,
-   `(waiting for a free receiver)`, `(idle)` or `(off)` sends nothing; see
+   `(waiting for a free receiver)`, `(peer can't play this stream)`,
+   `(idle)` or `(off)` sends nothing; see
    [reading the status](usage.md#reading-the-status). `idle` is a route
    that [claims on play](usage.md#claiming-a-receiver-on-play) while
    nothing plays into its sink; `waiting for a free receiver` means all of

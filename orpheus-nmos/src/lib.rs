@@ -5,8 +5,9 @@
 //! content changes and counts changes per resource type, which IS-04
 //! peer-to-peer discovery announces in the `ver_*` TXT keys. [`sdp`] writes
 //! the SDP files senders link to; [`is05`] has the parameters of the
-//! Connection API.
+//! Connection API, and [`caps`] the receiver capabilities of BCP-004-01.
 
+pub mod caps;
 pub mod is04;
 pub mod is05;
 pub mod sdp;

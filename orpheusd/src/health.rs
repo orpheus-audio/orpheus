@@ -74,6 +74,8 @@ pub enum WarningKind {
     /// The route wants a receiver on the peer, but the peer has no free
     /// one.
     PeerBusy,
+    /// None of the peer's receivers can play the route's stream.
+    PeerIncompatible,
 }
 
 /// What a warning is about.
@@ -433,14 +435,22 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
             receiver: None,
             message,
         };
-        if links.get(&id).is_some_and(|l| l.state == PeerState::Busy) {
-            found.push(warn(
+        match links.get(&id).map(|l| l.state) {
+            Some(PeerState::Busy) => found.push(warn(
                 WarningKind::PeerBusy,
                 format!(
                     "route {}: the peer has no free receiver; it waits for one",
                     s.name
                 ),
-            ));
+            )),
+            Some(PeerState::Incompatible) => found.push(warn(
+                WarningKind::PeerIncompatible,
+                format!(
+                    "route {}: none of the peer's receivers can play the stream",
+                    s.name
+                ),
+            )),
+            _ => {}
         }
         if !s.enabled {
             continue;

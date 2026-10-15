@@ -840,6 +840,7 @@ fn route_state(p: Paint, state: Option<&str>) -> String {
         None | Some("connected") => p.mark(Level::Good, "connected"),
         Some("idle") => p.mark(Level::Off, "idle, claims a receiver when audio plays"),
         Some("busy") => p.mark(Level::Warn, "waiting for a free receiver"),
+        Some("incompatible") => p.mark(Level::Warn, "peer can't play this stream"),
         Some("offline") => p.mark(Level::Off, "peer offline, sink hidden"),
         Some("unreachable") => p.mark(Level::Warn, "peer unreachable"),
         Some("disconnected") => p.mark(Level::Warn, "disconnected, paused"),
@@ -1663,6 +1664,7 @@ fn peer_column(t: &Sender) -> String {
     match t.receiver.as_ref().map(|r| r.state.as_str()) {
         Some("disconnected") => notes.push("disconnected, paused".to_owned()),
         Some("busy") => notes.push("waiting for a free receiver".to_owned()),
+        Some("incompatible") => notes.push("peer can't play this stream".to_owned()),
         Some("offline") => notes.push("peer offline, sink hidden".to_owned()),
         Some(s @ ("unreachable" | "connecting" | "idle")) => notes.push(s.to_owned()),
         _ if !t.enabled => notes.push("off".into()),

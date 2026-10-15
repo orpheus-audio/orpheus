@@ -265,6 +265,10 @@ struct Link {
     /// Since when the peer has been unreachable.
     #[serde(skip)]
     unreachable_since: Option<Instant>,
+    /// The peer's receiver change counter (`ver_rcv`) when none of its
+    /// receivers fit, if discovery knew it.
+    #[serde(skip)]
+    unfit_at: Option<u8>,
 }
 
 /// How a sender's connection to a peer's receiver stands.
@@ -290,6 +294,10 @@ pub enum PeerState {
     /// sender took its receiver, or all were taken when audio started. It
     /// pauses and tries again every few seconds.
     Busy,
+    /// None of the peer's receivers can play the stream (their
+    /// capabilities don't fit). It pauses and tries again when the peer's
+    /// receivers change.
+    Incompatible,
     /// The peer has been unreachable for a while and isn't pinned: the
     /// sink is gone until the peer is back, so that applications play
     /// elsewhere meanwhile.
@@ -299,7 +307,10 @@ pub enum PeerState {
 impl PeerState {
     /// Whether the sender holds its packets back in this state.
     fn pauses(self) -> bool {
-        matches!(self, Self::Disconnected | Self::Idle | Self::Busy)
+        matches!(
+            self,
+            Self::Disconnected | Self::Idle | Self::Busy | Self::Incompatible
+        )
     }
 }
 
@@ -688,6 +699,7 @@ pub fn connect(
         volume: cached.as_ref().and_then(|c| c.volume.clone()),
         since: Some(Instant::now()),
         unreachable_since: None,
+        unfit_at: None,
     };
     start_sender(
         node,
@@ -1312,7 +1324,10 @@ fn update_link(
             link.state = if p.sender == Some(ours) {
                 stale = was == PeerState::Idle;
                 if stale { was } else { PeerState::Connected }
-            } else if matches!(was, PeerState::Idle | PeerState::Busy) {
+            } else if matches!(
+                was,
+                PeerState::Idle | PeerState::Busy | PeerState::Incompatible
+            ) {
                 was
             } else if link.displaced {
                 link.since = None;

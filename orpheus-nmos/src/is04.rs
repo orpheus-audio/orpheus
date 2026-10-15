@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
+use crate::caps::AudioConstraints;
+
 pub const API_VERSION: &str = "v1.3";
 pub const FORMAT_AUDIO: &str = "urn:x-nmos:format:audio";
 /// RTP, unicast or multicast.
@@ -277,9 +279,13 @@ pub struct Receiver {
     pub subscription: ReceiverSubscription,
 }
 
+/// What a receiver plays: IS-04's media types, and the finer constraints
+/// of BCP-004-01 with the time they last changed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ReceiverCaps {
     pub media_types: Vec<&'static str>,
+    pub constraint_sets: Vec<AudioConstraints>,
+    pub version: Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

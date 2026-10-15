@@ -142,6 +142,12 @@ resource gets a new version when its content changes. The node then
 announces a new `ver_*` counter in its mDNS TXT record, which tells NMOS
 controllers and other nodes to fetch the resources again.
 
+Receivers announce what they play in their capabilities (BCP-004-01): one
+constraint set with media type, sample rate, channel count and sample
+depth. Before `connect` takes a peer's receiver, it checks the receiver's
+constraint sets against the stream; constraints on other parameters are
+ignored, receivers without constraint sets are judged by `media_types`.
+
 Each sender's `manifest_href` points to its SDP file. Its session version
 follows the sender's and the node's resource versions, so it changes when the
 destination or the PTP grandmaster does.
@@ -207,7 +213,10 @@ read it back), and an idle one lets it go after `release_after_s` of
 silence. While a route has no receiver, its sender sends nothing; when it
 resumes, it fades in over `fade_in_ms`. A route whose peer has no free
 receiver waits (`busy`) and tries every 5 seconds, also with `claim =
-"always"`, where a route without a receiver claims one at once. The peer
+"always"`, where a route without a receiver claims one at once. One whose
+peer has no receiver that fits (`422`, `incompatible`) tries again when the
+peer announces a new receiver change counter (`ver_rcv`), or every minute
+if discovery doesn't see the peer. The peer
 watch ignores what a peer said before the last claim or release, and lets
 go of a receiver still connected to an idle route.
 

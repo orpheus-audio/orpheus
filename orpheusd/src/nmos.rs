@@ -6,7 +6,7 @@
 //! discovery announces.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -19,6 +19,7 @@ use orpheus_core::rtp::Encoding;
 use orpheus_core::{AudioFormat, DeviceId};
 use orpheus_engine::sender::PAYLOAD_TYPE;
 use orpheus_engine::{ReceiverId, SenderId};
+use orpheus_nmos::caps::{AudioConstraints, Stream};
 use orpheus_nmos::is04::{self, *};
 use orpheus_nmos::is05;
 use orpheus_nmos::is05::ReceiverParams;
@@ -31,6 +32,29 @@ const CLOCK: &str = "clk0";
 /// What every sender sends and the receiver plays.
 pub const FORMAT: AudioFormat = AudioFormat::AES67;
 pub const ENCODING: Encoding = Encoding::L24;
+pub const PTIME_MS: u32 = 1;
+
+/// What every sender sends, as receiver capabilities see it.
+pub fn stream() -> Stream<'static> {
+    Stream {
+        media_type: media_type(),
+        sample_rate: FORMAT.rate,
+        channel_count: FORMAT.channels,
+        sample_depth: 8 * ENCODING.bytes_per_sample() as u8,
+        packet_time_ms: PTIME_MS.into(),
+    }
+}
+
+fn media_type() -> &'static str {
+    match ENCODING {
+        Encoding::L16 => "audio/L16",
+        Encoding::L24 => "audio/L24",
+    }
+}
+
+/// When the receivers' capabilities last changed: they change only with
+/// the program, so when it started.
+static CAPS_VERSION: LazyLock<Version> = LazyLock::new(now);
 
 pub fn router() -> Router<Arc<Node>> {
     let list = |items: &'static [&'static str]| get(move || async move { Json(items) });
@@ -203,10 +227,7 @@ fn snapshot(node: &Node) -> Snapshot {
         .collect();
     drop(conns);
     let format = FORMAT;
-    let media_type: &'static str = match ENCODING {
-        Encoding::L16 => "audio/L16",
-        Encoding::L24 => "audio/L24",
-    };
+    let media_type = media_type();
     let mut snap = Snapshot {
         node: is04::Node {
             base: Base {
@@ -259,6 +280,9 @@ fn snapshot(node: &Node) -> Snapshot {
             format: FORMAT_AUDIO,
             caps: ReceiverCaps {
                 media_types: vec![media_type],
+                // Receivers play exactly what the senders send.
+                constraint_sets: vec![AudioConstraints::exactly(&stream())],
+                version: *CAPS_VERSION,
             },
             device_id,
             transport: TRANSPORT_RTP,
@@ -307,7 +331,7 @@ fn snapshot(node: &Node) -> Snapshot {
                 numerator: format.rate,
                 denominator: 1,
             },
-            bit_depth: 8 * ENCODING.bytes_per_sample() as u8,
+            bit_depth: stream().sample_depth,
         });
         snap.senders.push(Sender {
             base: base(uuid),
@@ -391,7 +415,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         payload_type: PAYLOAD_TYPE,
         encoding: ENCODING,
         format: FORMAT,
-        ptime_ms: 1,
+        ptime_ms: PTIME_MS,
         clock,
         // RTP timestamps count media-clock frames since the epoch.
         media_clock_offset: 0,

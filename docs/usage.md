@@ -176,6 +176,10 @@ the rest of the time:
 - If the peer has no free receiver when audio starts, the route waits
   (`waiting for a free receiver`, and the warning `peer_busy`) and tries
   again every 5 seconds while audio plays.
+- If none of the peer's receivers can play the stream (their
+  capabilities don't fit), the route waits too (`peer can't play this
+  stream`, warning `peer_incompatible`), and tries again when the peer's
+  receivers change, or every minute for a peer that discovery doesn't see.
 
 Whichever receiver it gets, the peer plays the stream where it played
 before and as loud, since it remembers both per
@@ -411,6 +415,8 @@ the sender's state:
 - `(waiting for a free receiver)`: another sender took the peer's
   receiver, or all were taken when audio started; nothing is sent until
   the peer has a free one.
+- `(peer can't play this stream)`: none of the peer's receivers can play
+  the stream; nothing is sent until one can.
 - `(idle)`: the route [claims a receiver on
   play](#claiming-a-receiver-on-play) and nothing has played for a while;
   nothing is sent until audio plays.
@@ -515,7 +521,8 @@ The NMOS APIs also use `423` (IS-05: an activation is scheduled) and `501`
   `state` is `connecting`, `connected`, `disconnected`, `unreachable`,
   `idle` (let go after silence, see [claiming on
   play](#claiming-a-receiver-on-play)), `busy` (waiting for a free
-  receiver) or `offline` (the sink hidden);
+  receiver), `incompatible` (no receiver of the peer can play the stream)
+  or `offline` (the sink hidden);
   `policy` is `muted` or `ducked` while the peer holds the stream back.
 - `warnings`: a list of `{kind, on, sender, message}`, see
   [warnings](#warnings).
@@ -544,6 +551,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. |
 | `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
 | `peer_busy` | sender | The route wants a receiver on the peer, but all of the peer's receivers play other senders; it tries again every 5 seconds. Raise `[receiver] max` on the peer, or let other routes [claim on play](#claiming-a-receiver-on-play). |
+| `peer_incompatible` | sender | None of the peer's receivers can play the route's stream; it tries again when the peer's receivers change. |
 
 Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
 the stream or PTP takes. Each node also announces its own link, that of its
@@ -602,7 +610,8 @@ Each node serves the NMOS IS-04 Node API v1.3 at `/x-nmos/node/v1.3/`, so NMOS
 controllers can see it. It describes the node as one device with:
 
 - a **receiver** per connection and a free one (see [several
-  streams](#several-streams)), up to 8 by default;
+  streams](#several-streams)), up to 8 by default. Its capabilities
+  (`caps`, after BCP-004-01) say what it plays: L24, 48 kHz, 2 channels;
 - per sender started with `connect`, a **source**, a **flow** (L24, 48 kHz,
   stereo) and a **sender**.
 

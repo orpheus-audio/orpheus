@@ -90,8 +90,7 @@ and Bluetooth inputs.
 - The HTTP API has no authentication.
 - NMOS: peer-to-peer discovery only; nodes don't register with an NMOS
   registry. Interfaces don't name the switch port they are attached to
-  (`attached_network_device`), and receivers have no BCP-004 capabilities
-  yet.
+  (`attached_network_device`).
 - Network warnings see Wi-Fi only on the two ends' own links; a wireless
   hop in between shows only as jitter. Along a chain of nodes (A to B, B on
   to C), C doesn't learn about Wi-Fi between A and B. Wi-Fi detection is

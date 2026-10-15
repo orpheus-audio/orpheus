@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use orpheus_core::{DeviceId, OutputType};
 use orpheus_nmos::is04::{TAG_FORM_FACTOR, TAG_STATE, TAG_WARNINGS};
-use orpheus_nmos::{Uuid, is05, resource_id};
+use orpheus_nmos::{Uuid, caps, is05, resource_id};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -231,27 +231,49 @@ fn patch_receiver(api: &str, receiver: Uuid, body: &Value) -> Result<(), Fail> {
     Err((StatusCode::BAD_GATEWAY, format!("{api} refused: {msg}")))
 }
 
-/// Picks a receiver on `peer` that plays our format and has no sender, or
-/// with `force`, one that plays another node's sender. `ours` are our
-/// senders, whose receivers are never taken.
+/// Picks a receiver on `peer` whose capabilities (BCP-004-01) take our
+/// stream and that has no sender, or with `force`, one that plays another
+/// node's sender. `ours` are our senders, whose receivers are never taken.
 pub fn find_receiver(peer: &Peer, ours: &[Uuid], force: bool) -> Result<Target, Fail> {
     let receivers = get(&peer.api, "/x-nmos/node/v1.3/receivers")?;
     let receivers = receivers.as_array().cloned().unwrap_or_default();
-    let fits = |r: &&Value| {
-        r["format"] == "urn:x-nmos:format:audio"
-            && r["transport"]
-                .as_str()
-                .is_some_and(|t| t.starts_with(is05::TRANSPORT_RTP))
-            && r["caps"]["media_types"]
-                .as_array()
-                .is_none_or(|m| m.iter().any(|t| t == "audio/L24"))
-    };
-    let fitting: Vec<&Value> = receivers.iter().filter(fits).collect();
+    let audio: Vec<&Value> = receivers
+        .iter()
+        .filter(|r| {
+            r["format"] == "urn:x-nmos:format:audio"
+                && r["transport"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with(is05::TRANSPORT_RTP))
+        })
+        .collect();
     let name = peer.name.as_deref().unwrap_or(&peer.api);
-    if fitting.is_empty() {
+    if audio.is_empty() {
         return Err((
             StatusCode::UNPROCESSABLE_ENTITY,
-            format!("{name} has no receiver for L24/48000/2 over RTP"),
+            format!("{name} has no audio receiver over RTP"),
+        ));
+    }
+    let stream = crate::nmos::stream();
+    let checked: Vec<_> = audio
+        .iter()
+        .map(|r| (*r, caps::check(&r["caps"], &stream)))
+        .collect();
+    let fitting: Vec<&Value> = checked
+        .iter()
+        .filter(|(_, fit)| fit.is_ok())
+        .map(|(r, _)| *r)
+        .collect();
+    if fitting.is_empty() {
+        let why = checked.iter().find_map(|(_, fit)| fit.clone().err());
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "{name} has no receiver for {}/{}/{}: {}",
+                stream.media_type.trim_start_matches("audio/"),
+                stream.sample_rate,
+                stream.channel_count,
+                why.unwrap_or_default()
+            ),
         ));
     }
     let chosen = match fitting.iter().find(|r| holder(r).is_none()) {
