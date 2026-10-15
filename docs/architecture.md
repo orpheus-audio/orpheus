@@ -285,7 +285,18 @@ Whenever ports or links come or go, a timer on the PipeWire thread
 (every 200 ms, only after a change) makes the links that are missing, so
 an output whose device was unplugged plays there again once it is back.
 The node and its links are destroyed with the handle, and with orpheusd,
-since they don't linger. The patchbay's wires will be links made the same way.
+since they don't linger.
+
+[Wires](usage.md#wires) are links made the same way. `wires.rs` keeps them
+by their ends: a source (by its ID, not the receiver playing it) or an
+input, and an output, with channel pairs by number, symbol or label, or
+none for all. Every second, after the sources are placed, it resolves them
+against the running receivers and the inputs and outputs there are into
+links by node name and channel index, and hands the list to the engine;
+the PipeWire thread makes the missing ones and drops those no longer
+asked for on the same timer. A source with wires is placed nowhere
+(`Placement::Held`), so the session manager doesn't link it as well.
+PipeWire sums what meets at an input port; nothing is turned down.
 
 `connection.rs` watches the peers' receivers the senders are connected to.
 Discovery keeps each node's receiver change counter (`ver_rcv` in its mDNS

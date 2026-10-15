@@ -7,8 +7,8 @@ use orpheus_clock::Clock;
 use orpheus_core::{AudioFormat, ChannelMap, Layout, OutputType};
 
 use crate::backend::{
-    AudioBackend, BackendError, Input, Output, OutputSpec, Placement, StreamHandle, StreamSpec,
-    Volume,
+    AudioBackend, BackendError, Input, Link, Output, OutputSpec, Placement, StreamHandle,
+    StreamSpec, Volume,
 };
 use crate::port::{PortStats, StatsSnapshot, port_pair};
 use crate::receiver::{Filter, Receiver, ReceiverConfig, ReceiverStatus};
@@ -297,6 +297,16 @@ impl Engine {
     /// Removes a created output; `false` if there is none of that name.
     pub fn remove_output(&mut self, name: &str) -> bool {
         self.created.remove(name).is_some()
+    }
+
+    /// Keeps exactly these links made; see [`AudioBackend::set_links`].
+    pub fn set_links(&self, links: &[Link]) -> Result<(), BackendError> {
+        self.backend.set_links(links)
+    }
+
+    /// The links asked for that are made now.
+    pub fn links(&self) -> Vec<Link> {
+        self.backend.links()
     }
 
     /// Makes output `name` the default one; see

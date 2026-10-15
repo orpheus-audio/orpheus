@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use orpheus_core::{AudioFormat, Layout, OutputType, Symbol};
 use orpheus_engine::{
-    AudioBackend, BackendError, CapturePort, Input, Output, OutputSpec, Placement, PlaybackPort,
-    StreamControl, StreamHandle, StreamSpec, Volume,
+    AudioBackend, BackendError, CapturePort, Input, Link, Output, OutputSpec, Placement,
+    PlaybackPort, StreamControl, StreamHandle, StreamSpec, Volume,
 };
 use pipewire::{self as pw, properties::properties, spa};
 use spa::param::audio::{AudioFormat as SpaFormat, AudioInfoRaw, MAX_CHANNELS};
@@ -313,6 +313,27 @@ impl AudioBackend for PipeWireBackend {
         }))
     }
 
+    fn set_links(&self, links: &[Link]) -> Result<(), BackendError> {
+        let mut g = self.graph.lock().unwrap();
+        if g.wires != links {
+            g.wires = links.to_vec();
+            g.changed = true;
+        }
+        Ok(())
+    }
+
+    fn links(&self) -> Vec<Link> {
+        let g = self.graph.lock().unwrap();
+        g.wires
+            .iter()
+            .filter(|l| {
+                g.ports_of_link(l)
+                    .is_some_and(|(_, out, _, input)| g.has_link((out, input)))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn set_default_output(&self, name: &str) -> Result<(), BackendError> {
         let (reply, result) = mpsc::sync_channel(1);
         self.tx
@@ -438,14 +459,19 @@ fn run(
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
     let created: Rc<RefCell<HashMap<u64, Created>>> = Rc::default();
-    // Links the created outputs to their devices as ports come and go.
+    // Links the created outputs to their devices, and the wires, as ports
+    // come and go.
     let relink = mainloop.loop_().add_timer({
         let core = core.clone();
         let graph = graph.clone();
         let created = created.clone();
+        let wired = RefCell::new(Made::new());
         move |_| {
             if std::mem::take(&mut graph.lock().unwrap().changed) {
                 link_outputs(&core, &graph, &mut created.borrow_mut());
+                let g = graph.lock().unwrap();
+                let want = g.wired_links();
+                reconcile(&core, &g, &want, &mut wired.borrow_mut(), "wires");
             }
         }
     });
@@ -583,7 +609,7 @@ struct Created {
     /// The links made, by output and input port, and whether each was
     /// seen in the graph since. Dropped before the node, which would take
     /// them along.
-    links: HashMap<(u32, u32), (pw::link::Link, bool)>,
+    links: Made,
     /// Keeps the node; dropping it removes it.
     _node: pw::node::Node,
 }
@@ -615,8 +641,7 @@ fn create_output(core: &pw::core::CoreRc, spec: &OutputSpec) -> Result<pw::node:
 }
 
 /// Links each created output to the channels of its device that are
-/// there, and forgets links that went: made again once their ports are
-/// back.
+/// there.
 fn link_outputs(
     core: &pw::core::CoreRc,
     graph: &Mutex<Graph>,
@@ -625,31 +650,46 @@ fn link_outputs(
     let g = graph.lock().unwrap();
     for c in created.values_mut() {
         let want = g.wanted_links(&c.spec);
-        c.links.retain(|pair, (_, seen)| {
-            let present = g.has_link(*pair);
-            *seen |= present;
-            want.iter().any(|w| (w.1, w.3) == *pair) && (present || !*seen)
-        });
-        for (out_node, out_port, in_node, in_port) in want {
-            if g.has_link((out_port, in_port)) || c.links.contains_key(&(out_port, in_port)) {
-                continue;
+        reconcile(core, &g, &want, &mut c.links, &c.spec.name);
+    }
+}
+
+/// Links made by Orpheus, by output and input port, and whether each was
+/// seen in the graph since.
+type Made = HashMap<(u32, u32), (pw::link::Link, bool)>;
+
+/// Makes the links of `want` that are missing, drops those of `made` no
+/// longer wanted, and forgets those that went: made again once their
+/// ports are back. `what` names their owner in warnings.
+fn reconcile(
+    core: &pw::core::CoreRc,
+    g: &Graph,
+    want: &[(u32, u32, u32, u32)],
+    made: &mut Made,
+    what: &str,
+) {
+    made.retain(|pair, (_, seen)| {
+        let present = g.has_link(*pair);
+        *seen |= present;
+        want.iter().any(|w| (w.1, w.3) == *pair) && (present || !*seen)
+    });
+    for &(out_node, out_port, in_node, in_port) in want {
+        if g.has_link((out_port, in_port)) || made.contains_key(&(out_port, in_port)) {
+            continue;
+        }
+        let ids = [out_node, out_port, in_node, in_port].map(|id| id.to_string());
+        let props = properties! {
+            "link.output.node" => ids[0].as_str(),
+            "link.output.port" => ids[1].as_str(),
+            "link.input.node" => ids[2].as_str(),
+            "link.input.port" => ids[3].as_str(),
+            "object.linger" => "false",
+        };
+        match core.create_object::<pw::link::Link>("link-factory", &props) {
+            Ok(link) => {
+                made.insert((out_port, in_port), (link, false));
             }
-            let ids = [out_node, out_port, in_node, in_port].map(|id| id.to_string());
-            let props = properties! {
-                "link.output.node" => ids[0].as_str(),
-                "link.output.port" => ids[1].as_str(),
-                "link.input.node" => ids[2].as_str(),
-                "link.input.port" => ids[3].as_str(),
-                "object.linger" => "false",
-            };
-            match core.create_object::<pw::link::Link>("link-factory", &props) {
-                Ok(link) => {
-                    c.links.insert((out_port, in_port), (link, false));
-                }
-                Err(e) => {
-                    tracing::warn!(output = %c.spec.name, error = %e, "linking to the device");
-                }
-            }
+            Err(e) => tracing::warn!(%what, error = %e, "linking channels"),
         }
     }
 }
@@ -1072,8 +1112,12 @@ struct Graph {
     links: HashMap<u32, LinkInfo>,
     /// Audio ports by ID.
     ports: HashMap<u32, Port>,
-    /// Whether ports or links came or went since the created outputs were
-    /// last linked.
+    /// Machine names of all nodes, by ID.
+    names: HashMap<u32, String>,
+    /// The links asked for besides those of created outputs.
+    wires: Vec<Link>,
+    /// Whether ports, links or wires came or went since the created
+    /// outputs and the wires were last linked.
     changed: bool,
     /// Node IDs of our streams, by stream ID.
     streams: HashMap<u64, u32>,
@@ -1217,6 +1261,32 @@ impl Graph {
             .collect()
     }
 
+    /// The wires' links whose ports are there: output node and port,
+    /// input node and port.
+    fn wired_links(&self) -> Vec<(u32, u32, u32, u32)> {
+        let mut want: Vec<_> = self
+            .wires
+            .iter()
+            .filter_map(|w| self.ports_of_link(w))
+            .collect();
+        want.sort_unstable();
+        want.dedup();
+        want
+    }
+
+    fn ports_of_link(&self, link: &Link) -> Option<(u32, u32, u32, u32)> {
+        let node = |name: &str| {
+            self.names
+                .iter()
+                .find(|(_, n)| *n == name)
+                .map(|(&id, _)| id)
+        };
+        let (from, to) = (node(&link.from)?, node(&link.to)?);
+        let (out_port, _) = *self.channel_ports(from, true).get(link.from_channel)?;
+        let (in_port, _) = *self.channel_ports(to, false).get(link.to_channel)?;
+        Some((from, out_port, to, in_port))
+    }
+
     fn has_link(&self, (output_port, input_port): (u32, u32)) -> bool {
         self.links
             .values()
@@ -1314,6 +1384,13 @@ fn watch_graph(
                 let props = global.props;
                 let get = |key: &str| props.and_then(|p| p.get(key));
                 let id = global.id;
+                if global.type_ == pw::types::ObjectType::Node
+                    && let Some(name) = get(*pw::keys::NODE_NAME)
+                {
+                    let mut g = graph.lock().unwrap();
+                    g.names.insert(id, name.to_owned());
+                    g.changed = true;
+                }
                 match global.type_ {
                     pw::types::ObjectType::Link => {
                         let id_of = |k| get(k).and_then(|v: &str| v.parse().ok());
@@ -1447,6 +1524,7 @@ fn watch_graph(
                 let mut g = graph.lock().unwrap();
                 g.sinks.remove(&id);
                 g.sources.remove(&id);
+                g.names.remove(&id);
                 if g.links.remove(&id).is_some() || g.ports.remove(&id).is_some() {
                     g.changed = true;
                 }

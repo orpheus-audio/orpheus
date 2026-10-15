@@ -28,6 +28,9 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `inputs` | Lists the node's [inputs](#inputs-and-outputs): the receivers' streams and the audio system's inputs, such as microphones, with their channels. |
 | `output create NAME DEVICE CHANNEL… [--layout LAYOUT]` | Creates an output that plays on chosen channels of another, for example channels 3 and 4 of an audio interface (see [inputs and outputs](#inputs-and-outputs)). Kept across restarts. |
 | `output remove OUTPUT` | Removes a created output. |
+| `wire FROM OUTPUT [OUT=IN…]` | Plays channels of a source or an input on an output (see [wires](#wires)): `L=R R=L` plays the input's right channel on the output's left and the other way round; without pairs, all channels go where they belong. A source with wires plays only on them. Kept across restarts. |
+| `unwire FROM OUTPUT [OUT=IN…]` | Removes a wire, or some of its channel pairs. A source left without wires plays on its output again. |
+| `patch` | Shows the wires as a patch bay: for each output channel, everything that plays on it. |
 | `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
 | `default OUTPUT` | Makes `OUTPUT` (as for `set-type`) the default output, where applications play and received streams without an output of their own go; a route's sink works too, so that the node's audio goes to the peer. The same as choosing it in the desktop's sound settings, for nodes without a desktop. The audio system keeps it across restarts. |
 | `sources` | Lists the [sources](#outputs-and-volume) the receivers remember: where each plays, how loud, and whether it plays now. |
@@ -352,8 +355,57 @@ in `outputs.json` and created again at start. While the device is
 missing, `outputs` marks it `(missing)` and what is played into it goes
 nowhere; once the device is back, it plays there again.
 
-Inputs are listed only for now; wiring them to outputs comes with the
-patchbay (see the [roadmap](roadmap.md)).
+Inputs are played on outputs with [wires](#wires).
+
+### Wires
+
+A wire plays channels of a source, or of an input such as a microphone,
+on chosen channels of an output: a device, a created output, or a sink to
+another node. Each pair names an output channel and the input channel
+played on it, `OUT=IN`, by number (from 1), [symbol](#channel-layouts) or
+label:
+
+```sh
+orpheusctl wire TV Kitchen                  # all channels, where they belong
+orpheusctl wire TV Kitchen L=R R=L          # left and right swapped
+orpheusctl wire TV "Scarlett 4i4" 3=L 4=R   # on channels 3 and 4
+orpheusctl wire "USB mic" Kitchen 1=1 2=1   # a mono mic on both sides
+orpheusctl unwire TV Kitchen 3=L            # one pair
+orpheusctl unwire TV Kitchen                # the whole wire
+orpheusctl patch
+```
+
+`FROM` is a [source](#outputs-and-volume) by name or ID, as `sources`
+lists them, or an input by name or description, as `inputs` lists them.
+A source is wired, not the receiver playing it: the wire applies to
+whichever receiver plays the source, and waits while none does. A source
+with wires plays only on them, not on its output; without wires it goes
+back there.
+
+Without pairs, each channel goes to the output channel of the same
+symbol. What the output lacks is folded onto it: side and rear channels
+onto its left and right, the centre onto its centre or else both sides,
+mono onto every channel; the LFE is left out. Channels with no symbols in
+common go by number. Folded channels are summed as they are, not turned
+down, and can clip.
+
+What several wires bring into one output channel is summed, too.
+`patch` shows it as it is, every input on each output channel:
+
+```
+Kitchen (orpheus.output.kitchen)
+  L  ← TV: R, USB mic: M1
+  R  ← TV: L, USB mic: M1
+
+Waiting
+  Radio → Kitchen (all): Radio plays nowhere
+```
+
+Wires are kept in `wires.json` in the [state
+directory](configuration.md#files). A wire waits while its source plays
+nowhere or an end is missing, and links again once it is back. On Linux,
+each pair is a PipeWire link from the input's port to the output's port;
+`pw-link -l` shows them.
 
 ## Aliases and pins
 
@@ -550,6 +602,9 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `PUT /x-orpheus/v1/outputs/{name}/type` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}/type` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
 | `GET /x-orpheus/v1/inputs` | The [inputs](#inputs-and-outputs): `name`, `description`, `kind` (`receiver` or `device`), `receiver` (its ID, for a receiver) and `channels`. |
+| `GET /x-orpheus/v1/wires` | The [wires](#wires): `source` (ID) or `input` (machine name), `from_name`, `output`, `output_name`, `channels` (the pairs as set, absent for all), `links` (what it links now: `from` and `to` channel, counted from 1, and whether the audio system has made the link) and, while known, `from_channels` and `output_channels` as [layouts](#channel-layouts). |
+| `PUT /x-orpheus/v1/wires` | Sets the wire between a source or input and an output, replacing one there. Body: `{"source": "<id>", "output": "<name>"}` or `{"input": "<name>", …}`, optionally with `"channels": [{"to": "L", "from": "R"}, {"to": 3, "from": 1}]`. Returns `200` with the wire as listed; `400` for a malformed request or no pairs, `422` if there is no such source, input or output, or no such channel, `503` without an audio system. |
+| `DELETE /x-orpheus/v1/wires?source=<id>&output=<name>` | Removes a wire; `input=<name>` instead of `source` for an input. Returns `204`; `400` without either, `404` if there is no such wire. |
 | `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |
 | `PATCH /x-orpheus/v1/nodes/{id}` | Sets a node's [alias or pin](#aliases-and-pins), by its node ID. Body: `{"alias": "Kitchen"}`, `{"alias": null}` to remove it, `{"pinned": true}`, or both keys. Returns `204`; `400` for an empty alias, `404` if the node was never seen, `409` if another node has the alias. |
@@ -595,6 +650,8 @@ the same name returns it, when it connects and again whenever it changes:
 | `settings` | `GET /x-orpheus/v1/settings` |
 | `routes` | `GET /x-orpheus/v1/routes` |
 | `sources` | `GET /x-orpheus/v1/sources`, at most once a second |
+| `inputs` | `GET /x-orpheus/v1/inputs`, at most once a second |
+| `wires` | `GET /x-orpheus/v1/wires`, at most once a second |
 
 `?topics=status,routes` picks topics; an unknown one is a `400`. The
 others come within 250 ms of a change. A slow client skips states but
@@ -642,7 +699,9 @@ websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
   stream's channels carry, `symbol` and `label` per channel (see
   [channel layouts](#channel-layouts)); `state` is what the
   [policy](#several-streams) does to it: `silent`, `playing`, `muted` or
-  `ducked`.
+  `ducked`. `plays_on` names the output it plays on; `held` says it
+  plays nowhere (see [warnings](#warnings)), `wired` that it plays on
+  [wires](#wires).
 - `routes`: the routes that run. `playing` says whether applications play
   into the sink, `silent_ms` how long ago it last carried sound, and
   `hidden` whether the sink is gone while the peer is offline.
@@ -856,9 +915,10 @@ with `DELETE`; an output with one pending answers `423` to other changes.
 `map/active` shows the maps in effect, and the receiver status shows its
 running stream's map as `map`.
 
-This per-receiver mapping is provisional. M7 (see the
-[roadmap](roadmap.md)) replaces it with a patchbay across all receivers
-and outputs, and IS-08 stays only if it can show that patch faithfully.
+This per-receiver mapping is provisional: [wires](#wires) do the same
+across all sources, inputs and outputs, and IS-08 stays only if it can
+show them faithfully (see the [roadmap](roadmap.md)). The map applies
+before the wires: they take the stream's channels as mapped.
 
 ### Multicast (interop)
 

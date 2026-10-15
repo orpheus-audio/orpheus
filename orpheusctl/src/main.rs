@@ -164,6 +164,34 @@ enum Command {
         #[arg(required = true, num_args = 1..)]
         layout: Vec<String>,
     },
+    /// Play channels of a source or an input on an output, replacing the
+    /// wire between them. A source with wires plays only on them; what
+    /// several wires bring into one channel is summed.
+    Wire {
+        /// The source or input: its name, or a source's ID or the start
+        /// of it (see `sources` and `inputs`).
+        from: String,
+        /// The output: its name or description, or a unique part of either.
+        output: String,
+        /// Output channel = input channel, each by number (from 1),
+        /// symbol or label: `L=R R=L`, `1=U03`, `2=1`. Without any, all
+        /// channels go where they belong.
+        #[arg(value_name = "OUT=IN")]
+        channels: Vec<String>,
+    },
+    /// Remove a wire, or some of its channels. A source left without
+    /// wires plays on its output again.
+    Unwire {
+        /// The source or input, as for `wire`.
+        from: String,
+        /// The output, as for `wire`.
+        output: String,
+        /// The channel pairs to remove, as for `wire`; all if none.
+        #[arg(value_name = "OUT=IN")]
+        channels: Vec<String>,
+    },
+    /// Show the wires: what plays on each output channel.
+    Patch,
     /// Forget where a source plays and how loud; if it plays now, it goes
     /// to the default output at full volume.
     ForgetSource {
@@ -261,6 +289,9 @@ struct Receiver {
     /// Plays nowhere: the default output is another node's sink.
     #[serde(default)]
     held: bool,
+    /// Plays on wires, not on an output of its own.
+    #[serde(default)]
+    wired: bool,
     /// What the stream's channels carry.
     layout: Option<Layout>,
 }
@@ -773,6 +804,103 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             };
             reply(r).with_context(|| format!("setting the layout of {source} via {url}"))?;
         }
+        Command::Wire {
+            from,
+            output,
+            channels,
+        } => {
+            let mut body = wire_ends(base, &from, &output)?;
+            if !channels.is_empty() {
+                let pairs = channels
+                    .iter()
+                    .map(|c| parse_pair(c))
+                    .collect::<Result<Vec<_>>>()?;
+                body["channels"] = serde_json::Value::Array(pairs);
+            }
+            let url = format!("{base}/x-orpheus/v1/wires");
+            let raw = reply(agent().put(&url).send_json(&body)?)
+                .with_context(|| format!("wiring {from} to {output} via {url}"))?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let wire: WireEntry = serde_json::from_str(&raw).context("reading the wire")?;
+                print!("{}", render_wire_set(&wire, Paint::detect()));
+            }
+        }
+        Command::Unwire {
+            from,
+            output,
+            channels,
+        } => {
+            let ends = wire_ends(base, &from, &output)?;
+            let url = format!("{base}/x-orpheus/v1/wires");
+            let mut query = vec![("output", ends["output"].as_str().unwrap_or_default())];
+            for key in ["source", "input"] {
+                if let Some(v) = ends[key].as_str() {
+                    query.push((key, v));
+                }
+            }
+            if channels.is_empty() {
+                let mut req = agent().delete(&url);
+                for (k, v) in query {
+                    req = req.query(k, v);
+                }
+                reply(req.call()?).with_context(|| format!("unwiring {from} from {output}"))?;
+                return Ok(());
+            }
+            let wires: Vec<WireEntry> =
+                serde_json::from_str(&get(&url)?).context("reading the wires")?;
+            let wire = wires
+                .iter()
+                .find(|w| {
+                    w.output == ends["output"]
+                        && (w.source.as_deref() == ends["source"].as_str())
+                        && (w.input.as_deref() == ends["input"].as_str())
+                })
+                .with_context(|| format!("no wire from {from} to {output}"))?;
+            let Some(have) = &wire.channels else {
+                anyhow::bail!(
+                    "the wire plays all channels; `orpheusctl unwire {from:?} {output:?}` removes it"
+                );
+            };
+            let mut keep = have.clone();
+            for c in &channels {
+                let pair = parse_pair(c)?;
+                let same = |p: &serde_json::Value| {
+                    ["to", "from"].iter().all(|k| {
+                        p[k].to_string().trim_matches('"').to_lowercase()
+                            == pair[k].to_string().trim_matches('"').to_lowercase()
+                    })
+                };
+                let before = keep.len();
+                keep.retain(|p| !same(p));
+                if keep.len() == before {
+                    anyhow::bail!("the wire has no {c}");
+                }
+            }
+            if keep.is_empty() {
+                let mut req = agent().delete(&url);
+                for (k, v) in query {
+                    req = req.query(k, v);
+                }
+                reply(req.call()?).with_context(|| format!("unwiring {from} from {output}"))?;
+            } else {
+                let mut body = ends.clone();
+                body["channels"] = serde_json::Value::Array(keep);
+                reply(agent().put(&url).send_json(&body)?)
+                    .with_context(|| format!("unwiring channels via {url}"))?;
+            }
+        }
+        Command::Patch => {
+            let raw = get(&format!("{base}/x-orpheus/v1/wires"))?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let wires: Vec<WireEntry> =
+                    serde_json::from_str(&raw).context("reading the wires")?;
+                print!("{}", render_patch(&wires, Paint::detect()));
+            }
+        }
         Command::ForgetSource { source } => {
             let id = find_source(base, &source)?;
             let url = format!("{base}/x-orpheus/v1/sources/{id}");
@@ -849,6 +977,232 @@ fn pick(items: &[(&str, &str)], query: &str, what: &str, list: &str) -> Result<S
             found.iter().map(|i| i.1).collect::<Vec<_>>().join(", ")
         ),
     }
+}
+
+/// The ends of a wire as the API takes them: `{"source": ID}` or
+/// `{"input": NAME}`, and `{"output": NAME}`.
+fn wire_ends(base: &str, from: &str, output: &str) -> Result<serde_json::Value> {
+    let sources: Vec<SourceEntry> =
+        serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/sources"))?)
+            .context("reading the sources")?;
+    let inputs: Vec<InputEntry> =
+        serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/inputs"))?)
+            .context("reading the inputs")?;
+    let outputs: Vec<Output> = serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
+        .context("reading the outputs")?;
+    let output = &find_output(&outputs, output)?.name;
+    // Receivers' streams are wired by their sources.
+    let devices: Vec<&InputEntry> = inputs.iter().filter(|i| i.kind == "device").collect();
+    let q = from.to_lowercase();
+    let source_named: Vec<&SourceEntry> = sources
+        .iter()
+        .filter(|s| s.name.to_lowercase() == q)
+        .collect();
+    let input_named: Vec<&&InputEntry> = devices
+        .iter()
+        .filter(|i| i.name == from || i.description.to_lowercase() == q)
+        .collect();
+    let found = match (&source_named[..], &input_named[..]) {
+        ([s], []) => serde_json::json!({ "source": s.id }),
+        ([], [i]) => serde_json::json!({ "input": i.name }),
+        ([], []) => {
+            let ids: Vec<(&str, &str)> = sources
+                .iter()
+                .map(|s| (s.name.as_str(), s.id.as_str()))
+                .collect();
+            let by_part: Vec<&&InputEntry> = devices
+                .iter()
+                .filter(|i| {
+                    i.name.to_lowercase().contains(&q) || i.description.to_lowercase().contains(&q)
+                })
+                .collect();
+            match (pick(&ids, from, "source", "sources"), &by_part[..]) {
+                (Ok(id), []) => serde_json::json!({ "source": id }),
+                (Err(_), [i]) => serde_json::json!({ "input": i.name }),
+                (Err(_), []) => anyhow::bail!(
+                    "no source or input {from:?}; see `orpheusctl sources` and `orpheusctl inputs`"
+                ),
+                _ => {
+                    anyhow::bail!("{from:?} names more than one source or input; be more specific")
+                }
+            }
+        }
+        _ => anyhow::bail!("{from:?} names more than one source or input; give a source's ID"),
+    };
+    let mut body = found;
+    body["output"] = serde_json::Value::String(output.clone());
+    Ok(body)
+}
+
+/// `OUT=IN` → `{"to": OUT, "from": IN}`, numbers as numbers.
+fn parse_pair(text: &str) -> Result<serde_json::Value> {
+    let (to, from) = text
+        .split_once('=')
+        .filter(|(t, f)| !t.trim().is_empty() && !f.trim().is_empty())
+        .with_context(|| format!("{text:?} is not OUT=IN, e.g. L=R or 1=U03"))?;
+    let channel = |c: &str| {
+        let c = c.trim();
+        match c.parse::<usize>() {
+            Ok(n) => serde_json::json!(n),
+            Err(_) => serde_json::json!(c),
+        }
+    };
+    Ok(serde_json::json!({ "to": channel(to), "from": channel(from) }))
+}
+
+/// A wire, as `/x-orpheus/v1/wires` lists it.
+#[derive(Deserialize)]
+struct WireEntry {
+    source: Option<String>,
+    input: Option<String>,
+    from_name: String,
+    output: String,
+    output_name: String,
+    /// `{"to": …, "from": …}` as set; `None` for all channels.
+    channels: Option<Vec<serde_json::Value>>,
+    links: Vec<WireLink>,
+    from_channels: Option<Layout>,
+    output_channels: Option<Layout>,
+}
+
+#[derive(Deserialize)]
+struct WireLink {
+    from: usize,
+    to: usize,
+    linked: bool,
+}
+
+/// Channel `n` (from 1) of `layout`: its symbol, with its label if it has
+/// one, `Mic 3 (U03)`; its number if the layout isn't known.
+fn channel_name(layout: Option<&Layout>, n: usize) -> String {
+    match layout.and_then(|l| l.channels().get(n - 1)) {
+        Some(c) => match &c.label {
+            Some(label) => format!("{label} ({})", c.symbol),
+            None => c.symbol.to_string(),
+        },
+        None => n.to_string(),
+    }
+}
+
+/// Why a wire links nothing.
+fn waiting(w: &WireEntry) -> String {
+    if w.from_channels.is_none() {
+        match w.source {
+            Some(_) => format!("{} plays nowhere", w.from_name),
+            None => format!("{} is missing", w.from_name),
+        }
+    } else if w.output_channels.is_none() {
+        format!("{} is missing", w.output_name)
+    } else {
+        "no channels match".into()
+    }
+}
+
+/// What `wire` set.
+fn render_wire_set(w: &WireEntry, p: Paint) -> String {
+    let mut o = String::new();
+    let _ = write!(o, "{} → {}", w.from_name, w.output_name);
+    if w.links.is_empty() {
+        let _ = writeln!(
+            o,
+            ": {}",
+            p.level(Level::Warn, &format!("waiting, {}", waiting(w)))
+        );
+        return o;
+    }
+    let pairs: Vec<String> = w
+        .links
+        .iter()
+        .map(|l| {
+            format!(
+                "{}={}",
+                channel_name(w.output_channels.as_ref(), l.to),
+                channel_name(w.from_channels.as_ref(), l.from)
+            )
+        })
+        .collect();
+    let _ = writeln!(o, ": {}", pairs.join(" "));
+    o
+}
+
+/// The wires as a patch bay: per output channel, everything playing on
+/// it; then the wires that link nothing yet.
+fn render_patch(wires: &[WireEntry], p: Paint) -> String {
+    let mut o = String::new();
+    if wires.is_empty() {
+        let _ = writeln!(o, "{}", p.mark(Level::Off, "no wires"));
+        return o;
+    }
+    let mut outputs: Vec<(&str, &str)> = Vec::new();
+    for w in wires.iter().filter(|w| !w.links.is_empty()) {
+        if !outputs.iter().any(|(name, _)| *name == w.output) {
+            outputs.push((&w.output, &w.output_name));
+        }
+    }
+    for (i, (name, description)) in outputs.iter().enumerate() {
+        if i > 0 {
+            o.push('\n');
+        }
+        let _ = writeln!(o, "{} {}", p.bold(description), p.dim(&format!("({name})")));
+        let on: Vec<&WireEntry> = wires.iter().filter(|w| w.output == *name).collect();
+        let layout = on.iter().find_map(|w| w.output_channels.as_ref());
+        let mut channels: Vec<usize> = on
+            .iter()
+            .flat_map(|w| w.links.iter().map(|l| l.to))
+            .collect();
+        channels.sort_unstable();
+        channels.dedup();
+        let names: Vec<String> = channels.iter().map(|&c| channel_name(layout, c)).collect();
+        let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
+        for (c, label) in channels.iter().zip(&names) {
+            let feeds: Vec<String> = on
+                .iter()
+                .flat_map(|w| {
+                    w.links.iter().filter(|l| l.to == *c).map(move |l| {
+                        let text = format!(
+                            "{}: {}",
+                            w.from_name,
+                            channel_name(w.from_channels.as_ref(), l.from)
+                        );
+                        if l.linked {
+                            text
+                        } else {
+                            p.level(Level::Warn, &format!("{text} (linking)"))
+                        }
+                    })
+                })
+                .collect();
+            let _ = writeln!(o, "  {label:<width$}  ← {}", feeds.join(", "));
+        }
+    }
+    let idle: Vec<&WireEntry> = wires.iter().filter(|w| w.links.is_empty()).collect();
+    if !idle.is_empty() {
+        if !outputs.is_empty() {
+            o.push('\n');
+        }
+        let _ = writeln!(o, "{}", p.bold("Waiting"));
+        for w in idle {
+            let channels = match &w.channels {
+                None => "all".to_owned(),
+                Some(pairs) => pairs
+                    .iter()
+                    .map(|p| {
+                        let side = |k: &str| p[k].to_string().trim_matches('"').to_owned();
+                        format!("{}={}", side("to"), side("from"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            };
+            let _ = writeln!(
+                o,
+                "  {} → {} ({channels}): {}",
+                w.from_name,
+                w.output_name,
+                p.level(Level::Warn, &waiting(w))
+            );
+        }
+    }
+    o
 }
 
 /// A source, as `/x-orpheus/v1/sources` lists it.
@@ -1710,6 +2064,8 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
     if r.held {
         let why = "none: the default output is another node's sink";
         row(o, p, "output", &p.mark(Level::Bad, why));
+    } else if r.wired {
+        row(o, p, "output", "on wires, see `orpheusctl patch`");
     } else if let Some(output) = &r.output {
         let output = match &r.plays_on {
             Some(on) => format!("{output} ({on})"),

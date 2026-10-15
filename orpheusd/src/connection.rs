@@ -1577,6 +1577,11 @@ fn receiver_port(node: &Node, id: ReceiverId) -> u16 {
     (u32::from(node.receiver.port) + 2 * id) as u16
 }
 
+/// The machine name of receiver `id`'s stream in the audio system.
+pub fn receiver_stream(id: ReceiverId) -> String {
+    format!("orpheus.receive.{id}")
+}
+
 /// The NMOS ID of receiver `id`.
 pub fn receiver_uuid(node: &Node, id: ReceiverId) -> Uuid {
     resource_id(node.id, &format!("receiver/{id}"))
@@ -1720,7 +1725,7 @@ fn apply_receiver(
             .start_receiver(
                 id,
                 &ReceiverConfig {
-                    name: format!("orpheus.receive.{id}"),
+                    name: receiver_stream(id),
                     description: name.clone().unwrap_or_else(|| "Orpheus".into()),
                     format: FORMAT,
                     layout,

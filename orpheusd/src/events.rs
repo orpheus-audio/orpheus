@@ -39,20 +39,29 @@ pub enum Topic {
     Routes,
     /// As `GET /x-orpheus/v1/sources`.
     Sources,
+    /// As `GET /x-orpheus/v1/inputs`.
+    Inputs,
+    /// As `GET /x-orpheus/v1/wires`.
+    Wires,
 }
 
 impl Topic {
-    pub const ALL: [Topic; 6] = [
+    pub const ALL: [Topic; 8] = [
         Topic::Status,
         Topic::Nodes,
         Topic::Outputs,
         Topic::Settings,
         Topic::Routes,
         Topic::Sources,
+        Topic::Inputs,
+        Topic::Wires,
     ];
 
     fn slow(self) -> bool {
-        matches!(self, Topic::Status | Topic::Outputs | Topic::Sources)
+        matches!(
+            self,
+            Topic::Status | Topic::Outputs | Topic::Sources | Topic::Inputs | Topic::Wires
+        )
     }
 
     /// The message for this topic's current state.

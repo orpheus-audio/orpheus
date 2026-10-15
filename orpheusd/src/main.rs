@@ -15,6 +15,7 @@ mod peers;
 mod policy;
 mod settings;
 mod sources;
+mod wires;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,7 @@ async fn main() -> Result<()> {
         )),
         events: events::Events::default(),
         mapping: Mutex::default(),
+        wires: Mutex::new(wires::Wires::load(home.state_dir().join("wires.json"))),
     });
     outputs::restore(&node);
     connection::restore(&node);

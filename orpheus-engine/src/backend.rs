@@ -86,6 +86,20 @@ pub trait AudioBackend: Send {
     fn set_default_output(&self, _name: &str) -> Result<(), BackendError> {
         Err("this audio system cannot change the default output".into())
     }
+
+    /// Keeps exactly these links made, besides those the audio system
+    /// makes itself, as far as their nodes and channels are there; made
+    /// again once they are back. What several links bring into one
+    /// channel is summed.
+    fn set_links(&self, _links: &[Link]) -> Result<(), BackendError> {
+        Err("this audio system cannot link channels".into())
+    }
+
+    /// Those of the links asked for with [`set_links`](Self::set_links)
+    /// that are made now.
+    fn links(&self) -> Vec<Link> {
+        Vec::new()
+    }
 }
 
 /// An output of the audio system, such as a sound card or another node's
@@ -130,6 +144,17 @@ pub struct OutputSpec {
     /// For each of its channels, the channel of `device` it plays on,
     /// counted from 0.
     pub channels: Vec<usize>,
+}
+
+/// A link from a channel of an input, or of a receiver's stream, to a
+/// channel of an output. Nodes go by machine name, channels are counted
+/// from 0.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Link {
+    pub from: String,
+    pub from_channel: usize,
+    pub to: String,
+    pub to_channel: usize,
 }
 
 /// Where a playback stream plays.

@@ -12,6 +12,7 @@ A node keeps its files where the XDG base directory specification says:
 ~/.local/state/orpheus/peers.json   aliases and pins of other nodes
 ~/.local/state/orpheus/sources.json output and volume of each source played here
 ~/.local/state/orpheus/settings.json settings changed over the API
+~/.local/state/orpheus/wires.json   wires from sources and inputs to outputs
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
 ```
 

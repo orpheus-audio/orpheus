@@ -14,7 +14,8 @@
 //! puts it on the output it should play on: the one remembered, else
 //! `[receiver] default_output`, else the audio system's default, unless
 //! that is a sink to another node. A stream from another node is never
-//! passed on to one by default; it waits, unlinked, for an output.
+//! passed on to one by default; it waits, unlinked, for an output. A
+//! source with wires (see [`wires`](crate::wires)) plays only on them.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -64,6 +65,8 @@ pub struct Sources {
     list: Vec<Source>,
     /// Where each running receiver's stream was put last.
     placed: BTreeMap<ReceiverId, Placement>,
+    /// The running receivers whose sources have wires.
+    wired: BTreeSet<ReceiverId>,
     /// The keys playing at the last tick.
     playing: BTreeSet<String>,
 }
@@ -83,6 +86,7 @@ impl Sources {
             limits,
             list,
             placed: BTreeMap::new(),
+            wired: BTreeSet::new(),
             playing: BTreeSet::new(),
         }
     }
@@ -147,9 +151,15 @@ impl Sources {
         self.placed.insert(id, placement);
     }
 
-    /// Whether receiver `id`'s stream waits, unlinked, for an output.
+    /// Whether receiver `id`'s stream waits, unlinked, for an output;
+    /// not if it plays on wires.
     pub fn held(&self, id: ReceiverId) -> bool {
-        self.placed.get(&id) == Some(&Placement::Held)
+        self.placed.get(&id) == Some(&Placement::Held) && !self.wired.contains(&id)
+    }
+
+    /// Whether receiver `id`'s stream plays on wires.
+    pub fn on_wires(&self, id: ReceiverId) -> bool {
+        self.wired.contains(&id)
     }
 
     /// Forgets a source's output and volume. One that plays stays listed,
@@ -193,9 +203,10 @@ impl Sources {
         }
     }
 
-    /// Forgets sources beyond the limits, oldest first; those playing and
-    /// those from pinned nodes stay. Returns whether any went.
-    fn evict(&mut self, pinned: &BTreeSet<String>) -> bool {
+    /// Forgets sources beyond the limits, oldest first; those playing,
+    /// those from pinned nodes and those with wires stay. Returns whether
+    /// any went.
+    fn evict(&mut self, pinned: &BTreeSet<String>, wired: &BTreeSet<SourceId>) -> bool {
         let max_age = u64::from(self.limits.max_age_days) * 86_400;
         let max_entries = self.limits.max_entries as usize;
         let now = unix_now();
@@ -204,7 +215,10 @@ impl Sources {
         let mut kept = 0;
         let playing = &self.playing;
         self.list.retain(|s| {
-            if playing.contains(&s.key) || s.node.as_ref().is_some_and(|n| pinned.contains(n)) {
+            if playing.contains(&s.key)
+                || s.node.as_ref().is_some_and(|n| pinned.contains(n))
+                || wired.contains(&s.id)
+            {
                 return true;
             }
             kept += 1;
@@ -214,7 +228,7 @@ impl Sources {
     }
 }
 
-/// Forgets source `id`'s output and volume; a stream playing it goes where
+/// Forgets source `id`'s output, volume, layout and wires; a stream playing it goes where
 /// streams play by default, at full volume. Returns whether there was one.
 pub fn forget(node: &Node, id: SourceId) -> bool {
     let default_output = node.settings().receiver.default_output;
@@ -223,6 +237,7 @@ pub fn forget(node: &Node, id: SourceId) -> bool {
     let Some(source) = sources.forget(id) else {
         return false;
     };
+    node.wires.lock().unwrap().remove_source(id);
     tracing::info!(%id, name = %source.name, "source forgotten");
     let Some(engine) = engine else {
         return true;
@@ -285,6 +300,7 @@ pub async fn run(node: Arc<Node>) {
         let node = node.clone();
         let _ = tokio::task::spawn_blocking(move || {
             follow(&node);
+            crate::wires::follow(&node);
             crate::connection::follow_sinks(&node);
         })
         .await;
@@ -293,7 +309,7 @@ pub async fn run(node: Arc<Node>) {
 
 /// Notes the user's moves and volume changes, and puts each stream where
 /// it should play.
-fn follow(node: &Node) {
+pub fn follow(node: &Node) {
     let Some(engine) = &node.engine else {
         return;
     };
@@ -308,6 +324,7 @@ fn follow(node: &Node) {
             .filter(|n| peers.pinned(n))
             .collect()
     };
+    let wired = node.wires.lock().unwrap().sources();
     let engine = engine.lock().unwrap();
     let outputs = engine.outputs();
     let running: Vec<(ReceiverId, Option<String>)> = engine
@@ -318,6 +335,7 @@ fn follow(node: &Node) {
         .collect();
     let mut sources = node.sources.lock().unwrap();
     let mut changed = false;
+    sources.wired.clear();
     for (id, key) in &running {
         let chosen = engine.receiver_chosen_output(*id);
         if let Some(source) = key.as_deref().and_then(|k| sources.get_mut(k)) {
@@ -340,7 +358,16 @@ fn follow(node: &Node) {
             .and_then(|k| sources.get(k))
             .and_then(|s| s.output.clone())
             .or_else(|| chosen.clone().flatten());
-        let want = resolve(remembered.as_deref(), default_output.as_deref(), &outputs);
+        let on_wires = key
+            .as_deref()
+            .and_then(|k| sources.get(k))
+            .is_some_and(|s| wired.contains(&s.id));
+        let want = if on_wires {
+            sources.wired.insert(*id);
+            Placement::Held
+        } else {
+            resolve(remembered.as_deref(), default_output.as_deref(), &outputs)
+        };
         if sources.placed.get(id) == Some(&want) {
             continue;
         }
@@ -377,7 +404,7 @@ fn follow(node: &Node) {
         sources.playing = playing;
         changed = true;
     }
-    changed |= sources.evict(&pinned);
+    changed |= sources.evict(&pinned, &wired);
     if changed {
         sources.save();
     }
@@ -453,7 +480,7 @@ mod tests {
             });
         }
         s.playing.insert("a".into());
-        assert!(s.evict(&BTreeSet::from(["PINNED".to_owned()])));
+        assert!(s.evict(&BTreeSet::from(["PINNED".to_owned()]), &BTreeSet::new()));
         let keys: Vec<&str> = s.list.iter().map(|s| s.key.as_str()).collect();
         assert_eq!(keys, ["c", "d", "a", "b"]);
     }

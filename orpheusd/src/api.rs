@@ -68,6 +68,8 @@ pub struct Node {
     pub events: crate::events::Events,
     /// The receivers' channel maps (IS-08). Lock it last.
     pub mapping: Mutex<crate::mapping::Mapping>,
+    /// Channels of sources and inputs played on outputs. Lock it last.
+    pub wires: Mutex<crate::wires::Wires>,
 }
 
 impl Node {
@@ -215,7 +217,8 @@ const BASE: &str = "/x-orpheus/v1";
     tags(
         (name = "node", description = "The node itself"),
         (name = "settings", description = "Settings that can change while the node runs"),
-        (name = "outputs", description = "The audio system's outputs and their types"),
+        (name = "outputs", description = "The audio system's inputs and outputs, outputs made of channels of others, and their types"),
+        (name = "wires", description = "Channels of sources and inputs played on chosen channels of outputs"),
         (name = "receivers", description = "Streams this node plays"),
         (name = "routes", description = "Where this node sends: a sink each, streamed to a peer"),
         (name = "sources", description = "What the receivers remember of the streams they played"),
@@ -294,6 +297,10 @@ struct ReceiverEntry {
     /// Choose an output for it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     held: bool,
+    /// The stream plays on wires (see `/x-orpheus/v1/wires`), not on an
+    /// output of its own.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    wired: bool,
 }
 
 /// An output of the audio system.
@@ -555,6 +562,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(outputs, create_output))
         .routes(routes!(remove_output))
         .routes(routes!(inputs))
+        .routes(routes!(list_wires, set_wire, remove_wire))
         .routes(routes!(set_output_type, clear_output_type))
         .routes(routes!(set_default_output))
         .routes(routes!(set_receiver_output, clear_receiver_output))
@@ -609,6 +617,8 @@ pub fn snapshot(node: &Node, topic: Topic) -> serde_json::Value {
         Topic::Settings => serde_json::to_value(SettingsView::of(&node.settings.lock().unwrap())),
         Topic::Routes => serde_json::to_value(routes_of(node)),
         Topic::Sources => serde_json::to_value(sources_of(node)),
+        Topic::Inputs => serde_json::to_value(inputs_of(node)),
+        Topic::Wires => serde_json::to_value(wires_of(node)),
     }
     .unwrap_or_default()
 }
@@ -657,13 +667,13 @@ fn status_of(node: &Node) -> Status {
     let mut engine = engine;
     let view = crate::outputs::View::of(node);
     let mixer = node.mixer.lock().unwrap();
-    let held: Vec<ReceiverId> = {
+    let (held, wired): (Vec<ReceiverId>, Vec<ReceiverId>) = {
         let sources = node.sources.lock().unwrap();
-        ports
-            .iter()
-            .map(|p| p.0)
-            .filter(|&id| sources.held(id))
-            .collect()
+        let ids = || ports.iter().map(|p| p.0);
+        (
+            ids().filter(|&id| sources.held(id)).collect(),
+            ids().filter(|&id| sources.on_wires(id)).collect(),
+        )
     };
     let receivers = ports
         .into_iter()
@@ -685,9 +695,10 @@ fn status_of(node: &Node) -> Status {
                 output: view.receiver_type(node, id),
                 plays_on: view
                     .receiver(id)
-                    .filter(|_| !held.contains(&id))
+                    .filter(|_| !held.contains(&id) && !wired.contains(&id))
                     .map(|o| o.description.clone()),
                 held: held.contains(&id),
+                wired: wired.contains(&id),
             }
         })
         .collect();
@@ -1319,7 +1330,7 @@ fn inputs_of(node: &Node) -> Vec<InputEntry> {
     let engine = engine.lock().unwrap();
     let receivers = engine.status().receivers.into_iter().filter_map(|(id, _)| {
         Some(InputEntry {
-            name: format!("orpheus.receive.{id}"),
+            name: crate::connection::receiver_stream(id),
             description: names
                 .get(&id)
                 .cloned()
@@ -1444,6 +1455,327 @@ async fn remove_output(
             engine.lock().unwrap().remove_output(&name);
         }
         tracing::info!(output = %name, "output removed");
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+}
+
+/// A wire: channels of a source or an input played on an output.
+#[derive(Serialize, ToSchema)]
+struct WireEntry {
+    /// The source it comes from, by ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    source: Option<SourceId>,
+    /// The input it comes from, by machine name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<String>,
+    /// The source's or input's name.
+    from_name: String,
+    /// The output, by machine name.
+    output: String,
+    /// The output's name; its machine name while it is missing.
+    output_name: String,
+    /// The channel pairs as set; absent for all channels, where they
+    /// belong.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<WirePair>>)]
+    channels: Option<Vec<crate::wires::Pair>>,
+    /// The channels it links now; empty while the source plays nowhere
+    /// or an end is missing.
+    links: Vec<WireLink>,
+    /// The channels of the source or input, while known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<LayoutChannel>>)]
+    from_channels: Option<Layout>,
+    /// The channels of the output, while it is there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<LayoutChannel>>)]
+    output_channels: Option<Layout>,
+}
+
+/// A channel of the source or input linked to a channel of the output.
+#[derive(Serialize, ToSchema)]
+struct WireLink {
+    /// The input channel, counted from 1.
+    from: usize,
+    /// The output channel, counted from 1.
+    to: usize,
+    /// Whether the audio system has made the link.
+    linked: bool,
+}
+
+/// An output channel and the input channel played on it.
+#[derive(Deserialize, ToSchema)]
+#[allow(dead_code)]
+struct WirePair {
+    to: WireChannel,
+    from: WireChannel,
+}
+
+/// A channel: its number, counted from 1, or its symbol or label.
+#[derive(Deserialize, ToSchema)]
+#[allow(dead_code)]
+#[serde(untagged)]
+enum WireChannel {
+    #[schema(example = 1)]
+    Number(usize),
+    #[schema(example = "L")]
+    Name(String),
+}
+
+/// A wire to set: from a source or an input, to an output.
+#[derive(Deserialize, ToSchema)]
+#[allow(dead_code)]
+struct NewWire {
+    /// The source, by ID; or give `input`.
+    source: Option<String>,
+    /// The input, by machine name; or give `source`.
+    input: Option<String>,
+    /// The output, by machine name.
+    output: String,
+    /// The channel pairs; leave it out for all channels, where they
+    /// belong.
+    channels: Option<Vec<WirePair>>,
+}
+
+/// Names a wire by its ends.
+#[derive(Deserialize, utoipa::IntoParams)]
+struct WireQuery {
+    /// The source it comes from, by ID; or give `input`.
+    #[param(value_type = Option<String>)]
+    source: Option<SourceId>,
+    /// The input it comes from, by machine name.
+    input: Option<String>,
+    /// The output, by machine name.
+    output: String,
+}
+
+/// The wires, with what each links now.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/wires",
+    tag = "wires",
+    responses((status = OK, description = "The wires", body = Vec<WireEntry>)),
+)]
+async fn list_wires(State(node): State<Arc<Node>>) -> Json<Vec<WireEntry>> {
+    let list = tokio::task::spawn_blocking(move || wires_of(&node))
+        .await
+        .unwrap_or_default();
+    Json(list)
+}
+
+fn wires_of(node: &Node) -> Vec<WireEntry> {
+    let wires = node.wires.lock().unwrap().list().to_vec();
+    wire_entries(node, &wires)
+}
+
+fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
+    use crate::wires::Origin;
+    let (resolved, made, inputs, outputs) = match &node.engine {
+        Some(engine) => {
+            let engine = engine.lock().unwrap();
+            (
+                crate::wires::resolve(node, &engine, wires),
+                engine.links(),
+                engine.inputs(),
+                engine.outputs(),
+            )
+        }
+        None => Default::default(),
+    };
+    let names: BTreeMap<SourceId, String> = node
+        .sources
+        .lock()
+        .unwrap()
+        .list()
+        .iter()
+        .map(|s| (s.id, s.name.clone()))
+        .collect();
+    wires
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            let r = resolved.get(i);
+            let links = r
+                .map(|r| {
+                    r.links(w)
+                        .map(|l| WireLink {
+                            from: l.from_channel + 1,
+                            to: l.to_channel + 1,
+                            linked: made.contains(&l),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (source, input, from_name) = match &w.from {
+                Origin::Source(id) => (
+                    Some(*id),
+                    None,
+                    names.get(id).cloned().unwrap_or_else(|| id.to_string()),
+                ),
+                Origin::Input(name) => (
+                    None,
+                    Some(name.clone()),
+                    inputs
+                        .iter()
+                        .find(|i| i.name == *name)
+                        .map_or_else(|| name.clone(), |i| i.description.clone()),
+                ),
+            };
+            WireEntry {
+                source,
+                input,
+                from_name,
+                output: w.output.clone(),
+                output_name: outputs
+                    .iter()
+                    .find(|o| o.name == w.output)
+                    .map_or_else(|| w.output.clone(), |o| o.description.clone()),
+                channels: w.channels.clone(),
+                links,
+                from_channels: r.and_then(|r| r.from_layout.clone()),
+                output_channels: r.and_then(|r| r.to_layout.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Plays channels of a source or an input on an output, replacing the
+/// wire between the two. Each pair names an output channel and the input
+/// channel played on it, by number (from 1), symbol or label; without
+/// pairs all channels go where they belong. A source with wires plays
+/// only on them. What several wires bring into one output channel is
+/// summed. Kept across restarts.
+#[utoipa::path(
+    put,
+    path = "/x-orpheus/v1/wires",
+    tag = "wires",
+    request_body = NewWire,
+    responses(
+        (status = OK, description = "Set", body = WireEntry),
+        (status = BAD_REQUEST, description = "A malformed request, or no channels", body = ErrorBody),
+        (status = UNPROCESSABLE_ENTITY, description = "No such source, input, output or channel", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
+    ),
+)]
+async fn set_wire(
+    State(node): State<Arc<Node>>,
+    Body(wire): Body<crate::wires::Wire>,
+) -> Result<Json<WireEntry>, ApiError> {
+    use crate::wires::{Channel, Origin};
+    let bad = |e: String| ApiError(StatusCode::BAD_REQUEST, e);
+    if let Some(pairs) = &wire.channels {
+        if pairs.is_empty() {
+            return Err(bad("no channels; leave `channels` out for all".into()));
+        }
+        let empty = |c: &Channel| match c {
+            Channel::Number(n) => *n == 0,
+            Channel::Name(name) => name.trim().is_empty(),
+        };
+        if pairs.iter().any(|p| empty(&p.to) || empty(&p.from)) {
+            return Err(bad("channels are counted from 1, or named".into()));
+        }
+    }
+    blocking(move || {
+        let unknown = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
+        let Some(engine) = &node.engine else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
+        };
+        let (inputs, outputs) = {
+            let engine = engine.lock().unwrap();
+            (engine.inputs(), engine.outputs())
+        };
+        let output = outputs
+            .iter()
+            .find(|o| o.name == wire.output)
+            .ok_or_else(|| unknown(format!("no output {}", wire.output)))?;
+        // The source's layout as far as known without its stream.
+        let (from_name, from_layout) = match &wire.from {
+            Origin::Source(id) => {
+                let sources = node.sources.lock().unwrap();
+                let s = sources
+                    .list()
+                    .iter()
+                    .find(|s| s.id == *id)
+                    .ok_or_else(|| unknown(format!("no source {id}")))?;
+                (s.name.clone(), s.layout.clone())
+            }
+            Origin::Input(name) => {
+                let i = inputs
+                    .iter()
+                    .find(|i| i.name == *name)
+                    .ok_or_else(|| unknown(format!("no input {name}")))?;
+                (i.description.clone(), Some(i.channels.clone()))
+            }
+        };
+        // Else as its stream says, if it plays.
+        let from_layout = from_layout.or_else(|| {
+            let engine = engine.lock().unwrap();
+            crate::wires::resolve(&node, &engine, std::slice::from_ref(&wire))
+                .pop()
+                .and_then(|r| r.from_layout)
+        });
+        for p in wire.channels.iter().flatten() {
+            if p.to.index(&output.channels).is_none() {
+                return Err(unknown(format!(
+                    "{} has no channel {} (it has {})",
+                    output.description, p.to, output.channels
+                )));
+            }
+            if let Some(layout) = &from_layout
+                && p.from.index(layout).is_none()
+            {
+                return Err(unknown(format!(
+                    "{from_name} has no channel {} (it has {layout})",
+                    p.from
+                )));
+            }
+        }
+        node.wires.lock().unwrap().set(wire.clone());
+        tracing::info!(from = %from_name, output = %wire.output, "wired");
+        crate::sources::follow(&node);
+        crate::wires::follow(&node);
+        Ok(Json(wire_entries(&node, &[wire]).remove(0)))
+    })
+    .await
+}
+
+/// Removes the wire between a source or an input and an output. A source
+/// left without wires plays on its output again.
+#[utoipa::path(
+    delete,
+    path = "/x-orpheus/v1/wires",
+    tag = "wires",
+    params(WireQuery),
+    responses(
+        (status = NO_CONTENT, description = "Removed"),
+        (status = BAD_REQUEST, description = "Neither or both of source and input", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such wire", body = ErrorBody),
+    ),
+)]
+async fn remove_wire(
+    State(node): State<Arc<Node>>,
+    Query(q): Query<WireQuery>,
+) -> Result<StatusCode, ApiError> {
+    use crate::wires::Origin;
+    let from = match (q.source, q.input) {
+        (Some(id), None) => Origin::Source(id),
+        (None, Some(name)) => Origin::Input(name),
+        _ => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "give either source or input".into(),
+            ));
+        }
+    };
+    blocking(move || {
+        if !node.wires.lock().unwrap().remove(&from, &q.output) {
+            return Err((StatusCode::NOT_FOUND, "no such wire".into()));
+        }
+        tracing::info!(from = ?from, output = %q.output, "unwired");
+        crate::sources::follow(&node);
+        crate::wires::follow(&node);
         Ok(StatusCode::NO_CONTENT)
     })
     .await
@@ -1782,6 +2114,7 @@ mod tests {
                 "/x-orpheus/v1/sources/{id}",
                 "/x-orpheus/v1/sources/{id}/layout",
                 "/x-orpheus/v1/status",
+                "/x-orpheus/v1/wires",
             ]
         );
     }
