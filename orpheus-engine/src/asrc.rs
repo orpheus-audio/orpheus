@@ -113,8 +113,12 @@ impl RateControl {
         let wn = std::f64::consts::TAU / self.period_s;
         let (kp, ki) = (2.0 * wn / self.rate, wn * wn / self.rate);
         let integral = self.integral + ki * error * self.tick_s;
-        // Anti-windup: stop integrating while saturated.
-        if integral.abs() < MAX_CORRECTION {
+        // Anti-windup: stop integrating while the correction is saturated.
+        // A jump in the level (the audio system rescheduled) saturates it
+        // for a while; integrating then would learn a drift that isn't
+        // there, and the loop would dig the level far below the setpoint
+        // once the jump has drained.
+        if (kp * error + integral).abs() < MAX_CORRECTION {
             self.integral = integral;
         }
         self.correction = (kp * error + self.integral).clamp(-MAX_CORRECTION, MAX_CORRECTION);
@@ -285,6 +289,36 @@ mod tests {
         let min = levels[3000..].iter().cloned().fold(f64::MAX, f64::min);
         let max = levels[3000..].iter().cloned().fold(f64::MIN, f64::max);
         assert!(max - min < 256.0 + 50.0, "range {min}..{max}");
+    }
+
+    #[test]
+    fn a_jump_in_the_level_doesnt_wind_up_the_drift_estimate() {
+        // A sink driven in 1024-frame blocks, drained 48 frames per tick;
+        // after the loop has locked on, the level jumps up by one block for
+        // good, as when the audio system reschedules.
+        let (rate, tick, block, drift) = (48_000.0, 0.001, 1024.0, 50e-6);
+        let mut c = RateControl::new(48_000, tick);
+        let (mut level, mut card_phase) = (1500.0, 0.0);
+        let mut lowest = f64::MAX;
+        for i in 0..(400.0 / tick) as usize {
+            if i == (200.0 / tick) as usize {
+                level += block;
+            }
+            card_phase += rate * tick * (1.0 + drift);
+            while card_phase >= block {
+                card_phase -= block;
+                level += block;
+            }
+            level -= rate * tick * (1.0 + c.correction());
+            c.update(level);
+            if i > (100.0 / tick) as usize {
+                lowest = lowest.min(level);
+            }
+        }
+        // It drains the extra block without learning a drift that isn't
+        // there, and never digs below the sawtooth it had before the jump.
+        assert!((c.integral - drift).abs() < 20e-6, "{}", c.integral);
+        assert!(lowest > 1500.0 - block - 100.0, "lowest {lowest}");
     }
 
     #[test]
