@@ -1032,6 +1032,9 @@ fn check_peers(node: &Node, watch: &mut Watch) {
         let found = by_id.or_else(|| nodes.iter().find(|n| peer::serves(n, &to.api)));
         if let Some(n) = by_id.filter(|n| !peer::serves(n, &to.api))
             && let Some((ip, api)) = peer::address(n)
+            && moved(destination_of(node, id).map(|d| d.ip()), ip, || {
+                peer::playing(&to).is_ok()
+            })
         {
             follow(node, id, PeerReceiver { api, ..to }, ip, &n.name);
             continue;
@@ -1151,6 +1154,15 @@ fn source_moved(node: &Node, id: SenderId) -> bool {
 }
 
 /// Follows sender `id`'s peer to its new address.
+/// Whether a peer that no longer announces the address `current` it is
+/// reached at moved to `announced`. mDNS may first announce only some of a
+/// node's addresses, IPv6 before IPv4, so a less preferred address counts
+/// only once the peer stops answering at the current one.
+fn moved(current: Option<IpAddr>, announced: IpAddr, answers: impl FnOnce() -> bool) -> bool {
+    let rank = orpheus_discovery::address_rank;
+    current.is_none_or(|c| rank(&announced) <= rank(&c)) || !answers()
+}
+
 fn follow(node: &Node, id: SenderId, to: PeerReceiver, ip: IpAddr, name: &str) {
     let Some(mut dest) = destination_of(node, id) else {
         return;
@@ -2374,6 +2386,20 @@ mod tests {
         assert!(only.sends(only.peer, Priority::Normal));
         assert!(!only.sends("10.0.0.3:5004".parse().unwrap(), Priority::Normal));
         assert!(!only.connects(&peer("http://10.0.0.1:7480", None), Priority::Normal));
+    }
+
+    #[test]
+    fn peers_move_to_addresses_ranked_as_well_or_when_gone() {
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        let v4 = Some(ip("10.0.0.1"));
+        let never = || -> bool { panic!("asked although the address ranks as well") };
+        assert!(moved(v4, ip("10.0.0.2"), never));
+        assert!(moved(None, ip("2001:db8::1"), never));
+        assert!(moved(Some(ip("2001:db8::1")), ip("10.0.0.2"), never));
+        // Only the IPv6 address announced so far: stay while IPv4 answers.
+        assert!(!moved(v4, ip("2001:db8::1"), || true));
+        assert!(moved(v4, ip("2001:db8::1"), || false));
+        assert!(!moved(Some(ip("2001:db8::1")), ip("fe80::1"), || true));
     }
 
     #[test]

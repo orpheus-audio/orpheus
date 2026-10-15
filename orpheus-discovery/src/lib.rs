@@ -273,9 +273,10 @@ fn node(s: &ResolvedService) -> Node {
     }
 }
 
-/// IPv4 first: every receiver listens on it, also AES67 devices. Link-local
-/// IPv6 last: it needs the interface.
-fn address_rank(ip: &IpAddr) -> u8 {
+/// How much an address is preferred, lowest first. IPv4 first: every
+/// receiver listens on it, also AES67 devices. Link-local IPv6 last: it
+/// needs the interface.
+pub fn address_rank(ip: &IpAddr) -> u8 {
     match ip {
         IpAddr::V4(_) => 0,
         IpAddr::V6(v6) if v6.segments()[0] & 0xffc0 == 0xfe80 => 2,

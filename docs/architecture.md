@@ -272,7 +272,9 @@ The watch also keeps a connection whole when things move:
 - **Follow.** If discovery's node with the stored node ID no longer
   serves the stored API, the peer has a new address; the sender is
   retargeted to the receiver's port at the new address and the receiver
-  PATCHed again. If the route to the peer now leaves from another source
+  PATCHed again. An address ranked below the current one (IPv6 for an
+  IPv4 route) counts only once the peer stops answering at the current
+  one: mDNS may announce a node's IPv6 address before its IPv4 one. If the route to the peer now leaves from another source
   address than the receiver was given (`source_ip` `auto`), the receiver
   is PATCHed with the new one.
 - **Reclaim.** A link notes when its receiver was taken by another sender
