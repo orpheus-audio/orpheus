@@ -695,6 +695,35 @@ activating its sender's destination. The node saves what was
 last activated, as requested (with `auto`), in `routes.json` in its
 [state directory](configuration.md#files) and activates it again at start.
 
+### Channel mapping (IS-08)
+
+The IS-08 Channel Mapping API v1.0 at `/x-nmos/channelmapping/v1.0/` sets
+which channel of a stream plays on each channel of the output. Each
+receiver is one input, `rx-<id>` (the stream it plays), and one output,
+`out-<id>` (what it plays on its output); an output takes only its own
+receiver's input. A map can swap left and right, play one channel on both
+sides, or mute a channel; it doesn't mix channels. A change crossfades
+over 30 ms. The map stays with the receiver while it exists, also between
+streams.
+
+For example, to swap left and right on receiver 0:
+
+```sh
+curl -s -X POST localhost:7480/x-nmos/channelmapping/v1.0/map/activations \
+  -H 'content-type: application/json' -d '{
+  "activation": {"mode": "activate_immediate"},
+  "action": {"out-0": {
+    "0": {"input": "rx-0", "channel_index": 1},
+    "1": {"input": "rx-0", "channel_index": 0}}}}'
+```
+
+`{"input": null, "channel_index": null}` mutes a channel. Scheduled
+activations (`activate_scheduled_absolute`, `activate_scheduled_relative`)
+are listed under `map/activations` until they happen and can be cancelled
+with `DELETE`; an output with one pending answers `423` to other changes.
+`map/active` shows the maps in effect, and the receiver status shows its
+running stream's map as `map`.
+
 ### Multicast (interop)
 
 Orpheus nodes stream to each other by unicast only; `orpheusctl connect`

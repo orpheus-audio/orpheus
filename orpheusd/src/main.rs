@@ -6,6 +6,7 @@ mod connection;
 mod events;
 mod health;
 mod home;
+mod mapping;
 mod network;
 mod nmos;
 mod outputs;
@@ -114,6 +115,7 @@ async fn main() -> Result<()> {
             config.sources,
         )),
         events: events::Events::default(),
+        mapping: Mutex::default(),
     });
     connection::restore(&node);
 

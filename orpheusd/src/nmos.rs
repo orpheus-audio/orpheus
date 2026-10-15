@@ -59,7 +59,10 @@ static CAPS_VERSION: LazyLock<Version> = LazyLock::new(now);
 pub fn router() -> Router<Arc<Node>> {
     let list = |items: &'static [&'static str]| get(move || async move { Json(items) });
     Router::new()
-        .route("/x-nmos", list(&["node/", "connection/"]))
+        .route(
+            "/x-nmos",
+            list(&["node/", "connection/", "channelmapping/"]),
+        )
         .route("/x-nmos/node", list(&["v1.3/"]))
         .route(
             "/x-nmos/node/v1.3",
@@ -364,10 +367,19 @@ fn snapshot(node: &Node) -> Snapshot {
         node_id,
         senders: snap.senders.iter().map(|s| s.base.id).collect(),
         receivers: snap.receivers.iter().map(|r| r.base.id).collect(),
-        controls: vec![Control {
-            href: format!("{href}x-nmos/connection/{}/", is05::API_VERSION),
-            kind: CONTROL_CONNECTION,
-        }],
+        controls: vec![
+            Control {
+                href: format!("{href}x-nmos/connection/{}/", is05::API_VERSION),
+                kind: CONTROL_CONNECTION,
+            },
+            Control {
+                href: format!(
+                    "{href}x-nmos/channelmapping/{}/",
+                    crate::mapping::API_VERSION
+                ),
+                kind: crate::mapping::CONTROL,
+            },
+        ],
     });
     snap
 }

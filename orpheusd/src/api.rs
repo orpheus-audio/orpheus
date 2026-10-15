@@ -66,6 +66,8 @@ pub struct Node {
     pub sources: Mutex<crate::sources::Sources>,
     /// Snapshots for the event stream.
     pub events: crate::events::Events,
+    /// The receivers' channel maps (IS-08). Lock it last.
+    pub mapping: Mutex<crate::mapping::Mapping>,
 }
 
 impl Node {
@@ -467,6 +469,7 @@ pub fn router(node: Arc<Node>) -> Router {
     router
         .merge(crate::nmos::router())
         .merge(crate::connection::router())
+        .merge(crate::mapping::router())
         .route(
             &format!("{BASE}/openapi.json"),
             get(move || async move { ([(header::CONTENT_TYPE, "application/json")], spec) }),

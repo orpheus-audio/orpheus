@@ -150,6 +150,13 @@ depth. Before `connect` takes a peer's receiver, it checks the receiver's
 constraint sets against the stream; constraints on other parameters are
 ignored, receivers without constraint sets are judged by `media_types`.
 
+The IS-08 Channel Mapping API (`mapping.rs`) gives each receiver one
+input and one output, whose map is the receiver's channel map. The maps
+are kept per receiver, also while it plays nothing, and given to the
+engine whenever the receiver runs. An input's parent is its receiver, not
+the sender's source, which the node's own IS-04 API doesn't list. Every
+activation gives the device a new IS-04 version.
+
 Each sender's `manifest_href` points to its SDP file. Its session version
 follows the sender's and the node's resource versions, so it changes when the
 destination or the PTP grandmaster does.
