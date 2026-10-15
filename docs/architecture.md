@@ -38,7 +38,7 @@ Linux.
 
 | Crate | Role |
 |---|---|
-| `orpheus-core` | Platform-independent types shared by all nodes, including the planned ESP32 firmware: device ID, audio format, RTP packets, jitter buffer, media-clock arithmetic. |
+| `orpheus-core` | Platform-independent types shared by all nodes, including the planned ESP32 firmware: device ID, audio format, channel layouts, RTP packets, jitter buffer, media-clock arithmetic. |
 | `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of statime. |
 | `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their channel maps, level meters and gains, ASRC, the `AudioBackend` trait. |
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
@@ -134,6 +134,26 @@ L24 (24-bit big-endian PCM), 48 kHz, 2 channels, 1 ms per packet, RTP payload
 type 97. This is the AES67 baseline. It is fixed for now. Each sender
 describes its stream in an SDP file; RTP timestamps count media-clock frames
 since the PTP epoch, so the SDP says `mediaclk:direct=0`.
+
+## Channel layouts
+
+A `Layout` (`orpheus-core`) says what each channel of a stream carries: an
+NMOS channel symbol and an optional label. It is Orpheus' own model; each
+interface translates at its edge and nothing Linux-specific goes on the
+wire:
+
+- **SDP:** written and read as the ST 2110-30 `channel-order`. It knows
+  fewer layouts than the symbols; runs of channels without a group go as
+  undefined (`U02`), labels don't go at all.
+- **IS-04:** a source's `channels`, symbol and label each.
+- **PipeWire:** channel positions of the sink and the playback stream;
+  symbols without a position become numbered AUX channels.
+
+A receiver's layout is resolved when its stream starts, in this order: the
+layout set for its [source](#receiver-pool-and-policy) (`sources.json`),
+the stream's SDP file, then a default by channel count. A change of the
+layout restarts the stream, as a change of the link offset does. Senders
+send stereo for now; the sink's layout is `ST`.
 
 ## NMOS
 
@@ -254,6 +274,18 @@ from `outputs.json`; the IS-04 receiver carries the result. A sender writes
 its peer's type (or the user's) into its sink's `device.form-factor` and
 icon, and PipeWire reports the change like any other sink's, which is how
 types pass along chains of nodes.
+
+The thread also follows the audio sources and the ports of all audio
+nodes; a node's channels are its ports in order with their positions,
+read back into a [layout](#channel-layouts). A created output is a
+`support.null-audio-sink` node that orpheusd owns, with
+`monitor.channel-volumes`, so its volume applies to what it passes on.
+Its monitor ports are linked to the chosen input ports of the device.
+Whenever ports or links come or go, a timer on the PipeWire thread
+(every 200 ms, only after a change) makes the links that are missing, so
+an output whose device was unplugged plays there again once it is back.
+The node and its links are destroyed with the handle, and with orpheusd,
+since they don't linger. The patchbay's wires will be links made the same way.
 
 `connection.rs` watches the peers' receivers the senders are connected to.
 Discovery keeps each node's receiver change counter (`ver_rcv` in its mDNS

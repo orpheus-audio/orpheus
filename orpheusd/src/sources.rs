@@ -1,5 +1,6 @@
 //! What the receivers remember of each source they played: the output it
-//! plays on and its volume.
+//! plays on, its volume and, if the user set one, the layout of its
+//! channels.
 //!
 //! A source is recognized by what its stream announces (see
 //! [`key`](crate::connection)): the sender's NMOS source ID, else its SDP
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use orpheus_core::SourceId;
+use orpheus_core::{Layout, SourceId};
 use orpheus_engine::{Output, Placement, ReceiverId, Volume};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +49,10 @@ pub struct Source {
     pub output: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<Volume>,
+    /// What its channels carry, as the user set it over what its stream
+    /// says: for senders that say nothing, or say it wrong.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
     /// When it last played, in seconds since the Unix epoch.
     pub used: u64,
 }
@@ -122,6 +127,7 @@ impl Sources {
                     node: None,
                     output: None,
                     volume: None,
+                    layout: None,
                     used: now,
                 });
                 self.list.len() - 1
@@ -155,12 +161,26 @@ impl Sources {
             let old = s.clone();
             s.output = None;
             s.volume = None;
+            s.layout = None;
             old
         } else {
             self.list.remove(i)
         };
         self.save();
         Some(source)
+    }
+
+    /// Sets the layout of source `id`, `None` for what its stream says;
+    /// `false` if there is no such source.
+    pub fn set_layout(&mut self, id: SourceId, layout: Option<Layout>) -> bool {
+        let Some(s) = self.list.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.layout != layout {
+            s.layout = layout;
+            self.save();
+        }
+        true
     }
 
     /// Notes that the user chose `output` for `key` (`None`: the default).
@@ -381,6 +401,7 @@ mod tests {
             description: name.into(),
             kind: OutputType::Generic,
             default,
+            channels: orpheus_core::Layout::default_for(2),
         }
     }
 
@@ -427,6 +448,7 @@ mod tests {
                 node: node.map(Into::into),
                 output: None,
                 volume: None,
+                layout: None,
                 used,
             });
         }

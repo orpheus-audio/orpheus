@@ -8,7 +8,7 @@ A node keeps its files where the XDG base directory specification says:
 ~/.config/orpheus/config.toml   configuration, optional, hand-edited
 ~/.local/state/orpheus/id       device ID, created on first start
 ~/.local/state/orpheus/routes.json  routes and connections, kept across restarts
-~/.local/state/orpheus/outputs.json types set for outputs (`orpheusctl set-type`)
+~/.local/state/orpheus/outputs.json types set for outputs and created outputs
 ~/.local/state/orpheus/peers.json   aliases and pins of other nodes
 ~/.local/state/orpheus/sources.json output and volume of each source played here
 ~/.local/state/orpheus/settings.json settings changed over the API

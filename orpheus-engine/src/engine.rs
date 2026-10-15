@@ -4,10 +4,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use orpheus_clock::Clock;
-use orpheus_core::{AudioFormat, ChannelMap, OutputType};
+use orpheus_core::{AudioFormat, ChannelMap, Layout, OutputType};
 
 use crate::backend::{
-    AudioBackend, BackendError, Output, Placement, StreamHandle, StreamSpec, Volume,
+    AudioBackend, BackendError, Input, Output, OutputSpec, Placement, StreamHandle, StreamSpec,
+    Volume,
 };
 use crate::port::{PortStats, StatsSnapshot, port_pair};
 use crate::receiver::{Filter, Receiver, ReceiverConfig, ReceiverStatus};
@@ -59,6 +60,8 @@ pub struct Engine {
     hidden: BTreeMap<SenderId, Hidden>,
     receivers: BTreeMap<ReceiverId, Receiver>,
     loopback: Option<Loopback>,
+    /// The outputs created in the audio system, by machine name.
+    created: BTreeMap<String, StreamHandle>,
     clock: Arc<dyn Clock>,
     backend: Box<dyn AudioBackend>,
 }
@@ -70,6 +73,7 @@ impl Engine {
             hidden: BTreeMap::new(),
             receivers: BTreeMap::new(),
             loopback: None,
+            created: BTreeMap::new(),
             clock,
             backend,
         }
@@ -86,6 +90,7 @@ impl Engine {
                 name: format!("{}.playback", cfg.name),
                 description: format!("{} (playback)", cfg.description),
                 format: cfg.format,
+                layout: Layout::default_for(cfg.format.channels.into()),
                 group: Some(cfg.name.clone()),
                 remote: None,
                 block_frames: cfg.block_frames,
@@ -101,6 +106,7 @@ impl Engine {
                 name: cfg.name.clone(),
                 description: cfg.description.clone(),
                 format: cfg.format,
+                layout: Layout::default_for(cfg.format.channels.into()),
                 group: Some(cfg.name.clone()),
                 remote: None,
                 block_frames: cfg.block_frames,
@@ -239,6 +245,11 @@ impl Engine {
         self.receivers.get(&id).map(Receiver::key)
     }
 
+    /// What the channels of receiver `id`'s stream carry, if it runs.
+    pub fn receiver_layout(&self, id: ReceiverId) -> Option<&Layout> {
+        self.receivers.get(&id).map(Receiver::layout)
+    }
+
     /// The link offset receiver `id` runs with, if it runs.
     pub fn receiver_link_offset(&self, id: ReceiverId) -> Option<u32> {
         self.receivers.get(&id).map(Receiver::link_offset_ms)
@@ -267,6 +278,25 @@ impl Engine {
     /// The audio system's outputs.
     pub fn outputs(&self) -> Vec<Output> {
         self.backend.outputs()
+    }
+
+    /// The audio system's inputs.
+    pub fn inputs(&self) -> Vec<Input> {
+        self.backend.inputs()
+    }
+
+    /// Creates an output on chosen channels of another, replacing one of
+    /// the same name; see [`AudioBackend::create_output`].
+    pub fn add_output(&mut self, spec: &OutputSpec) -> Result<(), BackendError> {
+        self.created.remove(&spec.name);
+        let handle = self.backend.create_output(spec)?;
+        self.created.insert(spec.name.clone(), handle);
+        Ok(())
+    }
+
+    /// Removes a created output; `false` if there is none of that name.
+    pub fn remove_output(&mut self, name: &str) -> bool {
+        self.created.remove(name).is_some()
     }
 
     /// Makes output `name` the default one; see

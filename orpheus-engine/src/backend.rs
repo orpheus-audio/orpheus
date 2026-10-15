@@ -2,7 +2,7 @@
 
 use std::error::Error;
 
-use orpheus_core::{AudioFormat, OutputType};
+use orpheus_core::{AudioFormat, Layout, OutputType};
 
 use crate::port::{CapturePort, PlaybackPort};
 
@@ -19,6 +19,9 @@ pub struct StreamSpec {
     /// end, which backends show, e.g. as an icon. `None` for local streams.
     pub remote: Option<OutputType>,
     pub format: AudioFormat,
+    /// What each of the `format.channels` channels carries, which the
+    /// audio system uses to place them.
+    pub layout: Layout,
     /// Streams with the same group run on one clock in one graph cycle, so
     /// audio passed between them never drifts.
     pub group: Option<String>,
@@ -65,6 +68,18 @@ pub trait AudioBackend: Send {
         Vec::new()
     }
 
+    /// The audio system's inputs: microphones, line-ins.
+    fn inputs(&self) -> Vec<Input> {
+        Vec::new()
+    }
+
+    /// Creates an output that plays on chosen channels of another one.
+    /// It stays while the handle lives, also while the other output is
+    /// missing, and plays there again once it is back.
+    fn create_output(&mut self, _spec: &OutputSpec) -> Result<StreamHandle, BackendError> {
+        Err("this audio system cannot create outputs".into())
+    }
+
     /// Makes output `name` the default one, where streams go unless
     /// moved, as the user would in the desktop's sound settings. The
     /// audio system keeps it across restarts.
@@ -85,6 +100,36 @@ pub struct Output {
     pub kind: OutputType,
     /// Whether streams go here unless moved.
     pub default: bool,
+    /// What its channels carry, in order.
+    pub channels: Layout,
+}
+
+/// An input of the audio system, such as a microphone or a line-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Input {
+    /// Stable machine name.
+    pub name: String,
+    /// Name shown to the user.
+    pub description: String,
+    /// What its channels carry, in order.
+    pub channels: Layout,
+}
+
+/// An output made of chosen channels of another, such as channels 3 and 4
+/// of an audio interface: what is played into it plays there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSpec {
+    /// Stable machine name.
+    pub name: String,
+    /// Name shown to the user.
+    pub description: String,
+    /// What its channels carry.
+    pub layout: Layout,
+    /// The output it plays on, by machine name.
+    pub device: String,
+    /// For each of its channels, the channel of `device` it plays on,
+    /// counted from 0.
+    pub channels: Vec<usize>,
 }
 
 /// Where a playback stream plays.

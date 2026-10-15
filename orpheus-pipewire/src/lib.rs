@@ -12,11 +12,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
-use orpheus_core::{AudioFormat, OutputType};
+use orpheus_core::{AudioFormat, Layout, OutputType, Symbol};
 use orpheus_engine::{
-    AudioBackend, BackendError, CapturePort, Output, Placement, PlaybackPort, StreamControl,
-    StreamHandle, StreamSpec, Volume,
+    AudioBackend, BackendError, CapturePort, Input, Output, OutputSpec, Placement, PlaybackPort,
+    StreamControl, StreamHandle, StreamSpec, Volume,
 };
 use pipewire::{self as pw, properties::properties, spa};
 use spa::param::audio::{AudioFormat as SpaFormat, AudioInfoRaw, MAX_CHANNELS};
@@ -102,6 +103,13 @@ enum Command {
         kind: Kind,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
+    /// Creates an output on channels of another.
+    CreateOutput {
+        id: u64,
+        spec: Box<OutputSpec>,
+        reply: mpsc::SyncSender<Result<(), String>>,
+    },
+    /// Removes a stream or a created output.
     Destroy(u64),
     /// Renames a stream.
     Describe(u64, String),
@@ -280,6 +288,31 @@ impl AudioBackend for PipeWireBackend {
         self.graph.lock().unwrap().outputs()
     }
 
+    fn inputs(&self) -> Vec<Input> {
+        self.graph.lock().unwrap().inputs()
+    }
+
+    fn create_output(&mut self, spec: &OutputSpec) -> Result<StreamHandle, BackendError> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (reply, result) = mpsc::sync_channel(1);
+        self.tx
+            .send(Command::CreateOutput {
+                id,
+                spec: Box::new(spec.clone()),
+                reply,
+            })
+            .map_err(|_| "PipeWire thread is gone")?;
+        result
+            .recv()
+            .map_err(|_| "PipeWire thread is gone")?
+            .map_err(|e| format!("creating output {}: {e}", spec.name))?;
+        let close = self.tx.clone();
+        Ok(StreamHandle::new(move || {
+            let _ = close.send(Command::Destroy(id));
+        }))
+    }
+
     fn set_default_output(&self, name: &str) -> Result<(), BackendError> {
         let (reply, result) = mpsc::sync_channel(1);
         self.tx
@@ -404,10 +437,24 @@ fn run(
 
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
+    let created: Rc<RefCell<HashMap<u64, Created>>> = Rc::default();
+    // Links the created outputs to their devices as ports come and go.
+    let relink = mainloop.loop_().add_timer({
+        let core = core.clone();
+        let graph = graph.clone();
+        let created = created.clone();
+        move |_| {
+            if std::mem::take(&mut graph.lock().unwrap().changed) {
+                link_outputs(&core, &graph, &mut created.borrow_mut());
+            }
+        }
+    });
+    let _ = relink.update_timer(Some(RELINK), Some(RELINK));
     let _receiver = rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let streams = streams.clone();
         let groups = groups.clone();
+        let created = created.clone();
         move |cmd| match cmd {
             Command::Create {
                 id,
@@ -428,7 +475,23 @@ fn run(
                     streams.borrow_mut().insert(id, live);
                 }));
             }
+            Command::CreateOutput { id, spec, reply } => {
+                let result = create_output(&core, &spec).map(|node| {
+                    created.borrow_mut().insert(
+                        id,
+                        Created {
+                            spec: *spec,
+                            _node: node,
+                            links: HashMap::new(),
+                        },
+                    );
+                    graph.lock().unwrap().changed = true;
+                });
+                let _ = reply.send(result);
+            }
             Command::Destroy(id) => {
+                // Its links go with it.
+                created.borrow_mut().remove(&id);
                 let mut g = graph.lock().unwrap();
                 g.streams.remove(&id);
                 g.playback.remove(&id);
@@ -507,6 +570,88 @@ fn run(
     mainloop.run();
     streams.borrow_mut().clear();
     groups.borrow_mut().clear();
+    created.borrow_mut().clear();
+}
+
+/// How often the links of created outputs are checked, once ports changed.
+const RELINK: Duration = Duration::from_millis(200);
+
+/// An output created on channels of another: a null sink whose monitor
+/// ports are linked to the other's ports.
+struct Created {
+    spec: OutputSpec,
+    /// The links made, by output and input port, and whether each was
+    /// seen in the graph since. Dropped before the node, which would take
+    /// them along.
+    links: HashMap<(u32, u32), (pw::link::Link, bool)>,
+    /// Keeps the node; dropping it removes it.
+    _node: pw::node::Node,
+}
+
+/// Creates the null sink of an output; the session manager doesn't link it.
+fn create_output(core: &pw::core::CoreRc, spec: &OutputSpec) -> Result<pw::node::Node, String> {
+    if spec.layout.len() != spec.channels.len() || spec.channels.is_empty() {
+        return Err(format!(
+            "a layout of {} channels for {} channels",
+            spec.layout.len(),
+            spec.channels.len()
+        ));
+    }
+    let positions = position_names(&spec.layout).join(",");
+    let channels = spec.layout.len().to_string();
+    let props = properties! {
+        "factory.name" => "support.null-audio-sink",
+        *pw::keys::NODE_NAME => spec.name.as_str(),
+        *pw::keys::NODE_DESCRIPTION => spec.description.as_str(),
+        *pw::keys::MEDIA_CLASS => "Audio/Sink",
+        *pw::keys::AUDIO_CHANNELS => channels.as_str(),
+        "audio.position" => positions.as_str(),
+        // The sink's volume applies to what goes on to the device.
+        "monitor.channel-volumes" => "true",
+        "object.linger" => "false",
+    };
+    core.create_object::<pw::node::Node>("adapter", &props)
+        .map_err(|e| e.to_string())
+}
+
+/// Links each created output to the channels of its device that are
+/// there, and forgets links that went: made again once their ports are
+/// back.
+fn link_outputs(
+    core: &pw::core::CoreRc,
+    graph: &Mutex<Graph>,
+    created: &mut HashMap<u64, Created>,
+) {
+    let g = graph.lock().unwrap();
+    for c in created.values_mut() {
+        let want = g.wanted_links(&c.spec);
+        c.links.retain(|pair, (_, seen)| {
+            let present = g.has_link(*pair);
+            *seen |= present;
+            want.iter().any(|w| (w.1, w.3) == *pair) && (present || !*seen)
+        });
+        for (out_node, out_port, in_node, in_port) in want {
+            if g.has_link((out_port, in_port)) || c.links.contains_key(&(out_port, in_port)) {
+                continue;
+            }
+            let ids = [out_node, out_port, in_node, in_port].map(|id| id.to_string());
+            let props = properties! {
+                "link.output.node" => ids[0].as_str(),
+                "link.output.port" => ids[1].as_str(),
+                "link.input.node" => ids[2].as_str(),
+                "link.input.port" => ids[3].as_str(),
+                "object.linger" => "false",
+            };
+            match core.create_object::<pw::link::Link>("link-factory", &props) {
+                Ok(link) => {
+                    c.links.insert((out_port, in_port), (link, false));
+                }
+                Err(e) => {
+                    tracing::warn!(output = %c.spec.name, error = %e, "linking to the device");
+                }
+            }
+        }
+    }
 }
 
 /// Moves playback stream `id` to output `name`, or with `None` to the
@@ -779,7 +924,7 @@ fn create_stream(
         ),
     };
 
-    let format = format_pod(spec.format)?;
+    let format = format_pod(spec.format, &spec.layout)?;
     let mut params = vec![Pod::from_bytes(&format).ok_or("invalid format pod")?];
     let latency = latency_pod(None, spec.process_latency);
     if direction == spa::utils::Direction::Input {
@@ -919,10 +1064,17 @@ fn update_properties(stream: &pw::stream::Stream, props: &[(&str, Option<&str>)]
 struct Graph {
     /// Audio sinks by node ID.
     sinks: HashMap<u32, Sink>,
+    /// Audio sources, such as microphones, by node ID.
+    sources: HashMap<u32, Sink>,
     /// The default sink's node name.
     default: Option<String>,
-    /// Links by ID: output node, input node.
-    links: HashMap<u32, (u32, u32)>,
+    /// Links by ID.
+    links: HashMap<u32, LinkInfo>,
+    /// Audio ports by ID.
+    ports: HashMap<u32, Port>,
+    /// Whether ports or links came or went since the created outputs were
+    /// last linked.
+    changed: bool,
     /// Node IDs of our streams, by stream ID.
     streams: HashMap<u64, u32>,
     /// The volume of our streams and where the user moved playback
@@ -953,6 +1105,28 @@ impl StreamState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LinkInfo {
+    output_node: u32,
+    output_port: u32,
+    input_node: u32,
+    input_port: u32,
+}
+
+/// A port of an audio node.
+#[derive(Debug, Clone)]
+struct Port {
+    node: u32,
+    /// Out of the node, else into it.
+    output: bool,
+    /// A sink's monitor, or a source's capture port of a virtual source.
+    monitor: bool,
+    /// The port's number on its node, in channel order.
+    index: u32,
+    /// The channel position, `FL`, `AUX3`.
+    channel: String,
+}
+
 #[derive(Default)]
 struct Sink {
     name: String,
@@ -966,17 +1140,87 @@ impl Graph {
     fn outputs(&self) -> Vec<Output> {
         let mut out: Vec<Output> = self
             .sinks
-            .values()
-            .filter(|s| !s.name.is_empty())
-            .map(|s| Output {
+            .iter()
+            .filter(|(_, s)| !s.name.is_empty())
+            .map(|(&id, s)| Output {
                 name: s.name.clone(),
                 description: s.description.clone(),
                 kind: s.kind,
                 default: self.default.as_deref() == Some(s.name.as_str()),
+                channels: self.layout(id, false),
             })
             .collect();
         out.sort_by(|a, b| a.description.cmp(&b.description).then(a.name.cmp(&b.name)));
         out
+    }
+
+    fn inputs(&self) -> Vec<Input> {
+        let mut out: Vec<Input> = self
+            .sources
+            .iter()
+            .filter(|(_, s)| !s.name.is_empty())
+            .map(|(&id, s)| Input {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                channels: self.layout(id, true),
+            })
+            .collect();
+        out.sort_by(|a, b| a.description.cmp(&b.description).then(a.name.cmp(&b.name)));
+        out
+    }
+
+    /// The ports of `node` that carry its channels, in order: into a sink
+    /// (not its monitor), out of a source.
+    fn channel_ports(&self, node: u32, output: bool) -> Vec<(u32, &Port)> {
+        self.ports_of(node, |p| p.output == output && (output || !p.monitor))
+    }
+
+    fn ports_of(&self, node: u32, keep: impl Fn(&Port) -> bool) -> Vec<(u32, &Port)> {
+        let mut ports: Vec<(u32, &Port)> = self
+            .ports
+            .iter()
+            .filter(|(_, p)| p.node == node && keep(p))
+            .map(|(&id, p)| (id, p))
+            .collect();
+        ports.sort_by_key(|(_, p)| p.index);
+        ports
+    }
+
+    fn layout(&self, node: u32, output: bool) -> Layout {
+        let ports = self.channel_ports(node, output);
+        let channels: Vec<&str> = ports.iter().map(|(_, p)| p.channel.as_str()).collect();
+        layout_of(&channels)
+    }
+
+    /// The links created output `spec` needs, as far as its ports and its
+    /// device's are there: output node and port, input node and port.
+    fn wanted_links(&self, spec: &OutputSpec) -> Vec<(u32, u32, u32, u32)> {
+        let node = |name: &str| {
+            self.sinks
+                .iter()
+                .find(|(_, s)| s.name == name)
+                .map(|(&id, _)| id)
+        };
+        let (Some(own), Some(device)) = (node(&spec.name), node(&spec.device)) else {
+            return Vec::new();
+        };
+        let monitors = self.ports_of(own, |p| p.output && p.monitor);
+        let inputs = self.channel_ports(device, false);
+        spec.channels
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &ch)| {
+                let (out_port, _) = monitors.get(i)?;
+                let (in_port, _) = inputs.get(ch)?;
+                Some((own, *out_port, device, *in_port))
+            })
+            .collect()
+    }
+
+    fn has_link(&self, (output_port, input_port): (u32, u32)) -> bool {
+        self.links
+            .values()
+            .any(|l| l.output_port == output_port && l.input_port == input_port)
     }
 
     /// The sink stream `id` is linked to.
@@ -984,8 +1228,8 @@ impl Graph {
         let node = self.streams.get(&id)?;
         self.links
             .values()
-            .filter(|(out, _)| out == node)
-            .find_map(|(_, input)| self.sinks.get(input))
+            .filter(|l| l.output_node == *node)
+            .find_map(|l| self.sinks.get(&l.input_node))
             .map(|s| s.name.clone())
     }
 
@@ -1072,16 +1316,55 @@ fn watch_graph(
                 let id = global.id;
                 match global.type_ {
                     pw::types::ObjectType::Link => {
-                        let node = |k| get(k).and_then(|v: &str| v.parse().ok());
-                        if let (Some(out), Some(input)) =
-                            (node("link.output.node"), node("link.input.node"))
-                        {
-                            graph.lock().unwrap().links.insert(id, (out, input));
+                        let id_of = |k| get(k).and_then(|v: &str| v.parse().ok());
+                        if let (
+                            Some(output_node),
+                            Some(output_port),
+                            Some(input_node),
+                            Some(input_port),
+                        ) = (
+                            id_of("link.output.node"),
+                            id_of("link.output.port"),
+                            id_of("link.input.node"),
+                            id_of("link.input.port"),
+                        ) {
+                            let mut g = graph.lock().unwrap();
+                            g.links.insert(
+                                id,
+                                LinkInfo {
+                                    output_node,
+                                    output_port,
+                                    input_node,
+                                    input_port,
+                                },
+                            );
+                            g.changed = true;
                         }
                     }
+                    pw::types::ObjectType::Port => {
+                        let number = |k| get(k).and_then(|v: &str| v.parse().ok());
+                        let (Some(node), Some(index), Some(channel)) =
+                            (number("node.id"), number("port.id"), get("audio.channel"))
+                        else {
+                            return;
+                        };
+                        let port = Port {
+                            node,
+                            output: get("port.direction") == Some("out"),
+                            monitor: get("port.monitor") == Some("true"),
+                            index,
+                            channel: channel.to_owned(),
+                        };
+                        let mut g = graph.lock().unwrap();
+                        g.ports.insert(id, port);
+                        g.changed = true;
+                    }
                     pw::types::ObjectType::Node
-                        if get(*pw::keys::MEDIA_CLASS) == Some("Audio/Sink") =>
+                        if get(*pw::keys::MEDIA_CLASS).is_some_and(|c| {
+                            c == "Audio/Sink" || c.starts_with("Audio/Source")
+                        }) =>
                     {
+                        let sink = get(*pw::keys::MEDIA_CLASS) == Some("Audio/Sink");
                         let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
                             return;
                         };
@@ -1099,17 +1382,29 @@ fn watch_graph(
                                         return;
                                     };
                                     let get = |k| props.get(k).unwrap_or_default().to_owned();
-                                    let sink = Sink {
+                                    let node = Sink {
                                         name: get(*pw::keys::NODE_NAME),
                                         description: get(*pw::keys::NODE_DESCRIPTION),
                                         kind: output_type(|k| props.get(k)),
                                         serial: get("object.serial"),
                                     };
-                                    graph.lock().unwrap().sinks.insert(id, sink);
+                                    let mut g = graph.lock().unwrap();
+                                    if sink {
+                                        g.sinks.insert(id, node);
+                                    } else {
+                                        g.sources.insert(id, node);
+                                    }
+                                    // Its name is known now.
+                                    g.changed = true;
                                 }
                             })
                             .register();
-                        graph.lock().unwrap().sinks.insert(id, Sink::default());
+                        let mut g = graph.lock().unwrap();
+                        if sink {
+                            g.sinks.insert(id, Sink::default());
+                        } else {
+                            g.sources.insert(id, Sink::default());
+                        }
                         proxies.borrow_mut().insert(id, Box::new((node, listener)));
                     }
                     pw::types::ObjectType::Metadata if get("metadata.name") == Some("default") => {
@@ -1151,7 +1446,10 @@ fn watch_graph(
                 }
                 let mut g = graph.lock().unwrap();
                 g.sinks.remove(&id);
-                g.links.remove(&id);
+                g.sources.remove(&id);
+                if g.links.remove(&id).is_some() || g.ports.remove(&id).is_some() {
+                    g.changed = true;
+                }
             }
         })
         .register();
@@ -1286,7 +1584,7 @@ fn process_playback(stream: &pw::stream::Stream, port: &mut PlaybackPort) {
 }
 
 /// Serializes an `EnumFormat` param offering interleaved native-endian `f32`.
-fn format_pod(format: AudioFormat) -> Result<Vec<u8>, String> {
+fn format_pod(format: AudioFormat, layout: &Layout) -> Result<Vec<u8>, String> {
     let channels = format.channels as usize;
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(format!("unsupported channel count {channels}"));
@@ -1295,7 +1593,13 @@ fn format_pod(format: AudioFormat) -> Result<Vec<u8>, String> {
     info.set_format(SAMPLE_FORMAT);
     info.set_rate(format.rate);
     info.set_channels(format.channels.into());
-    info.set_position(channel_positions(channels));
+    if layout.len() != channels {
+        return Err(format!(
+            "a layout of {} channels for {channels}",
+            layout.len()
+        ));
+    }
+    info.set_position(channel_positions(layout));
 
     let value = Value::Object(Object {
         type_: spa_sys::SPA_TYPE_OBJECT_Format,
@@ -1348,27 +1652,149 @@ fn latency_pod(downstream: Option<&[u8]>, frames: u32) -> Option<Vec<u8>> {
         .map(|(cursor, _)| cursor.into_inner())
 }
 
-/// Mono, stereo, or numbered AUX channels for anything else.
-fn channel_positions(channels: usize) -> [u32; MAX_CHANNELS] {
+/// The PipeWire position of each channel: where its symbol says, else
+/// (and for a position already taken) a numbered AUX channel, which
+/// PipeWire passes on by number.
+fn channel_positions(layout: &Layout) -> [u32; MAX_CHANNELS] {
+    use spa_sys::*;
     let mut pos = [0; MAX_CHANNELS];
-    match channels {
-        1 => pos[0] = spa_sys::SPA_AUDIO_CHANNEL_MONO,
-        2 => {
-            pos[0] = spa_sys::SPA_AUDIO_CHANNEL_FL;
-            pos[1] = spa_sys::SPA_AUDIO_CHANNEL_FR;
-        }
-        n => {
-            for (i, p) in pos.iter_mut().take(n).enumerate() {
-                *p = spa_sys::SPA_AUDIO_CHANNEL_AUX0 + i as u32;
-            }
-        }
+    for (i, symbol) in layout.symbols().enumerate().take(MAX_CHANNELS) {
+        let p = match symbol {
+            Symbol::M1 if layout.len() == 1 => SPA_AUDIO_CHANNEL_MONO,
+            Symbol::L | Symbol::Lt => SPA_AUDIO_CHANNEL_FL,
+            Symbol::R | Symbol::Rt => SPA_AUDIO_CHANNEL_FR,
+            Symbol::C => SPA_AUDIO_CHANNEL_FC,
+            Symbol::Lfe => SPA_AUDIO_CHANNEL_LFE,
+            Symbol::Ls | Symbol::Lss => SPA_AUDIO_CHANNEL_SL,
+            Symbol::Rs | Symbol::Rss => SPA_AUDIO_CHANNEL_SR,
+            Symbol::Lrs => SPA_AUDIO_CHANNEL_RL,
+            Symbol::Rrs => SPA_AUDIO_CHANNEL_RR,
+            Symbol::Lc => SPA_AUDIO_CHANNEL_FLC,
+            Symbol::Rc => SPA_AUDIO_CHANNEL_FRC,
+            Symbol::Cs => SPA_AUDIO_CHANNEL_RC,
+            _ => SPA_AUDIO_CHANNEL_UNKNOWN,
+        };
+        pos[i] = if p == SPA_AUDIO_CHANNEL_UNKNOWN || pos[..i].contains(&p) {
+            SPA_AUDIO_CHANNEL_AUX0 + i as u32
+        } else {
+            p
+        };
     }
     pos
+}
+
+/// PipeWire's names of the positions [`channel_positions`] uses.
+fn position_names(layout: &Layout) -> Vec<String> {
+    use spa_sys::*;
+    let names = [
+        (SPA_AUDIO_CHANNEL_MONO, "MONO"),
+        (SPA_AUDIO_CHANNEL_FL, "FL"),
+        (SPA_AUDIO_CHANNEL_FR, "FR"),
+        (SPA_AUDIO_CHANNEL_FC, "FC"),
+        (SPA_AUDIO_CHANNEL_LFE, "LFE"),
+        (SPA_AUDIO_CHANNEL_SL, "SL"),
+        (SPA_AUDIO_CHANNEL_SR, "SR"),
+        (SPA_AUDIO_CHANNEL_RL, "RL"),
+        (SPA_AUDIO_CHANNEL_RR, "RR"),
+        (SPA_AUDIO_CHANNEL_FLC, "FLC"),
+        (SPA_AUDIO_CHANNEL_FRC, "FRC"),
+        (SPA_AUDIO_CHANNEL_RC, "RC"),
+    ];
+    channel_positions(layout)[..layout.len().min(MAX_CHANNELS)]
+        .iter()
+        .map(|&p| match names.iter().find(|(id, _)| *id == p) {
+            Some((_, name)) => (*name).to_owned(),
+            None => format!("AUX{}", p - SPA_AUDIO_CHANNEL_AUX0),
+        })
+        .collect()
+}
+
+/// The layout of a node's channels from their PipeWire positions. Side
+/// channels are the surrounds of 5.1 and the side surrounds of 7.1; rear
+/// ones the surrounds of a 5.1 without sides.
+fn layout_of(positions: &[&str]) -> Layout {
+    use orpheus_core::layout::Channel;
+    let has = |p: &str| positions.contains(&p);
+    let sides = has("SL") || has("SR");
+    let rears = has("RL") || has("RR");
+    let channels = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| {
+            let symbol = match p {
+                "MONO" => Symbol::M1,
+                "FL" => Symbol::L,
+                "FR" => Symbol::R,
+                "FC" => Symbol::C,
+                "LFE" => Symbol::Lfe,
+                "SL" if rears => Symbol::Lss,
+                "SR" if rears => Symbol::Rss,
+                "SL" => Symbol::Ls,
+                "SR" => Symbol::Rs,
+                "RL" if sides => Symbol::Lrs,
+                "RR" if sides => Symbol::Rrs,
+                "RL" => Symbol::Ls,
+                "RR" => Symbol::Rs,
+                "FLC" => Symbol::Lc,
+                "FRC" => Symbol::Rc,
+                "RC" => Symbol::Cs,
+                _ => {
+                    let aux = p.strip_prefix("AUX").and_then(|n| n.parse::<usize>().ok());
+                    Symbol::U((aux.unwrap_or(i) + 1).min(64) as u8)
+                }
+            };
+            Channel::new(symbol)
+        })
+        .collect();
+    Layout::new(channels)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn layouts_from_positions() {
+        let shown = |p: &[&str]| layout_of(p).to_string();
+        assert_eq!(shown(&["FL", "FR"]), "ST");
+        assert_eq!(shown(&["MONO"]), "M");
+        assert_eq!(shown(&["FL", "FR", "FC", "LFE", "SL", "SR"]), "51");
+        assert_eq!(shown(&["FL", "FR", "FC", "LFE", "RL", "RR"]), "51");
+        assert_eq!(
+            shown(&["FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR"]),
+            "L R C LFE Lrs Rrs Lss Rss"
+        );
+        assert_eq!(shown(&["AUX0", "AUX1", "AUX2"]), "U03");
+        // And back.
+        for layout in ["ST", "M", "51", "U04"] {
+            let layout = Layout::parse(layout).unwrap();
+            let names = position_names(&layout);
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            assert_eq!(layout_of(&names), layout);
+        }
+    }
+
+    #[test]
+    fn positions() {
+        use spa_sys::*;
+        let pos = |layout: &str| {
+            let layout = Layout::parse(layout).unwrap();
+            channel_positions(&layout)[..layout.len()].to_vec()
+        };
+        assert_eq!(pos("M"), [SPA_AUDIO_CHANNEL_MONO]);
+        assert_eq!(pos("ST"), [SPA_AUDIO_CHANNEL_FL, SPA_AUDIO_CHANNEL_FR]);
+        assert_eq!(pos("51")[4], SPA_AUDIO_CHANNEL_SL);
+        // Taken twice, or nowhere to put it.
+        assert_eq!(
+            pos("L L M1 M2"),
+            [
+                SPA_AUDIO_CHANNEL_FL,
+                SPA_AUDIO_CHANNEL_AUX0 + 1,
+                SPA_AUDIO_CHANNEL_AUX0 + 2,
+                SPA_AUDIO_CHANNEL_AUX0 + 3
+            ]
+        );
+    }
 
     #[test]
     fn icons() {

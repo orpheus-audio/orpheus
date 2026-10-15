@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use orpheus_core::Layout;
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -83,8 +84,16 @@ enum Command {
         /// The node: its name, alias or ID (see `nodes`).
         node: String,
     },
-    /// List the node's outputs and their types.
+    /// List the node's outputs, their types and channels.
     Outputs,
+    /// List the node's inputs: the receivers' streams and the audio
+    /// system's inputs, such as microphones.
+    Inputs,
+    /// Create or remove outputs made of channels of another.
+    Output {
+        #[command(subcommand)]
+        action: OutputAction,
+    },
     /// Set what kind of device an output is, which other nodes show.
     SetType {
         /// The output: its name or description, or a unique part of either.
@@ -144,6 +153,17 @@ enum Command {
     /// List the sources the receivers remember: where each plays and how
     /// loud.
     Sources,
+    /// Set what the channels of a source carry, for senders that say
+    /// nothing or say it wrong; a stream playing it restarts.
+    Layout {
+        /// The source: its name, or its ID or the start of it (see
+        /// `sources`).
+        source: String,
+        /// ST 2110-30 groups (`51`, `ST,M`, `DM`, `U02`), channel symbols
+        /// (`L R`, `M1 M2`), or `auto` for what the stream says.
+        #[arg(required = true, num_args = 1..)]
+        layout: Vec<String>,
+    },
     /// Forget where a source plays and how loud; if it plays now, it goes
     /// to the default output at full volume.
     ForgetSource {
@@ -241,6 +261,8 @@ struct Receiver {
     /// Plays nowhere: the default output is another node's sink.
     #[serde(default)]
     held: bool,
+    /// What the stream's channels carry.
+    layout: Option<Layout>,
 }
 
 /// A running receiver's stream.
@@ -265,6 +287,50 @@ struct Stream {
     peak_dbfs: Option<f32>,
 }
 
+#[derive(Subcommand)]
+enum OutputAction {
+    /// Create an output that plays on chosen channels of another, such as
+    /// channels 3 and 4 of an audio interface. Applications and receivers
+    /// play into it like into any output; kept across restarts.
+    Create {
+        /// Its name, e.g. Kitchen.
+        name: String,
+        /// The output to play on: its name or description, or a unique
+        /// part of either.
+        device: String,
+        /// That output's channels, counted from 1, one per channel of the
+        /// new output: `3 4`.
+        #[arg(required = true, num_args = 1..)]
+        channels: Vec<usize>,
+        /// What the channels carry, as ST 2110-30 groups or symbols; by
+        /// default stereo for two, and so on.
+        #[arg(long)]
+        layout: Option<String>,
+    },
+    /// Remove a created output.
+    Remove {
+        /// The output: its name or description, or a unique part of either.
+        output: String,
+    },
+}
+
+/// An input of a node.
+#[derive(Deserialize)]
+struct InputEntry {
+    name: String,
+    description: String,
+    /// `receiver` or `device`.
+    kind: String,
+    channels: Layout,
+}
+
+/// Where a created output plays.
+#[derive(Clone, Deserialize)]
+struct CreatedOn {
+    device: String,
+    channels: Vec<usize>,
+}
+
 /// An output of a node.
 #[derive(Clone, Deserialize)]
 struct Output {
@@ -278,6 +344,8 @@ struct Output {
     /// The receivers playing here.
     #[serde(default)]
     receivers: Vec<u32>,
+    channels: Layout,
+    created: Option<CreatedOn>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -500,12 +568,61 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 print!("{}", render_outputs(&outputs, Paint::detect()));
             }
         }
-        Command::SetType { output, kind } => {
+        Command::Inputs => {
+            let raw = get(&format!("{base}/x-orpheus/v1/inputs"))?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let inputs: Vec<InputEntry> =
+                    serde_json::from_str(&raw).context("reading the inputs")?;
+                print!("{}", render_inputs(&inputs, Paint::detect()));
+            }
+        }
+        Command::Output {
+            action:
+                OutputAction::Create {
+                    name,
+                    device,
+                    channels,
+                    layout,
+                },
+        } => {
+            let outputs: Vec<Output> =
+                serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
+                    .context("reading the outputs")?;
+            let device = find_output(&outputs, &device)?;
+            let mut body = serde_json::json!({
+                "name": name, "device": device.name, "channels": channels,
+            });
+            if let Some(layout) = layout {
+                let layout = Layout::parse(&layout).map_err(|e| anyhow::anyhow!("{e}"))?;
+                body["layout"] = serde_json::to_value(layout)?;
+            }
+            let url = format!("{base}/x-orpheus/v1/outputs");
+            let raw = reply(agent().post(&url).send_json(body)?)
+                .with_context(|| format!("creating {name} via {url}"))?;
+            let created: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+            if let Some(name) = created["name"].as_str() {
+                println!("output {name}");
+            }
+        }
+        Command::Output {
+            action: OutputAction::Remove { output },
+        } => {
             let outputs: Vec<Output> =
                 serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
                     .context("reading the outputs")?;
             let o = find_output(&outputs, &output)?;
             let url = format!("{base}/x-orpheus/v1/outputs/{}", encode(&o.name));
+            reply(agent().delete(&url).call()?)
+                .with_context(|| format!("removing {output} via {url}"))?;
+        }
+        Command::SetType { output, kind } => {
+            let outputs: Vec<Output> =
+                serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
+                    .context("reading the outputs")?;
+            let o = find_output(&outputs, &output)?;
+            let url = format!("{base}/x-orpheus/v1/outputs/{}/type", encode(&o.name));
             if kind == "auto" {
                 let r = agent().delete(&url).call()?;
                 // Nothing to reset.
@@ -642,6 +759,20 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 );
             }
         }
+        Command::Layout { source, layout } => {
+            let id = find_source(base, &source)?;
+            let url = format!("{base}/x-orpheus/v1/sources/{id}/layout");
+            let text = layout.join(" ");
+            let r = if text == "auto" {
+                agent().delete(&url).call()?
+            } else {
+                let layout = Layout::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))?;
+                agent()
+                    .put(&url)
+                    .send_json(serde_json::json!({ "layout": layout }))?
+            };
+            reply(r).with_context(|| format!("setting the layout of {source} via {url}"))?;
+        }
         Command::ForgetSource { source } => {
             let id = find_source(base, &source)?;
             let url = format!("{base}/x-orpheus/v1/sources/{id}");
@@ -727,6 +858,8 @@ struct SourceEntry {
     name: String,
     output: Option<String>,
     volume: Option<Volume>,
+    /// Set by the user; absent for what the stream says.
+    layout: Option<Layout>,
     receiver: Option<u32>,
     last_used: u64,
 }
@@ -755,7 +888,7 @@ fn render_sources(sources: &[SourceEntry], outputs: &[Output], p: Paint, now: u6
         let _ = writeln!(o, "{}", p.mark(Level::Off, "no sources"));
         return o;
     }
-    let rows: Vec<[String; 5]> = sources
+    let rows: Vec<[String; 6]> = sources
         .iter()
         .map(|s| {
             let output = match &s.output {
@@ -781,12 +914,21 @@ fn render_sources(sources: &[SourceEntry], outputs: &[Output], p: Paint, now: u6
                 s.id.clone(),
                 output,
                 s.volume.as_ref().map_or("100%".into(), Volume::percent),
+                s.layout
+                    .as_ref()
+                    .map_or("as sent".into(), ToString::to_string),
                 state,
             ]
         })
         .collect();
-    let header = ["NAME", "ID", "OUTPUT", "VOLUME", "STATE"];
-    table(&mut o, p, header, [false, false, false, true, false], &rows);
+    let header = ["NAME", "ID", "OUTPUT", "VOLUME", "LAYOUT", "STATE"];
+    table(
+        &mut o,
+        p,
+        header,
+        [false, false, false, true, false, false],
+        &rows,
+    );
     o
 }
 
@@ -1562,6 +1704,9 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
     };
     heading(o, p, &title, Some(mark));
     row(o, p, "listen", &st.listen);
+    if let Some(layout) = &r.layout {
+        row(o, p, "channels", &channels(layout));
+    }
     if r.held {
         let why = "none: the default output is another node's sink";
         row(o, p, "output", &p.mark(Level::Bad, why));
@@ -1623,6 +1768,16 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
     ];
     counts.extend(buffer_counts(&st.buffer));
     row(o, p, "problems", &problems(p, c, &counts));
+}
+
+/// The channels of a layout as `Left (L), Right (R)`.
+fn channels(layout: &Layout) -> String {
+    let names: Vec<String> = layout
+        .symbols()
+        .enumerate()
+        .map(|(i, s)| format!("{} ({s})", layout.label(i)))
+        .collect();
+    names.join(", ")
 }
 
 fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
@@ -1726,7 +1881,7 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
         let _ = writeln!(o, "{}", p.mark(Level::Off, "no outputs"));
         return o;
     }
-    let rows: Vec<[String; 4]> = outputs
+    let rows: Vec<[String; 5]> = outputs
         .iter()
         .map(|out| {
             let kind = match &out.overridden {
@@ -1734,6 +1889,19 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
                 None => out.kind.clone(),
             };
             let mut notes = Vec::new();
+            if let Some(c) = &out.created {
+                let device = outputs
+                    .iter()
+                    .find(|o| o.name == c.device)
+                    .map_or(c.device.as_str(), |o| o.description.as_str());
+                let channels: Vec<String> = c.channels.iter().map(usize::to_string).collect();
+                let missing = if outputs.iter().any(|o| o.name == c.device) {
+                    ""
+                } else {
+                    " (missing)"
+                };
+                notes.push(format!("on {device} {}{missing}", channels.join(", ")));
+            }
             if !out.receivers.is_empty() {
                 let ids: Vec<String> = out.receivers.iter().map(u32::to_string).collect();
                 let noun = if ids.len() == 1 {
@@ -1749,12 +1917,45 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
             [
                 out.description.clone(),
                 kind,
+                short(&out.channels),
                 out.name.clone(),
                 notes.join(", "),
             ]
         })
         .collect();
-    let header = ["OUTPUT", "TYPE", "NAME", ""];
+    let header = ["OUTPUT", "TYPE", "CHANNELS", "NAME", ""];
+    table(&mut o, p, header, [false; 5], &rows);
+    o
+}
+
+/// A layout in short, `ST` or `L R C`; `-` for none known yet.
+fn short(layout: &Layout) -> String {
+    if layout.is_empty() {
+        "-".into()
+    } else {
+        layout.to_string()
+    }
+}
+
+/// A node's inputs.
+fn render_inputs(inputs: &[InputEntry], p: Paint) -> String {
+    let mut o = String::new();
+    if inputs.is_empty() {
+        let _ = writeln!(o, "{}", p.mark(Level::Off, "no inputs"));
+        return o;
+    }
+    let rows: Vec<[String; 4]> = inputs
+        .iter()
+        .map(|i| {
+            [
+                i.description.clone(),
+                i.kind.clone(),
+                short(&i.channels),
+                i.name.clone(),
+            ]
+        })
+        .collect();
+    let header = ["INPUT", "KIND", "CHANNELS", "NAME"];
     table(&mut o, p, header, [false; 4], &rows);
     o
 }
@@ -1841,7 +2042,8 @@ mod tests {
             "malformed": 0, "ignored": 0, "late": 3, "early": 0, "lost": 1,
             "realigns": 0, "margin_us": 8710, "jitter_us": null, "asrc_ppm": -3.2,
             "buffer": {"underruns": 0, "overruns": 0, "resyncs": 0,
-            "level_frames": 1140}, "peak_dbfs": -12.04}},
+            "level_frames": 1140}, "peak_dbfs": -12.04},
+            "layout": [{"symbol": "L"}, {"symbol": "R", "label": "Rechts"}]},
             {"id": 1, "port": 5006}],
         "routes": [{"id": "K7QM3XRA", "name": "Kitchen", "peer": "192.168.1.20:5004", "packets": 120000,
             "send_errors": 0, "realigns": 0, "asrc_ppm": 8.9,
@@ -1868,6 +2070,7 @@ Clock          ● PTP, settled
 
 Receiver 0     ● receiving ssrc 5e1f02aa
   listen       [::]:5004
+  channels     Left (L), Rechts (R)
   link offset  10 ms
   level        -12.0 dBFS
   margin       8.71 ms
@@ -1915,20 +2118,21 @@ Routes
                  "output": "test.two", "volume": {"channels": [0.125, 0.1], "mute": false},
                  "receiver": 0, "last_used": 1000},
                 {"id": "V1MVRAV7", "name": "Phone", "key": "orpheus.from.192.168.1.30",
-                 "volume": {"channels": [1.0], "mute": true}, "last_used": 1000}]"#,
+                 "volume": {"channels": [1.0], "mute": true},
+                 "layout": [{"symbol": "M1"}, {"symbol": "M2"}], "last_used": 1000}]"#,
         )
         .unwrap();
         let outputs: Vec<Output> = serde_json::from_str(
             r#"[{"name": "test.two", "description": "Test two", "type": "hifi",
-                 "override": null, "default": false}]"#,
+                 "override": null, "default": false, "channels": []}]"#,
         )
         .unwrap();
         let out = render_sources(&sources, &outputs, Paint(false), 1000 + 86_400);
         assert_eq!(
             out,
-            "  NAME   ID        OUTPUT    VOLUME  STATE\n  \
-             Desk   6S0AGTEC  Test two     50%  ● playing on receiver 0\n  \
-             Phone  V1MVRAV7  default    muted  ○ last played yesterday\n"
+            "  NAME   ID        OUTPUT    VOLUME  LAYOUT   STATE\n  \
+             Desk   6S0AGTEC  Test two     50%  as sent  ● playing on receiver 0\n  \
+             Phone  V1MVRAV7  default    muted  DM       ○ last played yesterday\n"
         );
     }
 
@@ -2100,13 +2304,23 @@ Routes
         let outputs: Vec<Output> = serde_json::from_str(
             r#"[
                 {"name":"alsa_output.pci-0000_00_1f.3.analog-stereo","description":"Built-in Audio",
-                 "type":"hifi","detected":"computer","override":"hifi","default":true,"receivers":[0,2]},
+                 "type":"hifi","detected":"computer","override":"hifi","default":true,"receivers":[0,2],
+                 "channels":[{"symbol":"L"},{"symbol":"R"}]},
                 {"name":"orpheus.send.0","description":"Kitchen","type":"speaker",
-                 "detected":"speaker","default":false,"receivers":[]}
+                 "detected":"speaker","default":false,"receivers":[],
+                 "channels":[{"symbol":"L"},{"symbol":"R"}]},
+                {"name":"orpheus.output.desk","description":"Desk","type":"generic",
+                 "detected":"generic","default":false,"receivers":[],
+                 "channels":[{"symbol":"M1"}],
+                 "created":{"device":"alsa_output.pci-0000_00_1f.3.analog-stereo","channels":[2]}}
             ]"#,
         )
         .unwrap();
-        let expected = "  OUTPUT          TYPE        NAME\n  Built-in Audio  hifi (set)  alsa_output.pci-0000_00_1f.3.analog-stereo  receivers 0, 2, default\n  Kitchen         speaker     orpheus.send.0\n";
+        let expected = "  OUTPUT          TYPE        CHANNELS  NAME
+  Built-in Audio  hifi (set)  ST        alsa_output.pci-0000_00_1f.3.analog-stereo  receivers 0, 2, default
+  Kitchen         speaker     ST        orpheus.send.0
+  Desk            generic     M         orpheus.output.desk                         on Built-in Audio 2
+";
         assert_eq!(render_outputs(&outputs, Paint(false)), expected);
         assert_eq!(
             find_output(&outputs, "kitchen").unwrap().name,
@@ -2116,7 +2330,7 @@ Routes
             find_output(&outputs, "pci").unwrap().description,
             "Built-in Audio"
         );
-        assert!(find_output(&outputs, "i").is_err());
+        assert!(find_output(&outputs, "e").is_err());
         assert!(find_output(&outputs, "nope").is_err());
         assert_eq!(encode("a b/c"), "a%20b%2Fc");
     }

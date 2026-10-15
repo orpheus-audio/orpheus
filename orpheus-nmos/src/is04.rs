@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use orpheus_core::{Layout, Symbol};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
@@ -226,7 +227,23 @@ pub struct Channel {
     pub label: String,
     /// `L`, `R`, … from the NMOS channel symbols.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub symbol: Option<&'static str>,
+    pub symbol: Option<Symbol>,
+}
+
+impl Channel {
+    /// The channels of `layout`, each with its label or the name of its
+    /// symbol.
+    pub fn of(layout: &Layout) -> Vec<Self> {
+        layout
+            .channels()
+            .iter()
+            .enumerate()
+            .map(|(i, c)| Self {
+                label: layout.label(i),
+                symbol: Some(c.symbol),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -292,16 +309,6 @@ pub struct ReceiverCaps {
 pub struct ReceiverSubscription {
     pub sender_id: Option<Uuid>,
     pub active: bool,
-}
-
-/// NMOS channel symbol for channel `index` of `channels`.
-pub const fn channel_symbol(channels: usize, index: usize) -> Option<&'static str> {
-    match (channels, index) {
-        (1, 0) => Some("M1"),
-        (2, 0) => Some("L"),
-        (2, 1) => Some("R"),
-        _ => None,
-    }
 }
 
 /// A MAC address in NMOS form: lowercase, `-` separated.

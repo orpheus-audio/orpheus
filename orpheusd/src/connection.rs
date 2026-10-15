@@ -38,7 +38,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orpheus_core::OutputType;
+use orpheus_core::{Layout, OutputType};
 use orpheus_engine::{
     Engine, Filter, Group, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId, Volume,
 };
@@ -1697,8 +1697,10 @@ fn apply_receiver(
             format!("receiving on port {port}: {e}"),
         )
     };
+    let layout = stream_layout(node, key.as_deref(), stream.as_ref());
     let started = engine.receiver_key(id) == Some(key.as_deref())
-        && engine.receiver_link_offset(id) == Some(settings.link_offset_ms);
+        && engine.receiver_link_offset(id) == Some(settings.link_offset_ms)
+        && engine.receiver_layout(id) == Some(&layout);
     if !started {
         let remembered = key.as_deref().map(|k| {
             let shown = name
@@ -1721,6 +1723,7 @@ fn apply_receiver(
                     name: format!("orpheus.receive.{id}"),
                     description: name.clone().unwrap_or_else(|| "Orpheus".into()),
                     format: FORMAT,
+                    layout,
                     encoding: nmos::ENCODING,
                     listen,
                     link_offset_ms: settings.link_offset_ms,
@@ -1763,6 +1766,16 @@ fn apply_receiver(
         })?;
     engine.set_receiver_description(id, name.as_deref());
     Ok(resolved(port))
+}
+
+/// What the channels of a stream carry: as set for its source, else as
+/// its SDP file says, else what its channel count suggests.
+fn stream_layout(node: &Node, key: Option<&str>, stream: Option<&sdp::Stream>) -> Layout {
+    let channels = usize::from(FORMAT.channels);
+    key.and_then(|k| node.sources.lock().unwrap().get(k)?.layout.clone())
+        .filter(|l| l.len() == channels)
+        .or_else(|| stream.and_then(|s| s.layout.clone()))
+        .unwrap_or_else(|| Layout::default_for(channels))
 }
 
 fn check_sender(p: &SenderParams) -> Result<(), String> {

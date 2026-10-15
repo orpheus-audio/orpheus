@@ -21,9 +21,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get};
 use axum::{Json, Router};
-use orpheus_core::ChannelMap;
+use orpheus_core::{ChannelMap, Layout};
 use orpheus_engine::ReceiverId;
-use orpheus_nmos::is04::channel_symbol;
 use orpheus_nmos::is05::{Activation, Mode};
 use orpheus_nmos::{Uuid, resource_id};
 use serde::{Deserialize, Serialize};
@@ -122,14 +121,16 @@ fn receiver_of(node: &Node, prefix: &str, name: &str) -> Option<ReceiverId> {
     named(&receivers(node), prefix, name)
 }
 
-fn labels() -> Value {
-    let n = channels();
-    (0..n)
-        .map(|i| {
-            let label =
-                channel_symbol(n, i).map_or_else(|| format!("Channel {}", i + 1), str::to_owned);
-            json!({ "label": label })
-        })
+/// The labels of receiver `id`'s channels: those of its stream, also on
+/// its output, which plays them where they belong.
+fn labels(node: &Node, id: ReceiverId) -> Value {
+    let layout = node
+        .engine
+        .as_ref()
+        .and_then(|e| e.lock().unwrap().receiver_layout(id).cloned())
+        .unwrap_or_else(|| Layout::default_for(channels()));
+    (0..layout.len())
+        .map(|i| json!({ "label": layout.label(i) }))
         .collect()
 }
 
@@ -142,19 +143,19 @@ fn input(node: &Node, id: ReceiverId) -> Value {
         // The receiver rather than the sender's source, which this node's
         // Node API doesn't list.
         "parent": { "id": crate::connection::receiver_uuid(node, id), "type": "receiver" },
-        "channels": labels(),
+        "channels": labels(node, id),
         "caps": { "reordering": true, "block_size": 1 },
     })
 }
 
-fn output(id: ReceiverId) -> Value {
+fn output(node: &Node, id: ReceiverId) -> Value {
     json!({
         "properties": {
             "name": format!("Receiver {id} output"),
             "description": format!("What receiver {id} plays on its output"),
         },
         "sourceid": null,
-        "channels": labels(),
+        "channels": labels(node, id),
         // Its own receiver's stream, or nothing.
         "caps": { "routable_inputs": [input_id(id), null] },
     })
@@ -258,7 +259,7 @@ async fn output_field(
     let Some(id) = receiver_of(&node, "out-", &name) else {
         return error(StatusCode::NOT_FOUND, format!("no output {name}"));
     };
-    match output(id).get(&field) {
+    match output(&node, id).get(&field) {
         Some(v) => Json(v.clone()).into_response(),
         None => error(StatusCode::NOT_FOUND, format!("no {field} of an output")),
     }
@@ -273,7 +274,7 @@ async fn io(State(node): State<Arc<Node>>) -> Json<Value> {
     let outputs: serde_json::Map<String, Value> = ids
         .iter()
         .map(|&id| {
-            let mut o = output(id);
+            let mut o = output(&node, id);
             // The /io view names it differently.
             let source = o.as_object_mut().and_then(|o| o.remove("sourceid"));
             o["source_id"] = source.unwrap_or(Value::Null);

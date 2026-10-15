@@ -5,8 +5,8 @@
 use std::fmt::Write;
 use std::net::{IpAddr, SocketAddr};
 
-use orpheus_core::AudioFormat;
 use orpheus_core::rtp::Encoding;
+use orpheus_core::{AudioFormat, Layout};
 use serde::{Deserialize, Serialize};
 
 /// What timestamps the stream (RFC 7273).
@@ -43,6 +43,8 @@ pub struct Session<'a> {
     pub payload_type: u8,
     pub encoding: Encoding,
     pub format: AudioFormat,
+    /// Of `format.channels` channels.
+    pub layout: &'a Layout,
     pub ptime_ms: u32,
     pub clock: RefClock,
     /// The RTP timestamp at the clock's epoch; Orpheus counts from 0.
@@ -89,7 +91,8 @@ impl Session<'_> {
             f.rate,
             f.channels,
         );
-        if let Some(order) = channel_order(f.channels) {
+        let order = self.layout.channel_order();
+        if !order.is_empty() {
             let _ = write!(s, "a=fmtp:{pt} channel-order=SMPTE2110.({order})\r\n");
         }
         let _ = write!(
@@ -139,6 +142,9 @@ pub struct Stream {
     pub encoding: String,
     pub rate: u32,
     pub channels: u16,
+    /// What the channels carry (`channel-order`), if the sender says and it
+    /// fits the channel count.
+    pub layout: Option<Layout>,
     /// The sending Orpheus node's ID (`a=x-orpheus-node`), if it is one.
     pub node: Option<String>,
     /// What is sent (`a=x-orpheus-source`), if an Orpheus node sends it.
@@ -158,6 +164,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
     // Inside the first audio section: connection, port, payload type.
     let mut media: Option<(Option<IpAddr>, u16, u8)> = None;
     let mut rtpmap: Option<(String, u32, u16)> = None;
+    let mut layout = None;
     let mut filter = None;
     let mut node = None;
     let mut source_id = None;
@@ -210,6 +217,14 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
                         };
                         rtpmap = Some((name, rate, channels));
                     }
+                } else if let Some(fmtp) = value.strip_prefix("fmtp:") {
+                    let (pt, params) = fmtp.split_once(' ').unwrap_or((fmtp, ""));
+                    if pt.parse() == Ok(media.unwrap().2) {
+                        layout = params
+                            .split(';')
+                            .filter_map(|p| p.trim().strip_prefix("channel-order="))
+                            .find_map(Layout::from_channel_order);
+                    }
                 } else if let Some(id) = value.strip_prefix("x-orpheus-node:") {
                     node = Some(id.trim().to_owned()).filter(|id| !id.is_empty());
                 } else if let Some(id) = value.strip_prefix("x-orpheus-source:") {
@@ -240,6 +255,7 @@ pub fn parse(sdp: &str) -> Result<Stream, String> {
         encoding,
         rate,
         channels,
+        layout: layout.filter(|l| l.len() == usize::from(channels)),
         node,
         source_id,
         session,
@@ -263,15 +279,6 @@ fn family(ip: IpAddr) -> &'static str {
     }
 }
 
-/// The SMPTE ST 2110-30 channel grouping, for layouts that have one.
-fn channel_order(channels: u16) -> Option<&'static str> {
-    match channels {
-        1 => Some("M"),
-        2 => Some("ST"),
-        _ => None,
-    }
-}
-
 /// SDP values end at a line break.
 fn one_line(s: &str) -> String {
     s.replace(['\r', '\n'], " ")
@@ -291,6 +298,7 @@ mod tests {
             payload_type: 97,
             encoding: Encoding::L24,
             format: AudioFormat::AES67,
+            layout: Box::leak(Box::new(Layout::default_for(2))),
             ptime_ms: 1,
             clock,
             media_clock_offset: 0,
@@ -348,11 +356,44 @@ mod tests {
                 encoding: "L24".into(),
                 rate: 48_000,
                 channels: 2,
+                layout: Some(Layout::default_for(2)),
                 node: Some("B73AQ0P0".into()),
                 source_id: Some("5c1e0b6a-27a4-4d8e-9a43-2f1c3b8d9e01".into()),
                 session: Some("- 42 192.168.1.10".into()),
                 priority: Priority::High,
             })
+        );
+    }
+
+    #[test]
+    fn reads_layouts() {
+        let layout = |rtpmap: &str, fmtp: &str| {
+            let sdp = format!(
+                "v=0\nc=IN IP4 239.1.2.3\nm=audio 5004 RTP/AVP 97\n\
+                 a=rtpmap:97 {rtpmap}\na=fmtp:{fmtp}\n"
+            );
+            parse(&sdp).unwrap().layout.map(|l| l.to_string())
+        };
+        assert_eq!(
+            layout("L24/48000/8", "97 a=1; channel-order=SMPTE2110.(51,ST)").as_deref(),
+            Some("51,ST")
+        );
+        assert_eq!(
+            layout("L24/48000/1", "97 channel-order=SMPTE2110.(M)").as_deref(),
+            Some("M")
+        );
+        // Another payload type, another channel count, nonsense.
+        assert_eq!(
+            layout("L24/48000/2", "96 channel-order=SMPTE2110.(ST)"),
+            None
+        );
+        assert_eq!(
+            layout("L24/48000/2", "97 channel-order=SMPTE2110.(51)"),
+            None
+        );
+        assert_eq!(
+            layout("L24/48000/2", "97 channel-order=SMPTE2110.(X)"),
+            None
         );
     }
 
@@ -374,6 +415,7 @@ mod tests {
             (s.encoding.as_str(), s.rate, s.channels),
             ("L16", 44_100, 1)
         );
+        assert_eq!(s.layout, None);
 
         for bad in [
             "",

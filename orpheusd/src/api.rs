@@ -16,7 +16,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
-use orpheus_core::{DeviceId, SourceId};
+use orpheus_core::{DeviceId, Layout, SourceId};
 use orpheus_discovery::Discovery;
 use orpheus_engine::{Engine, ReceiverId, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
 use serde::de::DeserializeOwned;
@@ -271,6 +271,11 @@ struct ReceiverEntry {
     /// `accept` is `any`) or switched off.
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<ReceiverStatus>,
+    /// What the stream's channels carry: as set for its source, else as
+    /// its SDP file says, else what the channel count suggests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<LayoutChannel>>)]
+    layout: Option<Layout>,
     /// What the policy does to the stream; absent without one.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<PolicyState>,
@@ -315,6 +320,66 @@ struct OutputEntry {
     /// The receivers whose streams play here.
     #[schema(value_type = Vec<u32>)]
     receivers: Vec<ReceiverId>,
+    /// What its channels carry, in order.
+    #[schema(value_type = Vec<LayoutChannel>)]
+    channels: Layout,
+    /// For an output made of channels of another: which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    created: Option<CreatedOn>,
+}
+
+/// Where a created output plays.
+#[derive(Serialize, ToSchema)]
+struct CreatedOn {
+    /// The output it plays on, by machine name.
+    device: String,
+    /// That output's channels, counted from 1.
+    channels: Vec<usize>,
+}
+
+/// An input: a receiver's stream, or one of the audio system's.
+#[derive(Serialize, ToSchema)]
+struct InputEntry {
+    /// Machine name, e.g. `orpheus.receive.0` or
+    /// `alsa_input.usb-…-00.analog-stereo`.
+    name: String,
+    /// Name shown to the user: for a receiver, its stream's sender.
+    description: String,
+    /// `receiver` or `device`.
+    kind: &'static str,
+    /// For a receiver: its ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<u32>)]
+    receiver: Option<ReceiverId>,
+    /// What its channels carry, in order.
+    #[schema(value_type = Vec<LayoutChannel>)]
+    channels: Layout,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewOutput {
+    /// Name shown to the user; the machine name is made from it,
+    /// `orpheus.output.kitchen`.
+    #[schema(example = "Kitchen")]
+    name: String,
+    /// The output to play on, by machine name.
+    #[schema(example = "alsa_output.usb-Focusrite_Scarlett_4i4-00.pro-output-0")]
+    device: String,
+    /// Its channels to play on, counted from 1, one per channel of the new
+    /// output.
+    #[schema(example = json!([3, 4]))]
+    channels: Vec<usize>,
+    /// What the channels carry; by default stereo for two, and so on.
+    #[serde(default)]
+    #[schema(value_type = Option<LayoutText>)]
+    layout: Option<LayoutBody>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct OutputCreated {
+    /// Machine name of the new output.
+    #[schema(example = "orpheus.output.kitchen")]
+    name: String,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -322,6 +387,45 @@ struct PlayOn {
     /// Machine name of the output, as `/x-orpheus/v1/outputs` lists it.
     #[schema(example = "alsa_output.pci-0000_00_1f.3.analog-stereo")]
     output: String,
+}
+
+/// A channel of a layout.
+#[derive(Deserialize, ToSchema)]
+#[allow(dead_code)]
+struct LayoutChannel {
+    /// NMOS channel symbol: `L`, `R`, `C`, `LFE`, `Ls`, `Rs`, `Lss`,
+    /// `Rss`, `Lrs`, `Rrs`, `Lc`, `Rc`, `Cs`, `HI`, `VIN`, `M1`, `M2`,
+    /// `Lt`, `Rt`, `Lst`, `Rst`, `S`, `NSC000` to `NSC128`, or `U01` to
+    /// `U64` for undefined.
+    #[schema(example = "L")]
+    symbol: String,
+    /// A label to show instead of the symbol's name.
+    #[schema(example = "Left")]
+    label: Option<String>,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct SetLayout {
+    #[schema(value_type = LayoutText)]
+    layout: LayoutBody,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LayoutBody {
+    Text(String),
+    Channels(Layout),
+}
+
+/// ST 2110-30 groups or channel symbols as text, `51`, `ST,M` or
+/// `L R C`, or the channels with their labels.
+#[derive(Deserialize, ToSchema)]
+#[allow(dead_code)]
+#[serde(untagged)]
+enum LayoutText {
+    #[schema(example = "51")]
+    Text(String),
+    Channels(Vec<LayoutChannel>),
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -448,12 +552,15 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(sender_sdp))
         .routes(routes!(nodes))
         .routes(routes!(change_node))
-        .routes(routes!(outputs))
+        .routes(routes!(outputs, create_output))
+        .routes(routes!(remove_output))
+        .routes(routes!(inputs))
         .routes(routes!(set_output_type, clear_output_type))
         .routes(routes!(set_default_output))
         .routes(routes!(set_receiver_output, clear_receiver_output))
         .routes(routes!(list_sources))
         .routes(routes!(forget_source))
+        .routes(routes!(set_source_layout, clear_source_layout))
         .routes(routes!(events))
         .split_for_parts()
 }
@@ -534,8 +641,20 @@ fn status_of(node: &Node) -> Status {
             .collect();
         (ports, conns.peer_links(), senders)
     };
-    let engine = node.engine.as_ref().map(|e| e.lock().unwrap().status());
-    let mut engine = engine.unwrap_or_default();
+    let (engine, mut layouts) = match &node.engine {
+        Some(e) => {
+            let e = e.lock().unwrap();
+            let status = e.status();
+            let layouts: BTreeMap<ReceiverId, Layout> = status
+                .receivers
+                .iter()
+                .filter_map(|&(id, _)| Some((id, e.receiver_layout(id)?.clone())))
+                .collect();
+            (status, layouts)
+        }
+        None => Default::default(),
+    };
+    let mut engine = engine;
     let view = crate::outputs::View::of(node);
     let mixer = node.mixer.lock().unwrap();
     let held: Vec<ReceiverId> = {
@@ -560,6 +679,7 @@ fn status_of(node: &Node) -> Status {
                 port,
                 sender,
                 state: stream.as_ref().and(mixer.state(id)),
+                layout: layouts.remove(&id),
                 stream,
                 priority,
                 output: view.receiver_type(node, id),
@@ -652,6 +772,11 @@ pub struct SourceEntry {
     output: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     volume: Option<orpheus_engine::Volume>,
+    /// What its channels carry, as set for it; absent for what its stream
+    /// says.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<LayoutChannel>>)]
+    layout: Option<Layout>,
     /// The receiver playing it now.
     #[serde(skip_serializing_if = "Option::is_none")]
     receiver: Option<ReceiverId>,
@@ -683,6 +808,7 @@ fn sources_of(node: &Node) -> Vec<SourceEntry> {
             node: s.node.clone(),
             output: s.output.clone(),
             volume: s.volume.clone(),
+            layout: s.layout.clone(),
             receiver: playing.get(&s.key).copied(),
             last_used: s.used,
         })
@@ -725,6 +851,79 @@ async fn forget_source(
             .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no source {id}")))
     })
     .await
+}
+
+/// Sets what the channels of a source carry, for senders that say
+/// nothing or say it wrong: as ST 2110-30 groups or channel symbols
+/// (`{"layout": "51"}`, `{"layout": "L R"}`), or as the channels with
+/// labels. A stream playing it restarts with the layout. Kept across
+/// restarts.
+#[utoipa::path(
+    put,
+    path = "/x-orpheus/v1/sources/{id}/layout",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source ID")),
+    request_body = SetLayout,
+    responses(
+        (status = NO_CONTENT, description = "Set"),
+        (status = BAD_REQUEST, description = "A malformed request or layout", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such source", body = ErrorBody),
+        (status = UNPROCESSABLE_ENTITY, description = "Another number of channels than the streams have", body = ErrorBody),
+    ),
+)]
+async fn set_source_layout(
+    State(node): State<Arc<Node>>,
+    Id(id): Id<SourceId>,
+    Body(req): Body<SetLayout>,
+) -> Result<StatusCode, ApiError> {
+    let layout = match req.layout {
+        LayoutBody::Text(text) => {
+            Layout::parse(&text).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?
+        }
+        LayoutBody::Channels(layout) => layout,
+    };
+    let channels = usize::from(crate::nmos::FORMAT.channels);
+    if layout.len() != channels {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "{layout} has {} channels; streams here have {channels}",
+                layout.len()
+            ),
+        ));
+    }
+    blocking(move || set_layout(&node, id, Some(layout))).await
+}
+
+/// Goes back to the layout a source's stream says.
+#[utoipa::path(
+    delete,
+    path = "/x-orpheus/v1/sources/{id}/layout",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source ID")),
+    responses(
+        (status = NO_CONTENT, description = "Back to what its stream says"),
+        (status = NOT_FOUND, description = "No such source", body = ErrorBody),
+    ),
+)]
+async fn clear_source_layout(
+    State(node): State<Arc<Node>>,
+    Id(id): Id<SourceId>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || set_layout(&node, id, None)).await
+}
+
+fn set_layout(
+    node: &Node,
+    id: SourceId,
+    layout: Option<Layout>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    if !node.sources.lock().unwrap().set_layout(id, layout) {
+        return Err((StatusCode::NOT_FOUND, format!("no source {id}")));
+    }
+    // Streams of the source restart with it.
+    crate::connection::reapply_receivers(node);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// The routes that run, then the ones remembered, most recently used
@@ -1061,6 +1260,10 @@ fn outputs_of(node: &Node) -> Vec<OutputEntry> {
     view.outputs
         .iter()
         .map(|o| {
+            let created = overrides.find_created(&o.name).map(|c| CreatedOn {
+                device: c.device.clone(),
+                channels: c.channels.clone(),
+            });
             let detected = crate::outputs::sink_sender(&o.name)
                 .and_then(|id| links.get(&id).copied())
                 .unwrap_or(o.kind);
@@ -1078,9 +1281,172 @@ fn outputs_of(node: &Node) -> Vec<OutputEntry> {
                     .filter(|(_, name)| **name == o.name)
                     .map(|(&id, _)| id)
                     .collect(),
+                channels: o.channels.clone(),
+                created,
             }
         })
         .collect()
+}
+
+/// The inputs: the receivers' streams, then the audio system's inputs,
+/// such as microphones.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/inputs",
+    tag = "outputs",
+    responses((status = OK, description = "The inputs", body = Vec<InputEntry>)),
+)]
+async fn inputs(State(node): State<Arc<Node>>) -> Json<Vec<InputEntry>> {
+    let list = tokio::task::spawn_blocking(move || inputs_of(&node))
+        .await
+        .unwrap_or_default();
+    Json(list)
+}
+
+fn inputs_of(node: &Node) -> Vec<InputEntry> {
+    let Some(engine) = &node.engine else {
+        return Vec::new();
+    };
+    let names: BTreeMap<ReceiverId, String> = {
+        let conns = node.connections.lock().unwrap();
+        let peers = node.peers.lock().unwrap();
+        conns
+            .receiver_ids()
+            .into_iter()
+            .filter_map(|id| Some((id, conns.receiver_sender(id, &peers)?)))
+            .collect()
+    };
+    let engine = engine.lock().unwrap();
+    let receivers = engine.status().receivers.into_iter().filter_map(|(id, _)| {
+        Some(InputEntry {
+            name: format!("orpheus.receive.{id}"),
+            description: names
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("Receiver {id}")),
+            kind: "receiver",
+            receiver: Some(id),
+            channels: engine.receiver_layout(id)?.clone(),
+        })
+    });
+    let devices = engine.inputs().into_iter().map(|i| InputEntry {
+        name: i.name,
+        description: i.description,
+        kind: "device",
+        receiver: None,
+        channels: i.channels,
+    });
+    receivers.chain(devices).collect()
+}
+
+/// Creates an output that plays on chosen channels of another, such as
+/// channels 3 and 4 of an audio interface; applications and receivers
+/// play into it like into any output. Kept across restarts; while the
+/// other output is missing it plays nowhere.
+#[utoipa::path(
+    post,
+    path = "/x-orpheus/v1/outputs",
+    tag = "outputs",
+    request_body = NewOutput,
+    responses(
+        (status = CREATED, description = "Created", body = OutputCreated),
+        (status = BAD_REQUEST, description = "A malformed request, name or layout", body = ErrorBody),
+        (status = CONFLICT, description = "An output of that name exists", body = ErrorBody),
+        (status = UNPROCESSABLE_ENTITY, description = "No such output to play on, or not those channels", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
+        (status = INTERNAL_SERVER_ERROR, description = "The audio system refused", body = ErrorBody),
+    ),
+)]
+async fn create_output(
+    State(node): State<Arc<Node>>,
+    Body(req): Body<NewOutput>,
+) -> Result<(StatusCode, Json<OutputCreated>), ApiError> {
+    let bad = |e: String| ApiError(StatusCode::BAD_REQUEST, e);
+    let description = req.name.trim().to_owned();
+    let name = crate::outputs::created_name(&description)
+        .ok_or_else(|| bad(format!("{:?} is no name for an output", req.name)))?;
+    if req.channels.is_empty() {
+        return Err(bad("no channels to play on".into()));
+    }
+    let layout = match req.layout {
+        Some(LayoutBody::Text(text)) => Layout::parse(&text).map_err(|e| bad(e.to_string()))?,
+        Some(LayoutBody::Channels(layout)) => layout,
+        None => Layout::default_for(req.channels.len()),
+    };
+    if layout.len() != req.channels.len() {
+        return Err(bad(format!(
+            "{layout} has {} channels, not {}",
+            layout.len(),
+            req.channels.len()
+        )));
+    }
+    blocking(move || {
+        let view = crate::outputs::View::of(&node);
+        if view.find(&name).is_some() {
+            return Err((StatusCode::CONFLICT, format!("there is an output {name}")));
+        }
+        let device = view
+            .find(&req.device)
+            .ok_or_else(|| (StatusCode::UNPROCESSABLE_ENTITY, format!("no output {}", req.device)))?;
+        let count = device.channels.len();
+        if let Some(&c) = req.channels.iter().find(|&&c| c == 0 || c > count) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("{} has channels 1 to {count}, not {c}", device.description),
+            ));
+        }
+        let created = crate::outputs::Created {
+            name: name.clone(),
+            description,
+            device: req.device,
+            channels: req.channels,
+            layout,
+        };
+        let Some(engine) = &node.engine else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
+        };
+        // Kept first, so that two requests can't both create it.
+        if !node.outputs.lock().unwrap().add_created(created.clone()) {
+            return Err((StatusCode::CONFLICT, format!("there is an output {name}")));
+        }
+        let added = engine.lock().unwrap().add_output(&created.spec());
+        if let Err(e) = added {
+            node.outputs.lock().unwrap().remove_created(&name);
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        tracing::info!(output = %name, device = %created.device, channels = ?created.channels, "output created");
+        Ok((StatusCode::CREATED, Json(OutputCreated { name })))
+    })
+    .await
+}
+
+/// Removes an output made of channels of another.
+#[utoipa::path(
+    delete,
+    path = "/x-orpheus/v1/outputs/{name}",
+    tag = "outputs",
+    params(("name" = String, Path, description = "Machine name of the output")),
+    responses(
+        (status = NO_CONTENT, description = "Removed"),
+        (status = NOT_FOUND, description = "No such created output", body = ErrorBody),
+    ),
+)]
+async fn remove_output(
+    State(node): State<Arc<Node>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    blocking(move || {
+        let removed = node.outputs.lock().unwrap().remove_created(&name);
+        if removed.is_none() {
+            return Err((StatusCode::NOT_FOUND, format!("no created output {name}")));
+        }
+        if let Some(engine) = &node.engine {
+            engine.lock().unwrap().remove_output(&name);
+        }
+        tracing::info!(output = %name, "output removed");
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
 }
 
 #[derive(Deserialize, utoipa::IntoParams)]
@@ -1141,7 +1507,7 @@ async fn events(
 /// restarts.
 #[utoipa::path(
     put,
-    path = "/x-orpheus/v1/outputs/{name}",
+    path = "/x-orpheus/v1/outputs/{name}/type",
     tag = "outputs",
     params(("name" = String, Path, description = "Machine name of the output")),
     request_body = SetType,
@@ -1169,7 +1535,7 @@ async fn set_output_type(
 /// Goes back to the detected type of an output.
 #[utoipa::path(
     delete,
-    path = "/x-orpheus/v1/outputs/{name}",
+    path = "/x-orpheus/v1/outputs/{name}/type",
     tag = "outputs",
     params(("name" = String, Path, description = "Machine name of the output")),
     responses(
@@ -1400,11 +1766,13 @@ mod tests {
             paths,
             [
                 "/x-orpheus/v1/events",
+                "/x-orpheus/v1/inputs",
                 "/x-orpheus/v1/nodes",
                 "/x-orpheus/v1/nodes/{id}",
                 "/x-orpheus/v1/outputs",
                 "/x-orpheus/v1/outputs/{name}",
                 "/x-orpheus/v1/outputs/{name}/default",
+                "/x-orpheus/v1/outputs/{name}/type",
                 "/x-orpheus/v1/receivers/{id}/output",
                 "/x-orpheus/v1/routes",
                 "/x-orpheus/v1/routes/{id}",
@@ -1412,6 +1780,7 @@ mod tests {
                 "/x-orpheus/v1/settings",
                 "/x-orpheus/v1/sources",
                 "/x-orpheus/v1/sources/{id}",
+                "/x-orpheus/v1/sources/{id}/layout",
                 "/x-orpheus/v1/status",
             ]
         );

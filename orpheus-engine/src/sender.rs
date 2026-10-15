@@ -23,7 +23,7 @@ use std::thread::{self, JoinHandle};
 use orpheus_clock::Clock;
 use orpheus_core::rtp::{Encoding, HEADER_LEN, Header};
 use orpheus_core::timebase::MediaClock;
-use orpheus_core::{AudioFormat, OutputType};
+use orpheus_core::{AudioFormat, Layout, OutputType};
 
 use crate::asrc::{Asrc, Fixed};
 use crate::backend::{AudioBackend, BackendError, Placement, StreamHandle, StreamSpec, Volume};
@@ -283,6 +283,7 @@ impl Sender {
                 name: cfg.name.clone(),
                 description: cfg.description.clone(),
                 format,
+                layout: Layout::default_for(format.channels.into()),
                 group: None,
                 remote: Some(cfg.remote),
                 block_frames: Some(block_frames),

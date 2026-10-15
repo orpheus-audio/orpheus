@@ -16,7 +16,7 @@ use axum::routing::{get, put};
 use axum::{Json, Router};
 use orpheus_clock::Timescale;
 use orpheus_core::rtp::Encoding;
-use orpheus_core::{AudioFormat, DeviceId};
+use orpheus_core::{AudioFormat, DeviceId, Layout};
 use orpheus_engine::sender::PAYLOAD_TYPE;
 use orpheus_engine::{ReceiverId, SenderId};
 use orpheus_nmos::caps::{AudioConstraints, Stream};
@@ -32,6 +32,11 @@ const CLOCK: &str = "clk0";
 /// What every sender sends and the receiver plays.
 pub const FORMAT: AudioFormat = AudioFormat::AES67;
 pub const ENCODING: Encoding = Encoding::L24;
+
+/// What the channels of every sender carry: those of its sink.
+pub fn layout() -> Layout {
+    Layout::default_for(FORMAT.channels.into())
+}
 pub const PTIME_MS: u32 = 1;
 
 /// What every sender sends, as receiver capabilities see it.
@@ -307,7 +312,6 @@ fn snapshot(node: &Node) -> Snapshot {
             description: format!("to {}", s.peer),
             ..Base::new(id, &s.name)
         };
-        let channels = format.channels as usize;
         snap.sources.push(Source {
             base: base(source_id),
             format: FORMAT_AUDIO,
@@ -315,13 +319,7 @@ fn snapshot(node: &Node) -> Snapshot {
             device_id,
             parents: vec![],
             clock_name: Some(CLOCK.into()),
-            channels: (0..channels)
-                .map(|i| Channel {
-                    label: channel_symbol(channels, i)
-                        .map_or_else(|| format!("Channel {}", i + 1), str::to_owned),
-                    symbol: channel_symbol(channels, i),
-                })
-                .collect(),
+            channels: Channel::of(&layout()),
         });
         snap.flows.push(Flow {
             base: base(flow_id),
@@ -427,6 +425,7 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         payload_type: PAYLOAD_TYPE,
         encoding: ENCODING,
         format: FORMAT,
+        layout: &layout(),
         ptime_ms: PTIME_MS,
         clock,
         // RTP timestamps count media-clock frames since the epoch.

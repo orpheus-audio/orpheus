@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::rtp::Encoding;
-use orpheus_core::{AudioFormat, ChannelMap, OutputType};
+use orpheus_core::{AudioFormat, ChannelMap, Layout, OutputType};
 use orpheus_engine::*;
 
 #[derive(Default, Clone)]
@@ -56,6 +56,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 name: "rx".into(),
                 description: "rx".into(),
                 format,
+                layout: Layout::default_for(2),
                 encoding: Encoding::L24,
                 listen: "127.0.0.1:0".parse().unwrap(),
                 link_offset_ms: LINK_OFFSET_MS,
@@ -196,6 +197,7 @@ fn routes_and_filters_change_at_runtime() {
                 name: "rx".into(),
                 description: "rx".into(),
                 format: AudioFormat::AES67,
+                layout: Layout::default_for(2),
                 encoding: Encoding::L24,
                 listen: "127.0.0.1:0".parse().unwrap(),
                 link_offset_ms: LINK_OFFSET_MS,
@@ -296,6 +298,7 @@ fn gain_mutes_and_the_meter_hears_through_it() {
                     name: format!("rx{id}"),
                     description: "rx".into(),
                     format,
+                    layout: Layout::default_for(2),
                     encoding: Encoding::L24,
                     listen: "127.0.0.1:0".parse().unwrap(),
                     link_offset_ms: LINK_OFFSET_MS,
@@ -379,6 +382,7 @@ fn channel_map_picks_the_channels() {
                 name: "rx".into(),
                 description: "rx".into(),
                 format,
+                layout: Layout::default_for(2),
                 encoding: Encoding::L24,
                 listen: "127.0.0.1:0".parse().unwrap(),
                 link_offset_ms: LINK_OFFSET_MS,

@@ -117,6 +117,7 @@ async fn main() -> Result<()> {
         events: events::Events::default(),
         mapping: Mutex::default(),
     });
+    outputs::restore(&node);
     connection::restore(&node);
 
     let refresh = tokio::spawn(nmos::refresh_loop(node.clone()));

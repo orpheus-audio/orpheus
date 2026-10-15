@@ -24,11 +24,15 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `forget ROUTE` | Forgets a route, so that the next `connect` starts a new one; a route that runs is disconnected first. |
 | `alias NODE ALIAS` | Gives another node a name of your own, shown instead of the one it announces (see [aliases and pins](#aliases-and-pins)). `alias NODE --remove` removes it. |
 | `pin NODE`, `unpin NODE` | Keeps another node listed while it is offline, also after a restart, or stops doing so. |
-| `outputs` | Lists the node's outputs with their [types](#output-types), and which receivers play on each. |
+| `outputs` | Lists the node's outputs with their [types](#output-types) and [channels](#channel-layouts), which receivers play on each, and where [created outputs](#inputs-and-outputs) play. |
+| `inputs` | Lists the node's [inputs](#inputs-and-outputs): the receivers' streams and the audio system's inputs, such as microphones, with their channels. |
+| `output create NAME DEVICE CHANNEL… [--layout LAYOUT]` | Creates an output that plays on chosen channels of another, for example channels 3 and 4 of an audio interface (see [inputs and outputs](#inputs-and-outputs)). Kept across restarts. |
+| `output remove OUTPUT` | Removes a created output. |
 | `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
 | `default OUTPUT` | Makes `OUTPUT` (as for `set-type`) the default output, where applications play and received streams without an output of their own go; a route's sink works too, so that the node's audio goes to the peer. The same as choosing it in the desktop's sound settings, for nodes without a desktop. The audio system keeps it across restarts. |
 | `sources` | Lists the [sources](#outputs-and-volume) the receivers remember: where each plays, how loud, and whether it plays now. |
-| `forget-source SOURCE` | Forgets where a source plays and how loud; one that plays now goes to the default output at full volume. `SOURCE` is its name, or its ID or the start of it, as `sources` shows. |
+| `forget-source SOURCE` | Forgets where a source plays and how loud, and its layout; one that plays now goes to the default output at full volume. `SOURCE` is its name, or its ID or the start of it, as `sources` shows. |
+| `layout SOURCE LAYOUT` | Sets what the channels of a source carry, for senders that say nothing or say it wrong (see [channel layouts](#channel-layouts)): ST 2110-30 groups such as `ST`, `DM` or `51`, or channel symbols such as `L R`; `auto` goes back to what the stream says. |
 | `settings` | Shows the [settings](configuration.md#settings-changed-over-the-api) that can change while the node runs, each with where its value comes from: `default`, `config` (config.toml) or `api`. |
 | `set SECTION.KEY=VALUE…` | Changes settings while the node runs, for example `set receiver.policy=mix ptp.domain=1`; kept across restarts, config.toml is not touched. A bad value changes nothing. |
 | `reset SECTION.KEY…` | Undoes `set`: the value from config.toml or the default applies again. `reset ptp` resets a whole section. |
@@ -254,8 +258,8 @@ else their address. Each source gets an ID of 8 characters, like a node.
   the receiver's output as `none` and the node warns (`held`). Choose an
   output with `orpheusctl play`, make a local output the default with
   `orpheusctl default`, or set `default_output`.
-- **Forgetting:** `orpheusctl forget-source` drops a source's output and
-  volume. Unused sources are forgotten after the [`[sources]`
+- **Forgetting:** `orpheusctl forget-source` drops a source's output,
+  volume and [layout](#channel-layouts). Unused sources are forgotten after the [`[sources]`
   limits](configuration.md#sources); those from pinned nodes are kept.
 
 ```sh
@@ -278,6 +282,78 @@ volume. Neither costs quality: audio stays floating point in PipeWire and
 24 bit on the wire. Use the sink's for "this computer to the kitchen",
 the stream's for "this source in this room". Each is remembered by its
 own node.
+
+### Channel layouts
+
+Each channel of a stream says what it carries, by a channel symbol from
+NMOS: `L`, `R`, `C`, `LFE`, `Ls`, `Rs` and the like, `M1` and `M2` for
+mono, `NSC001` for numbered and `U01` for undefined channels, each with a
+label to show, such as "Left" or "Mic 1". A sender announces them for its
+source over NMOS (IS-04), and as the SMPTE ST 2110-30 channel grouping in
+its SDP file, `a=fmtp:97 channel-order=SMPTE2110.(ST)`. The grouping knows
+mono (`M`), dual mono (`DM`), stereo (`ST`), matrix stereo (`LtRt`), 5.1
+(`51`), 7.1 (`71`), 22.2 (`222`), SDI groups (`SGRP`) and undefined runs
+(`U01` to `U64`); channels it has no group for go as undefined.
+
+A receiver takes the layout from the stream's SDP file. If the file says
+nothing, as with many AES67 devices, it assumes one from the channel
+count: mono, stereo, 5.1 or 7.1, else undefined channels. `orpheusctl
+status` shows each channel as "label (symbol)", and the playback stream
+places the channels accordingly: `L` and `R` on the front left and right,
+undefined ones as numbered AUX channels, which PipeWire passes on in
+order.
+
+For a sender that says nothing or says it wrong, set the layout of its
+[source](#outputs-and-volume); a stream playing it restarts with it, and
+it is kept with the source:
+
+```sh
+orpheusctl layout Desk DM       # two mono channels
+orpheusctl layout Desk R L      # sent the wrong way round
+orpheusctl layout Desk auto     # what the stream says again
+```
+
+Over the API, a layout can carry labels:
+
+```sh
+curl -X PUT localhost:7480/x-orpheus/v1/sources/<id>/layout -H 'content-type: application/json' \
+  -d '{"layout": [{"symbol": "U01", "label": "Mic 1"}, {"symbol": "U02", "label": "Mic 2"}]}'
+```
+
+Streams have two channels for now; a layout with another number is
+refused. Orpheus' own senders send stereo, `L` and `R`.
+
+### Inputs and outputs
+
+`orpheusctl outputs` lists what can be played on: the sound cards and
+other sinks, the sinks to other nodes, and outputs created from channels
+of these. `orpheusctl inputs` lists what can be played: each running
+receiver's stream (`orpheus.receive.<id>`) and the audio system's inputs,
+such as microphones and line-ins. Both show the channels as a
+[layout](#channel-layouts): `ST`, `M`, `51`, or `U08` for eight numbered
+channels, as audio interfaces in their "pro audio" profile have.
+
+An audio interface with several outputs shows up as one output with many
+channels. To play into some of them as into an output of their own,
+create one:
+
+```sh
+orpheusctl output create Kitchen "Scarlett 4i4" 3 4   # its channels 3 and 4
+orpheusctl output create Desk "Built-in Audio" 2 --layout M
+orpheusctl output remove Kitchen
+```
+
+The new output (`orpheus.output.kitchen`) is a PipeWire sink like any
+other: applications and receivers play into it, it has a volume, a
+[type](#output-types), and can be the default. Its channels are linked to
+the chosen channels of the device, one each, in order; by default it has
+the layout their number suggests (`ST` for two, `M` for one). It is kept
+in `outputs.json` and created again at start. While the device is
+missing, `outputs` marks it `(missing)` and what is played into it goes
+nowhere; once the device is back, it plays there again.
+
+Inputs are listed only for now; wiring them to outputs comes with the
+patchbay (see the [roadmap](roadmap.md)).
 
 ## Aliases and pins
 
@@ -386,6 +462,8 @@ streams](#several-streams)):
   nothing; `free, plays any sender` that it would play any stream sent to
   its port but none arrives; `connected to …, off` that a
   [connection](#connections-is-05) switched it off.
+- `channels`: what each channel carries, as "label (symbol)"; see
+  [channel layouts](#channel-layouts).
 - `output`: the kind of output it plays on, which other nodes show, and
   that output (see [output types](#output-types)).
 - `priority`: `high` for a connection made with `--priority high`; shown
@@ -461,12 +539,17 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `422` if there is no such peer or none of its receivers can play the stream, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
 | `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
-| `GET /x-orpheus/v1/sources` | The [sources](#outputs-and-volume) the receivers remember, most recently played first: `id`, `name`, `key` (what the stream is recognized by), `node` (the sending node's ID, if Orpheus), `output` (machine name, absent for the default), `volume` (`channels`, linear per channel, and `mute`), `receiver` (while it plays) and `last_used` (Unix seconds). |
-| `DELETE /x-orpheus/v1/sources/{id}` | Forgets a source's output and volume; a stream playing it goes to the default output at full volume. Returns `204`, or `404` if there is no such source. |
+| `GET /x-orpheus/v1/sources` | The [sources](#outputs-and-volume) the receivers remember, most recently played first: `id`, `name`, `key` (what the stream is recognized by), `node` (the sending node's ID, if Orpheus), `output` (machine name, absent for the default), `volume` (`channels`, linear per channel, and `mute`), `layout` (if [set](#channel-layouts): `symbol` and `label` per channel), `receiver` (while it plays) and `last_used` (Unix seconds). |
+| `DELETE /x-orpheus/v1/sources/{id}` | Forgets a source's output, volume and layout; a stream playing it goes to the default output at full volume. Returns `204`, or `404` if there is no such source. |
+| `PUT /x-orpheus/v1/sources/{id}/layout` | Sets a source's [layout](#channel-layouts): `{"layout": "51"}` (ST 2110-30 groups or channel symbols) or `{"layout": [{"symbol": "L", "label": "Left"}, …]}`. A stream playing it restarts. Returns `204`; `400` for a malformed layout, `404` if there is no such source, `422` for another number of channels than the streams have. |
+| `DELETE /x-orpheus/v1/sources/{id}/layout` | Goes back to what the source's stream says. Returns `204`, or `404`. |
 | `PUT /x-orpheus/v1/receivers/{id}/output` | Plays a receiver's stream on an output, remembered for its source. Body: `{"output": "<name>"}`. Returns `204`; `404` if there is no such receiver or output, `409` if the receiver is not playing. `DELETE` goes back to the default. |
-| `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receivers`: the IDs of the receivers that play there. |
-| `PUT /x-orpheus/v1/outputs/{name}` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
-| `DELETE /x-orpheus/v1/outputs/{name}` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
+| `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, `receivers` (the IDs of the receivers that play there), `channels` (`symbol` per channel, see [channel layouts](#channel-layouts)) and, for a [created output](#inputs-and-outputs), `created`: the `device` it plays on and that device's `channels`, counted from 1. |
+| `POST /x-orpheus/v1/outputs` | Creates an output on channels of another. Body: `{"name": "Kitchen", "device": "<name>", "channels": [3, 4]}`, optionally with `layout` as for [sources](#channel-layouts). Returns `201` with its `name`; `400` for a malformed name or layout, `409` if an output of that name exists, `422` if there is no such device or not those channels, `503` without an audio system. |
+| `DELETE /x-orpheus/v1/outputs/{name}` | Removes a created output. Returns `204`, or `404` if there is no such created output. |
+| `PUT /x-orpheus/v1/outputs/{name}/type` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
+| `DELETE /x-orpheus/v1/outputs/{name}/type` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
+| `GET /x-orpheus/v1/inputs` | The [inputs](#inputs-and-outputs): `name`, `description`, `kind` (`receiver` or `device`), `receiver` (its ID, for a receiver) and `channels`. |
 | `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |
 | `PATCH /x-orpheus/v1/nodes/{id}` | Sets a node's [alias or pin](#aliases-and-pins), by its node ID. Body: `{"alias": "Kitchen"}`, `{"alias": null}` to remove it, `{"pinned": true}`, or both keys. Returns `204`; `400` for an empty alias, `404` if the node was never seen, `409` if another node has the alias. |
@@ -555,7 +638,9 @@ websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
 - `receivers`: one per connection and the free one. `sender` names the
   connected sender (its node's alias or name, else its address); `stream`
   is there while the receiver runs, with `map`, the stream's channel on
-  each output channel (`[0, 1]` unless changed); `state` is what the
+  each output channel (`[0, 1]` unless changed); `layout` is what the
+  stream's channels carry, `symbol` and `label` per channel (see
+  [channel layouts](#channel-layouts)); `state` is what the
   [policy](#several-streams) does to it: `silent`, `playing`, `muted` or
   `ducked`.
 - `routes`: the routes that run. `playing` says whether applications play
@@ -657,8 +742,9 @@ controllers can see it. It describes the node as one device with:
 - a **receiver** per connection and a free one (see [several
   streams](#several-streams)), up to 8 by default. Its capabilities
   (`caps`, after BCP-004-01) say what it plays: L24, 48 kHz, 2 channels;
-- per sender started with `connect`, a **source**, a **flow** (L24, 48 kHz,
-  stereo) and a **sender**.
+- per sender started with `connect`, a **source**, with its `channels`
+  (symbol and label, see [channel layouts](#channel-layouts)), a **flow**
+  (L24, 48 kHz, stereo) and a **sender**.
 
 ```sh
 curl -s localhost:7480/x-nmos/node/v1.3/self | jq
@@ -667,8 +753,9 @@ curl -s localhost:7480/x-nmos/node/v1.3/senders | jq '.[].label'
 
 Each sender's `manifest_href` points to its SDP file, which describes the
 stream the way AES67 and SMPTE ST 2110-30 receivers expect: destination,
-L24/48000/2, payload type 97, 1 ms packets, the PTP grandmaster and domain
-(`ts-refclk`) and `mediaclk:direct=0`:
+L24/48000/2, the channel grouping (`channel-order=SMPTE2110.(ST)`), payload
+type 97, 1 ms packets, the PTP grandmaster and domain (`ts-refclk`) and
+`mediaclk:direct=0`:
 
 ```sh
 curl -s localhost:7480/x-orpheus/v1/routes/<id>/sdp
@@ -748,7 +835,8 @@ receiver is one input, `rx-<id>` (the stream it plays), and one output,
 receiver's input. A map can swap left and right, play one channel on both
 sides, or mute a channel; it doesn't mix channels. A change crossfades
 over 30 ms. The map stays with the receiver while it exists, also between
-streams.
+streams. The channels of both are labelled as the stream's
+[layout](#channel-layouts) says.
 
 For example, to swap left and right on receiver 0:
 

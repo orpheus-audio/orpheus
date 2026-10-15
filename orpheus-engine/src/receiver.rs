@@ -32,7 +32,7 @@ use orpheus_core::channels::MAX_CHANNELS;
 use orpheus_core::jitter::{Insert, JitterBuffer};
 use orpheus_core::rtp::{self, Encoding, SequenceStats};
 use orpheus_core::timebase::{MediaClock, extend};
-use orpheus_core::{AudioFormat, ChannelMap, OutputType};
+use orpheus_core::{AudioFormat, ChannelMap, Layout, OutputType};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::asrc::{Asrc, Fixed};
@@ -62,6 +62,8 @@ pub struct ReceiverConfig {
     pub name: String,
     pub description: String,
     pub format: AudioFormat,
+    /// What the stream's channels carry.
+    pub layout: Layout,
     pub encoding: Encoding,
     /// `[::]:port` listens on IPv4 and IPv6 (only IPv4 where IPv6 is
     /// disabled).
@@ -237,6 +239,7 @@ pub(crate) struct Receiver {
     /// The configured description of the playback stream.
     description: String,
     key: Option<String>,
+    layout: Layout,
     /// The address to listen on, with whatever port.
     bind_ip: IpAddr,
     link_offset_ms: u32,
@@ -272,6 +275,7 @@ impl Receiver {
                 name: cfg.name.clone(),
                 description: cfg.description.clone(),
                 format,
+                layout: cfg.layout.clone(),
                 group: None,
                 remote: Some(OutputType::Generic),
                 block_frames: cfg.block_frames,
@@ -352,6 +356,7 @@ impl Receiver {
         Ok(Self {
             description: cfg.description.clone(),
             key: cfg.key.clone(),
+            layout: cfg.layout.clone(),
             bind_ip: cfg.listen.ip(),
             link_offset_ms: cfg.link_offset_ms,
             filter,
@@ -393,6 +398,10 @@ impl Receiver {
 
     pub fn key(&self) -> Option<&str> {
         self.key.as_deref()
+    }
+
+    pub fn layout(&self) -> &Layout {
+        &self.layout
     }
 
     pub fn playback(&self) -> &StreamHandle {

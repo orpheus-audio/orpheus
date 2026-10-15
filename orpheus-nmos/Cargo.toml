@@ -10,5 +10,5 @@ publish = false
 [dependencies]
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "v5", "serde"] }
-orpheus-core.workspace = true
+orpheus-core = { workspace = true, features = ["serde"] }
 serde.workspace = true
