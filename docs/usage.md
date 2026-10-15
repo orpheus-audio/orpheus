@@ -29,6 +29,9 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `default OUTPUT` | Makes `OUTPUT` (as for `set-type`) the default output, where applications play and received streams without an output of their own go; a route's sink works too, so that the node's audio goes to the peer. The same as choosing it in the desktop's sound settings, for nodes without a desktop. The audio system keeps it across restarts. |
 | `sources` | Lists the [sources](#outputs-and-volume) the receivers remember: where each plays, how loud, and whether it plays now. |
 | `forget-source SOURCE` | Forgets where a source plays and how loud; one that plays now goes to the default output at full volume. `SOURCE` is its name, or its ID or the start of it, as `sources` shows. |
+| `settings` | Shows the [settings](configuration.md#settings-changed-over-the-api) that can change while the node runs, each with where its value comes from: `default`, `config` (config.toml) or `api`. |
+| `set SECTION.KEY=VALUE…` | Changes settings while the node runs, for example `set receiver.policy=mix ptp.domain=1`; kept across restarts, config.toml is not touched. A bad value changes nothing. |
+| `reset SECTION.KEY…` | Undoes `set`: the value from config.toml or the default applies again. `reset ptp` resets a whole section. |
 | `set-type OUTPUT TYPE` | Sets what kind of device an output is; `auto` goes back to the detected type. `OUTPUT` is the name or description from `outputs`, or a part of either that only one output has. |
 
 `--json` prints the node's JSON responses instead of text: the status as the
@@ -352,7 +355,11 @@ and go; see [warnings](#warnings).
 **Clock**
 
 - `PTP, settled` or `PTP, settling`: see [clock](clock.md#ptp).
-  `system clock` means PTP is off or could not start; the log says why.
+  `PTP not running, system clock` means PTP could not start yet, and
+  `PTP stopped, holding over` that it stopped after following a
+  grandmaster; `error` says why, and the node tries again by itself (see
+  [clock](clock.md#when-ptp-cant-run)). `system clock` alone means PTP is
+  off (`[ptp] enabled = false`).
 - `interface`: the interface and transport PTP uses.
 - `state`: `slave` follows the grandmaster, `master` is it. `listening` means
   no other PTP clock has been heard yet. `uncalibrated` means following but
@@ -462,6 +469,9 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |
 | `PATCH /x-orpheus/v1/nodes/{id}` | Sets a node's [alias or pin](#aliases-and-pins), by its node ID. Body: `{"alias": "Kitchen"}`, `{"alias": null}` to remove it, `{"pinned": true}`, or both keys. Returns `204`; `400` for an empty alias, `404` if the node was never seen, `409` if another node has the alias. |
+| `GET /x-orpheus/v1/settings` | The [settings](configuration.md#settings-changed-over-the-api) in effect, by section (`ptp`, `receiver`, `sender`), and `sources`: for each key where its value comes from, `default`, `config` or `api`. |
+| `PATCH /x-orpheus/v1/settings` | Changes settings, as a JSON merge patch: `{"receiver": {"policy": "mix"}}` sets a value, `null` in its place resets it. Returns `200` with the settings now in effect; `400` for an unknown key or a bad value, `422` if PTP can't start with the new values. Nothing changes on an error. |
+| `GET /x-orpheus/v1/events` | A WebSocket that pushes the node's state, see [below](#events). |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
 
 The same OpenAPI document is printed by `orpheusd --openapi`.
@@ -482,6 +492,34 @@ endpoint:
 
 The NMOS APIs also use `423` (IS-05: an activation is scheduled) and `501`
 (IS-04's deprecated receiver `target`).
+
+### Events
+
+Instead of polling, a client can open a WebSocket on
+`/x-orpheus/v1/events` and is sent each topic's full state, as the GET of
+the same name returns it, when it connects and again whenever it changes:
+
+```json
+{"topic": "routes", "data": [{"id": "K7QM3XRA", "name": "Kitchen", "…": "…"}]}
+```
+
+| Topic | As |
+|---|---|
+| `status` | `GET /x-orpheus/v1/status`, at most once a second |
+| `nodes` | `GET /x-orpheus/v1/nodes`; `null` while mDNS isn't running |
+| `outputs` | `GET /x-orpheus/v1/outputs`, at most once a second |
+| `settings` | `GET /x-orpheus/v1/settings` |
+| `routes` | `GET /x-orpheus/v1/routes` |
+| `sources` | `GET /x-orpheus/v1/sources`, at most once a second |
+
+`?topics=status,routes` picks topics; an unknown one is a `400`. The
+others come within 250 ms of a change. A slow client skips states but
+never gets old ones. Messages from the client are ignored.
+`orpheusctl status --watch` uses this socket.
+
+```sh
+websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
+```
 
 ### The status JSON
 
@@ -507,6 +545,10 @@ The NMOS APIs also use `423` (IS-05: an activation is scheduled) and `501`
 }
 ```
 
+- `clock.source`: `ptp` while PTP runs, `holdover` while it is stopped
+  after following a grandmaster, `system` otherwise. `clock.ptp` is there
+  whenever PTP is enabled, also while it isn't running: `running`, and if
+  not, `error` (why) and `holdover`.
 - `accept`, `policy`, `duck_db`: the [`[receiver]`
   settings](configuration.md#receiver).
 - `receivers`: one per connection and the free one. `sender` names the
@@ -549,6 +591,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). |
 | `peer_jitter` | sender | The peer's receiver warns about `jitter` for this sender. |
 | `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. |
+| `ptp_down` | clock | PTP is not running, so the node plays out of step with the other nodes: on the system clock, or holding over the grandmaster's last time and rate. It tries again by itself; see [clock](clock.md#when-ptp-cant-run). |
 | `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. |
 | `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
 | `peer_busy` | sender | The route wants a receiver on the peer, but all of the peer's receivers play other senders; it tries again every 5 seconds. Raise `[receiver] max` on the peer, or let other routes [claim on play](#claiming-a-receiver-on-play). |
@@ -723,6 +766,10 @@ are listed under `map/activations` until they happen and can be cancelled
 with `DELETE`; an output with one pending answers `423` to other changes.
 `map/active` shows the maps in effect, and the receiver status shows its
 running stream's map as `map`.
+
+This per-receiver mapping is provisional. M7 (see the
+[roadmap](roadmap.md)) replaces it with a patchbay across all receivers
+and outputs, and IS-08 stays only if it can show that patch faithfully.
 
 ### Multicast (interop)
 

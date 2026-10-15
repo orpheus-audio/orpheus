@@ -1093,10 +1093,11 @@ struct EventsQuery {
 /// Opens a WebSocket that pushes snapshots instead of being polled. Each
 /// text message is one topic's full state, as its GET returns it:
 /// `{"topic": "status", "data": {…}}`. The topics are `status`, `nodes`
-/// (`null` while mDNS is not running), `outputs`, `settings` and `routes`.
-/// Every topic asked for comes once on connecting, then again whenever it
-/// changed: `nodes`, `settings` and `routes` within 250 ms, `status` and
-/// `outputs` at most once a second. Messages from the client are ignored.
+/// (`null` while mDNS is not running), `outputs`, `settings`, `routes` and
+/// `sources`. Every topic asked for comes once on connecting, then again
+/// whenever it changed: `nodes`, `settings` and `routes` within 250 ms,
+/// `status`, `outputs` and `sources` at most once a second. Messages from
+/// the client are ignored.
 #[utoipa::path(
     get,
     path = "/x-orpheus/v1/events",

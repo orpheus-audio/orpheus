@@ -12,9 +12,11 @@
 | — | Tuning the PTP servo | done, except on real hardware |
 | M4 | Discovery (mDNS) and NMOS: IS-04 node API, IS-05 connections with SDP, connecting through IS-05 from `orpheusctl`, output types | done, except interop tests |
 | M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes (through WirePlumber) | done, except the two-box test |
-| M6 | Configurability: clock settings (settle, slew, failover) over the API, WebSocket state stream, IS-08 and BCP-004 | planned |
+| — | Route identity: stable route and source IDs, output and volume remembered per source, claiming the peer's receiver on play, default output | done |
+| M6 | Configurability: settings over the API (clock, receivers, senders), PTP that retries and holds over, WebSocket state stream, output selection, BCP-004, IS-08 per receiver | done, except the two-box test |
+| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | planned |
 
-After M6 the API should be stable enough for the web UI.
+After M7 the API should be stable enough for the web UI.
 
 Later, beyond the Linux node: ESP32 receivers, a Wi-Fi profile with
 timestamped buffering and adaptive latency, the Svelte web UI (also packaged
@@ -74,7 +76,7 @@ and Bluetooth inputs.
   under fast drift a node can report settled while it is up to a few hundred
   µs behind.
 - One interface and one transport per node, end-to-end delay only. The AES67
-  message rates are fixed. `[ptp]` can only be set in the config file.
+  message rates are fixed.
 - The PTP clock sits on the system clock, so an NTP step disturbs it.
 - Jitter above the step threshold (1 ms), as on Wi-Fi, makes the clock
   step over and over, and a sudden change of the path delay makes it step
@@ -180,10 +182,11 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 - **Split between config and control plane.** Routing lives in the API and
   is saved in the state directory (`routes.json`); `config.toml` holds
-  defaults. Still open is how other settings changed through the API (link
-  offsets, clock settings in M6) relate to the file, for example the file as
-  defaults that the API overrides, with the API showing where each value
-  comes from.
+  defaults. Settings changed over the API override the file and show where
+  each value comes from (done in M6, see
+  [configuration](configuration.md#settings-changed-over-the-api)). Settings
+  that need a restart (ports, `[receiver] max`, the audio block) can only
+  be set in the file.
 - **Output types** (M4). Each output of a device announces a type, and other
   nodes show its sink with a matching icon and PipeWire `device.form-factor`.
   Outputs are typed separately, so an AV receiver's zones can differ. The

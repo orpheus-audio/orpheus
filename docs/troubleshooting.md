@@ -26,18 +26,24 @@ journalctl --user -u orpheusd -p warning  # warnings and errors only
 Fallbacks are logged as warnings with the reason, for example
 `PTP unavailable; using the system clock error=…`.
 
-## `system clock` instead of PTP
+## `PTP not running` or `holding over`
 
-The log line `PTP unavailable; using the system clock` gives the reason.
+`orpheusctl status` shows the reason as `error`, and the log says it once
+with `PTP can't start; trying again` or `PTP stopped`. The node keeps
+trying by itself (see [clock](clock.md#when-ptp-cant-run)); fix the cause
+and it follows the grandmaster again within seconds, without a restart.
 
 - **Permission denied:** the binary lacks `CAP_NET_BIND_SERVICE` for ports
   319 and 320. Run `sudo setcap cap_net_bind_service=+ep path/to/orpheusd`
   again; every rebuild removes it. `getcap path/to/orpheusd` shows whether it
-  is set.
+  is set. This one needs a restart of `orpheusd`.
 - **Interface has no MAC address:** the default route goes through a VPN or
-  another tunnel (WireGuard, OpenVPN tun). Set `[ptp] interface` to the LAN
-  interface.
-- **No default route:** set `[ptp] interface`.
+  another tunnel (WireGuard, OpenVPN tun). Set the LAN interface:
+  `orpheusctl set ptp.interface=enp3s0`.
+- **No default route:** set `ptp.interface` the same way.
+- **Holding over:** the interface went down or the network changed. PTP
+  starts again once the interface is back; meanwhile the clock drifts
+  slowly from the other nodes.
 
 ## PTP runs but never settles
 

@@ -16,9 +16,10 @@ PipeWire. ESP32 receivers, a web UI and Wi-Fi operation are planned; see the
 RTP unicast (IPv4 or IPv6; multicast only for AES67/Dante interop), with the
 clock synchronized over PTP and sample-rate conversion against the sound
 cards' clocks. Nodes find each other over mDNS and speak NMOS (IS-04,
-IS-05), so routes can be set with `orpheusctl`, which connects both ends, or
-an NMOS controller; they are kept across restarts. There is no
-authentication and no UI yet.
+IS-05, BCP-004, IS-08), so routes can be set with `orpheusctl`, which
+connects both ends, or an NMOS controller; they are kept across restarts.
+Settings can be changed while a node runs, and its state is pushed over a
+WebSocket. There is no authentication and no UI yet.
 
 ## Quick start
 
@@ -36,8 +37,8 @@ With [just](https://just.systems), `just run` does all three and asks for
 sudo only when the capability is missing; see
 [development](docs/development.md#building) for the other build profiles.
 
-Without the capability the node still runs, but it falls back to the system
-clock; see [clock](docs/clock.md).
+Without the capability the node still runs, but on the system clock; see
+[clock](docs/clock.md#when-ptp-cant-run).
 
 Both binaries, `orpheusd` and `orpheusctl`, end up in `target/release`. On a
 second machine, start `orpheusd` the same way, with `name = "Kitchen"` in
@@ -73,9 +74,9 @@ To start the node with your session, install the systemd user unit from
 
 ## Documentation
 
-- [Configuration](docs/configuration.md): files, `~/.config/orpheus/config.toml`
-- [Usage](docs/usage.md): `orpheusctl`, the HTTP API, reading the status
-- [Clock](docs/clock.md): PTP, TAI, settling, fallback, IPv4 and IPv6
+- [Configuration](docs/configuration.md): files, `~/.config/orpheus/config.toml`, settings changed over the API
+- [Usage](docs/usage.md): `orpheusctl`, the HTTP API and its WebSocket, reading the status
+- [Clock](docs/clock.md): PTP, TAI, settling, when PTP can't run, IPv4 and IPv6
 - [Architecture](docs/architecture.md): crates, threads, the audio path
 - [Troubleshooting](docs/troubleshooting.md)
 - [Development](docs/development.md): building and tests

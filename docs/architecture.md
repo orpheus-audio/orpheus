@@ -111,7 +111,7 @@ time instead of catching up ("realign").
 | main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type and can set the default output, as the desktop does. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
-| `orpheus-ptp` | PTP: sockets, timers, statime |
+| `orpheus-ptp` | PTP: sockets, timers, statime; restarts the port when its interface changes or the settings do, and retries while it can't start |
 | TX, one per sender | Pacing, ASRC, RTP send |
 | RX, one per running receiver | RTP receive, jitter buffer, channel map, level meter and gain, ASRC |
 | mDNS | mdns-sd's daemon, plus `mdns-monitor` (renames on name conflicts) and `mdns-browse` (the node list) |
@@ -155,7 +155,9 @@ input and one output, whose map is the receiver's channel map. The maps
 are kept per receiver, also while it plays nothing, and given to the
 engine whenever the receiver runs. An input's parent is its receiver, not
 the sender's source, which the node's own IS-04 API doesn't list. Every
-activation gives the device a new IS-04 version.
+activation gives the device a new IS-04 version. This model is
+provisional: M7 replaces the per-receiver maps with a patchbay across all
+receivers and outputs.
 
 Each sender's `manifest_href` points to its SDP file. Its session version
 follows the sender's and the node's resource versions, so it changes when the
@@ -362,6 +364,34 @@ resource; the new version bumps `ver_rcv`, the senders' peer watch asks
 the receiver again and warns on its side too. The clock warns about a
 slow path (mean delay) and about repeated steps, which is how a slow path
 shows when the filter can't settle.
+
+## Settings
+
+`settings.rs` holds the settings that can change while the node runs in
+three layers: the built-in defaults, `config.toml` (which keys it sets is
+remembered, to tell the two apart), and the API's changes, a JSON object
+of sections and keys in `settings.json`. A change is a JSON merge patch on
+that object; it is merged, checked as a whole against the same rules as
+the file, applied, and only then saved, so a refused change leaves
+nothing behind. The node never writes `config.toml`.
+
+Applying a change touches only what it changes. New PTP settings restart
+the PTP port in its thread, while the clock on top of the system clock
+keeps its time and rate (see [clock](clock.md#when-ptp-cant-run)); if
+the port can't start with them, the old settings stay. A new
+`link_offset_ms` restarts the running receivers; the policy, ducking,
+default output and sender settings are read where they are used.
+
+## Events
+
+`events.rs` serves the WebSocket `/x-orpheus/v1/events`. While at least
+one client is connected, a task builds each topic's state as its GET does
+(the same functions) every 250 ms, the dearer ones (status, outputs,
+sources) every second, and publishes the JSON of the topics that changed
+on a `tokio::sync::watch` channel holding the latest message per topic.
+Each client sends what changed since it last sent, so a slow client skips
+states instead of queueing them, and a client never gets a topic it
+already has. Without clients nothing is built.
 
 ## Identity
 

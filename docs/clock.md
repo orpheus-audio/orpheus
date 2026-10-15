@@ -122,21 +122,44 @@ AES67 requires.
 RTP and the HTTP API listen on IPv4 and IPv6 regardless of the PTP
 transport.
 
-## Fallback: the system clock
+## When PTP can't run
 
-The node uses the system clock (on the TAI timescale) when:
+The PTP clock runs on top of the system clock (on the TAI timescale): it
+is the system clock plus an offset and a rate correction, which PTP
+adjusts. So the node always has a clock, also while PTP is not running.
 
-- `[ptp] enabled = false`,
+**At start**, PTP may not be able to run yet:
+
 - the PTP ports cannot be bound (missing `CAP_NET_BIND_SERVICE`),
 - there is no default route and no `interface` is configured,
 - the interface has no MAC address (VPN and other tunnel interfaces) or,
   with `transport = "auto"`, no IP address.
 
-`orpheusctl status` then shows `system clock`, and the log says why. Nodes
-on the system clock stay in sync only as well as NTP keeps their clocks
-together, which on a LAN is typically within a few milliseconds. That must
-fit into the link offset. Raise `link_offset_ms` if receivers report late
-packets.
+The node then runs on the system clock and tries again every 5 seconds,
+and as soon as an interface comes up or changes. Once PTP runs, the clock
+follows the grandmaster; as with any start, that may take a step.
+
+**While it runs**, PTP stops when its interface goes down, the default
+route moves to another interface, or the interface gets a new IPv4
+address. The clock then **holds over**: it keeps the grandmaster's last
+time and rate and drifts away from the other nodes only as fast as that
+rate was off or the crystal changes since, typically by less than a few µs
+per second. PTP starts again by
+itself, on the new interface if the route moved, and the clock continues
+from where it is, without a step if it is still within `step_threshold_us`
+of the grandmaster.
+
+Changing the PTP [settings](configuration.md#settings-changed-over-the-api)
+over the API restarts PTP the same way, without a jump.
+
+`orpheusctl status` shows `PTP not running, system clock` or `PTP stopped,
+holding over` with the reason, and the node [warns](usage.md#warnings)
+(`ptp_down`). Nodes on the system clock stay in sync only as well as NTP
+keeps their clocks together, which on a LAN is typically within a few
+milliseconds. That must fit into the link offset. Raise `link_offset_ms` if
+receivers report late packets.
+
+With `[ptp] enabled = false` the node uses the system clock only.
 
 ## Clock-domain crossing (ASRC)
 

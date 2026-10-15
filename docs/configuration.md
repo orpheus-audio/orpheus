@@ -42,6 +42,11 @@ make the node a new device.
 error, so typos don't go unnoticed. Changes take effect when `orpheusd`
 restarts.
 
+Some keys can also be changed while the node runs, over the API or with
+`orpheusctl set` (see [settings](#settings-changed-over-the-api)): those
+of `[ptp]` except `enabled`, `[receiver]` except `enabled`, `port` and
+`max`, and all of `[sender]`.
+
 ### Example
 
 All values below are the defaults, except `name`.
@@ -214,7 +219,7 @@ Clock synchronization with the other nodes and with AES67 devices. See
 
 | Key | Default | Meaning |
 |---|---|---|
-| `enabled` | `true` | Run PTP. When disabled, or when PTP cannot start, the node uses the system clock. |
+| `enabled` | `true` | Run PTP. When disabled, the node uses the system clock; when PTP cannot start, it [keeps trying](clock.md#when-ptp-cant-run). |
 | `interface` | unset | Network interface for PTP. Unset picks the interface of the IPv4 default route, or of the IPv6 default route if there is no IPv4 one. |
 | `transport` | `"auto"` | `"ipv4"`, `"ipv6"` or `"auto"`. Auto uses IPv4 if the interface has an IPv4 address, IPv6 otherwise. Nodes on different transports don't see each other. AES67 and Dante devices only speak IPv4. |
 | `domain` | `0` | PTP domain. Only nodes in the same domain synchronize. |
@@ -265,6 +270,29 @@ measure the engine's own latency.
 |---|---|---|
 | `enabled` | `false` | Create the loopback sink. |
 | `latency_ms` | `20` | Buffer between the sink and the playback stream. |
+
+## Settings changed over the API
+
+`orpheusctl set receiver.policy=mix ptp.domain=1` changes settings while the
+node runs. The node keeps such changes in `settings.json` in the state
+directory, and they win over `config.toml`, which it never writes. So
+each value comes from one of three layers: the built-in default,
+`config.toml`, or the API. `orpheusctl settings` shows every value with
+its layer, `orpheusctl reset ptp.domain` (or `reset ptp` for a whole
+section) undoes a change, so that the file's value or the default applies
+again. Editing `config.toml` changes what a reset goes back to; a value
+set over the API stays until it is reset.
+
+| Section | Keys | When it takes effect |
+|---|---|---|
+| `ptp` | `interface`, `transport`, `domain`, `priority1`, `priority2`, `slave_only`, `step_threshold_us`, `settle_threshold_us` | PTP restarts at once; the clock keeps running without a jump. If PTP can't start with the new values, nothing changes. |
+| `receiver` | `accept`, `policy`, `duck_db`, `default_output` | at once |
+| `receiver` | `link_offset_ms` | at once; streams that play restart, with a short gap |
+| `sender` | `claim`, `release_after_s`, `fade_in_ms` | at once |
+
+The values are checked as in `config.toml`; a change with an unknown key
+or a value out of range is refused as a whole. The HTTP form is
+[`PATCH /x-orpheus/v1/settings`](usage.md#http-api).
 
 ## Environment
 
