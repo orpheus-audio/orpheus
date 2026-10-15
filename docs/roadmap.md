@@ -232,6 +232,12 @@ the node's policy only sets each stream's volume. Open ideas:
   speaker, headphones) need not compete.
 - Sample-rate changes come with the AES67 extended mode (44.1, 96 kHz), as
   the native format is fixed.
+- Remote volume: the sink's volume on the sending node and the stream's
+  volume on the receiving node are independent today and multiply. An
+  AirPlay-like mode could let the sink's slider set the receiver's volume
+  instead, with the sink at 100%. To settle: which wins when both change,
+  how it passes through relays hop by hop, and whether it is set per
+  route or per node.
 
 ### Graphs
 
