@@ -34,7 +34,10 @@ use crate::receiver::SOUND_THRESHOLD;
 /// Dynamic payload type; AES67 leaves the number to the SDP.
 pub const PAYLOAD_TYPE: u8 = 97;
 
-/// Block size assumed when none is configured (PipeWire's default quantum).
+/// Block size the sink asks for when none is configured (PipeWire's default
+/// quantum). The sink always asks for the block its buffer is sized for:
+/// otherwise a client asking for more latency raises the cycle beyond it
+/// and the buffer runs dry between cycles.
 const DEFAULT_BLOCK_FRAMES: u32 = 1024;
 
 /// Extra buffering for scheduling jitter between the sink and the TX thread.
@@ -259,8 +262,8 @@ impl Sender {
         cfg: &SenderConfig,
     ) -> Result<Self, BackendError> {
         let format = cfg.format;
-        let block_frames = cfg.block_frames.unwrap_or(DEFAULT_BLOCK_FRAMES) as usize;
-        let target = block_frames + format.frames_in_ms(JITTER_MARGIN_MS);
+        let block_frames = cfg.block_frames.unwrap_or(DEFAULT_BLOCK_FRAMES);
+        let target = block_frames as usize + format.frames_in_ms(JITTER_MARGIN_MS);
         let (capture, playback, buffer) = port_pair(format.channels, target);
 
         let link = Arc::new(Mutex::new(Link::open(Route::to(cfg.peer))?));
@@ -278,7 +281,7 @@ impl Sender {
                 format,
                 group: None,
                 remote: Some(cfg.remote),
-                block_frames: cfg.block_frames,
+                block_frames: Some(block_frames),
                 key: None,
                 placement: Placement::Default,
                 volume: cfg.volume.clone(),

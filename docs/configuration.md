@@ -114,9 +114,11 @@ sets part of the latency, about one block in each direction.
 | `cycle_ms` | unset | Block size to ask for, as a duration. It is converted to frames at the stream's sample rate and rounded to a whole frame, so the latency stays the same if the rate changes. |
 
 Set one of them or neither; setting both is an error. The block must come
-to 16 to 8192 frames, at 48 kHz 0.33 to 170 ms. Unset, the audio system
-picks (PipeWire usually 1024 frames, 21 ms, unless other applications ask
-for less).
+to 16 to 8192 frames, at 48 kHz 0.33 to 170 ms. Unset, receivers leave
+the block to the audio system (PipeWire usually 1024 frames, 21 ms, unless
+other applications ask for less), and senders ask for 1024 frames, so that
+an application asking for a large latency can't stretch the block beyond
+what the sender buffers for.
 
 - **Smaller blocks** mean lower latency, but more wakeups and CPU, and
   under load the audio system may not keep up (`underruns` in the
