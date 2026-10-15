@@ -20,6 +20,7 @@ pub struct Config {
     pub api: ApiConfig,
     pub audio: AudioConfig,
     pub receiver: ReceiverConfig,
+    pub sender: SenderConfig,
     pub routes: RoutesConfig,
     pub sources: SourcesConfig,
     pub ptp: PtpConfig,
@@ -192,6 +193,45 @@ pub enum Policy {
     First,
     /// All of them.
     Mix,
+}
+
+/// The routes this node sends: when they hold a receiver on the peer.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SenderConfig {
+    /// When a route holds its receiver on the peer.
+    pub claim: Claim,
+    /// With `claim = "on_play"`: how long a route's sink stays silent
+    /// before the peer's receiver is let go.
+    pub release_after_s: u32,
+    /// How long sending fades in when it starts, so that audio cut in
+    /// mid-sound doesn't click.
+    pub fade_in_ms: u32,
+}
+
+impl Default for SenderConfig {
+    fn default() -> Self {
+        Self {
+            claim: Claim::default(),
+            release_after_s: 600,
+            fade_in_ms: 20,
+        }
+    }
+}
+
+/// When a route holds its receiver on the peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Claim {
+    /// From connecting to disconnecting, also while nothing plays, so that
+    /// short sounds such as alerts are heard in full.
+    #[default]
+    Always,
+    /// Only while something plays into the sink: the receiver is claimed
+    /// when audio starts (or the sink becomes the default output) and let
+    /// go after `release_after_s` of silence, so that other senders can
+    /// use it. The first moments of a sound after a pause are lost.
+    OnPlay,
 }
 
 /// Clock synchronization with the other nodes (and AES67 devices). Without

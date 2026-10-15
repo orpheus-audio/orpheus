@@ -30,6 +30,8 @@ pub struct PortStats {
     /// playing or dropped audio.
     generation: AtomicU64,
     playing: AtomicBool,
+    /// Frames the capture side has taken, dropped ones included.
+    frames_in: AtomicU64,
 }
 
 /// A point-in-time copy of [`PortStats`].
@@ -66,6 +68,12 @@ impl PortStats {
     /// The playback side is playing, not waiting for audio.
     pub fn playing(&self) -> bool {
         self.playing.load(Relaxed)
+    }
+
+    /// Frames the capture side has taken so far; it grows while audio
+    /// arrives.
+    pub fn frames_in(&self) -> u64 {
+        self.frames_in.load(Relaxed)
     }
 }
 
@@ -122,6 +130,9 @@ impl CapturePort {
     /// as an overrun.
     pub fn push(&mut self, samples: &[f32]) {
         let want = whole_frames(samples.len(), self.channels);
+        self.stats
+            .frames_in
+            .fetch_add((want / self.channels) as u64, Relaxed);
         let n = want.min(whole_frames(self.producer.slots(), self.channels));
         if n > 0
             && let Ok(chunk) = self.producer.write_chunk_uninit(n)

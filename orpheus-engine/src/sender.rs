@@ -8,10 +8,15 @@
 //! The TX thread resamples from the sound card's clock to the media clock
 //! ([`asrc`](crate::asrc)), taking a little more or less than 1 ms from the
 //! port so that its level stays put.
+//!
+//! The TX thread also notes whether the sink plays (applications feed it)
+//! and when it last carried sound, so that the node can claim a receiver
+//! when audio starts and release it when the sink has been silent for a
+//! while. When it starts sending again after a pause, it fades in.
 
 use std::io;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -24,6 +29,7 @@ use crate::asrc::{Asrc, Fixed};
 use crate::backend::{AudioBackend, BackendError, Placement, StreamHandle, StreamSpec, Volume};
 use crate::grid::{Grid, Tick};
 use crate::port::{PlaybackPort, PortStats, StatsSnapshot, port_pair};
+use crate::receiver::SOUND_THRESHOLD;
 
 /// Dynamic payload type; AES67 leaves the number to the SDP.
 pub const PAYLOAD_TYPE: u8 = 97;
@@ -50,7 +56,14 @@ pub struct SenderConfig {
     /// The sink's volume to start with; `None` leaves the audio system's
     /// default.
     pub volume: Option<Volume>,
+    /// How long sending fades in when it starts or resumes, so that a
+    /// stream cut in mid-sound doesn't click.
+    pub fade_in_ms: u32,
 }
+
+/// How long after audio last arrived from the sink it counts as playing;
+/// longer than the audio system's longest cycles.
+const FED_NS: u64 = 300_000_000;
 
 /// Hops a multicast stream may take; AES67 devices commonly use 32.
 const MULTICAST_TTL: u32 = 32;
@@ -142,6 +155,11 @@ struct Counters {
     realigns: AtomicU64,
     /// `f64` bits.
     asrc_ppm: AtomicU64,
+    /// Media-clock time the sink last carried sound; 0 if it never did.
+    sound_ns: AtomicU64,
+    /// Media-clock time audio last arrived from the sink; 0 if it never
+    /// did.
+    fed_ns: AtomicU64,
 }
 
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
@@ -164,13 +182,25 @@ pub struct SenderStatus {
     pub asrc_ppm: f64,
     /// The buffer between the sink and the TX thread.
     pub buffer: StatsSnapshot,
+    /// Applications play into the sink: audio arrives, if only silence.
+    pub playing: bool,
+    /// Time since the sink last carried sound (above −60 dBFS), in
+    /// milliseconds; `None` if it never did.
+    pub silent_ms: Option<u64>,
+    /// The sink is gone for now, while the peer is offline.
+    pub hidden: bool,
 }
 
 pub(crate) struct Sender {
-    name: String,
+    /// What it was started with, kept up to date with renames and the
+    /// like, so that it can be started again the same.
+    cfg: SenderConfig,
     link: Arc<Mutex<Link>>,
     counters: Arc<Counters>,
     buffer: Arc<PortStats>,
+    /// Fade-in length in frames.
+    fade_frames: Arc<AtomicU32>,
+    clock: Arc<dyn Clock>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     sink: StreamHandle,
@@ -182,19 +212,45 @@ impl Sender {
     }
 
     /// Changes the kind of output the sink shows.
-    pub fn set_remote(&self, remote: OutputType) {
+    pub fn set_remote(&mut self, remote: OutputType) {
         self.sink.set_remote(remote);
+        self.cfg.remote = remote;
     }
 
     /// Shows the sink under another name.
     pub fn rename(&mut self, name: &str) {
         self.sink.describe(name);
-        self.name = name.to_owned();
+        self.cfg.description = name.to_owned();
     }
 
     /// Stops or resumes sending, whatever the route says.
     pub fn pause(&self, paused: bool) {
         self.link.lock().unwrap().paused = paused;
+    }
+
+    /// Whether sending is held back, whatever the route says.
+    pub fn paused(&self) -> bool {
+        self.link.lock().unwrap().paused
+    }
+
+    pub fn route(&self) -> Route {
+        self.link.lock().unwrap().route
+    }
+
+    /// Changes how long sending fades in.
+    pub fn set_fade_in(&self, ms: u32) {
+        let frames = self.cfg.format.frames_in_ms(ms) as u32;
+        self.fade_frames.store(frames, Relaxed);
+    }
+
+    /// What it would start with again: the configuration with the name,
+    /// output type, route and volume it has now.
+    pub fn config(&self) -> SenderConfig {
+        SenderConfig {
+            peer: self.route().peer,
+            volume: self.sink.volume().or_else(|| self.cfg.volume.clone()),
+            ..self.cfg.clone()
+        }
     }
 
     pub fn start(
@@ -232,26 +288,30 @@ impl Sender {
         )?;
 
         let counters = Arc::new(Counters::default());
+        let fade_frames = Arc::new(AtomicU32::new(format.frames_in_ms(cfg.fade_in_ms) as u32));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = thread::Builder::new().name("orpheus-tx".into()).spawn({
             let tx = Tx {
                 port: playback,
                 link: link.clone(),
-                clock,
+                clock: clock.clone(),
                 format,
                 encoding: cfg.encoding,
                 asrc,
                 buffer: buffer.clone(),
                 counters: counters.clone(),
+                fade_frames: fade_frames.clone(),
             };
             let stop = stop.clone();
             move || tx.run(&stop)
         })?;
         Ok(Self {
-            name: cfg.description.clone(),
+            cfg: cfg.clone(),
             link,
             counters,
             buffer,
+            fade_frames,
+            clock,
             stop,
             thread: Some(thread),
             sink,
@@ -269,10 +329,23 @@ impl Sender {
         Ok(())
     }
 
+    /// Time since the sink last carried sound, in milliseconds; `None` if
+    /// it never did.
+    pub fn silent_ms(&self) -> Option<u64> {
+        let sound = self.counters.sound_ns.load(Relaxed);
+        (sound != 0).then(|| self.clock.now_ns().saturating_sub(sound) / 1_000_000)
+    }
+
+    /// Whether audio arrived from the sink lately.
+    fn playing(&self) -> bool {
+        let fed = self.counters.fed_ns.load(Relaxed);
+        fed != 0 && self.clock.now_ns().saturating_sub(fed) < FED_NS
+    }
+
     pub fn status(&self) -> SenderStatus {
         let link = self.link.lock().unwrap();
         SenderStatus {
-            name: self.name.clone(),
+            name: self.cfg.description.clone(),
             peer: link.route.peer,
             enabled: link.route.enabled && !link.paused,
             source_port: link
@@ -285,6 +358,29 @@ impl Sender {
             realigns: self.counters.realigns.load(Relaxed),
             asrc_ppm: f64::from_bits(self.counters.asrc_ppm.load(Relaxed)),
             buffer: self.buffer.snapshot(),
+            playing: self.playing(),
+            silent_ms: self.silent_ms(),
+            hidden: false,
+        }
+    }
+}
+
+impl SenderStatus {
+    /// The status of a sender whose sink is hidden, started with `cfg`.
+    pub(crate) fn hidden(cfg: &SenderConfig, route: Route) -> Self {
+        Self {
+            name: cfg.description.clone(),
+            peer: route.peer,
+            enabled: false,
+            source_port: 0,
+            packets: 0,
+            send_errors: 0,
+            realigns: 0,
+            asrc_ppm: 0.0,
+            buffer: StatsSnapshot::default(),
+            playing: false,
+            silent_ms: None,
+            hidden: true,
         }
     }
 }
@@ -307,6 +403,7 @@ struct Tx {
     asrc: Asrc,
     buffer: Arc<PortStats>,
     counters: Arc<Counters>,
+    fade_frames: Arc<AtomicU32>,
 }
 
 impl Tx {
@@ -325,6 +422,9 @@ impl Tx {
         };
         let media = MediaClock::new(self.format.rate);
         let mut grid = Grid::new(media, ptime as u64, self.clock.now_ns());
+        // Frames sent since sending (re)started, for the fade-in.
+        let mut sent = 0u32;
+        let mut frames_in = 0;
 
         while !stop.load(Relaxed) {
             // A packet goes out once its last frame is due.
@@ -343,6 +443,13 @@ impl Tx {
             }
             let need = self.asrc.input_frames_next() * ch;
             self.port.fill(&mut input[..need]);
+            if self.buffer.frames_in() != frames_in {
+                frames_in = self.buffer.frames_in();
+                self.counters
+                    .fed_ns
+                    .store(self.clock.now_ns().max(1), Relaxed);
+            }
+            self.meter(&input[..need]);
             self.asrc.process(&input[..need], &mut samples);
             self.asrc.control(
                 self.port.level(),
@@ -354,16 +461,20 @@ impl Tx {
                 .store(self.asrc.correction_ppm().to_bits(), Relaxed);
             header.timestamp = grid.next() as u32;
             header.write((&mut packet[..HEADER_LEN]).try_into().unwrap());
-            self.encoding.encode(&samples, &mut packet[HEADER_LEN..]);
             let link = self.link.lock().unwrap();
             if link.route.enabled
                 && !link.paused
                 && let Some(socket) = &link.socket
             {
+                let length = self.fade_frames.load(Relaxed);
+                sent = fade(&mut samples, self.format.channels as usize, length, sent);
+                self.encoding.encode(&samples, &mut packet[HEADER_LEN..]);
                 match socket.send_to(&packet, link.route.peer) {
                     Ok(_) => self.counters.packets.fetch_add(1, Relaxed),
                     Err(_) => self.counters.send_errors.fetch_add(1, Relaxed),
                 };
+            } else {
+                sent = 0;
             }
             drop(link);
             header.sequence = header.sequence.wrapping_add(1);
@@ -373,6 +484,48 @@ impl Tx {
     }
 }
 
+impl Tx {
+    /// Notes whether the block carries sound.
+    fn meter(&self, block: &[f32]) {
+        if block.iter().any(|s| s.abs() > SOUND_THRESHOLD) {
+            self.counters
+                .sound_ns
+                .store(self.clock.now_ns().max(1), Relaxed);
+        }
+    }
+}
+
+/// Fades interleaved `samples` in over `length` frames, of which `sent`
+/// have gone out before; returns the frames sent with these.
+fn fade(samples: &mut [f32], channels: usize, length: u32, sent: u32) -> u32 {
+    if sent < length {
+        for (i, frame) in samples.chunks_exact_mut(channels).enumerate() {
+            let gain = ((sent + i as u32) as f32 / length as f32).min(1.0);
+            frame.iter_mut().for_each(|s| *s *= gain);
+        }
+    }
+    sent.saturating_add((samples.len() / channels) as u32)
+}
+
 fn random() -> u32 {
     getrandom::u32().unwrap_or(0x6f72_7068)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fades_in_across_packets() {
+        let mut a = [1.0f32; 8]; // 4 stereo frames
+        assert_eq!(fade(&mut a, 2, 8, 0), 4);
+        assert_eq!(a, [0.0, 0.0, 0.125, 0.125, 0.25, 0.25, 0.375, 0.375]);
+        let mut b = [1.0f32; 12];
+        assert_eq!(fade(&mut b, 2, 8, 4), 10);
+        assert_eq!(b[..2], [0.5, 0.5]);
+        assert_eq!(b[8..], [1.0; 4], "full gain once the fade is over");
+        let mut c = [1.0f32; 4];
+        fade(&mut c, 2, 0, 0);
+        assert_eq!(c, [1.0; 4], "no fade");
+    }
 }

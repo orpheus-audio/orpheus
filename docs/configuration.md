@@ -64,6 +64,11 @@ accept = "connected"
 policy = "last"
 duck_db = 20
 
+[sender]
+claim = "always"
+release_after_s = 600
+fade_in_ms = 20
+
 [ptp]
 enabled = true
 # interface = "enp3s0"
@@ -167,6 +172,17 @@ are set per output over the API, not in this file.
 Which streams go where is routing, which belongs to the API, not to this
 file: routes and connections are kept in `routes.json` in the state
 directory and restored at start.
+
+### `[sender]`
+
+When the routes this node sends hold their receiver on the peer; see
+[claiming a receiver on play](usage.md#claiming-a-receiver-on-play).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `claim` | `"always"` | `"always"`: a route holds the peer's receiver from `connect` to `disconnect`, so that short sounds such as alerts are heard in full. `"on_play"`: only while something plays into its sink; the first moments of a sound after a pause are lost. |
+| `release_after_s` | `600` | With `"on_play"`: how long a sink stays silent before the peer's receiver is let go, in seconds. |
+| `fade_in_ms` | `20` | How long sending fades in when it starts or resumes, so that sound cut in midway doesn't click: 0 to 1000. |
 
 ### `[routes]`
 

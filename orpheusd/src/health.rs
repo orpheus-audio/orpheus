@@ -22,6 +22,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::api::Node;
+use crate::connection::PeerState;
 use crate::network::{self, own_link, wireless_to};
 use crate::peer;
 
@@ -70,6 +71,9 @@ pub enum WarningKind {
     /// The receiver's stream plays nowhere: the default output is a sink
     /// to another node.
     Held,
+    /// The route wants a receiver on the peer, but the peer has no free
+    /// one.
+    PeerBusy,
 }
 
 /// What a warning is about.
@@ -422,9 +426,6 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
     };
     let mut found = vec![];
     for (id, s) in senders {
-        if !s.enabled {
-            continue;
-        }
         let warn = |kind, message| Warning {
             kind,
             on: Subject::Sender,
@@ -432,6 +433,18 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
             receiver: None,
             message,
         };
+        if links.get(&id).is_some_and(|l| l.state == PeerState::Busy) {
+            found.push(warn(
+                WarningKind::PeerBusy,
+                format!(
+                    "route {}: the peer has no free receiver; it waits for one",
+                    s.name
+                ),
+            ));
+        }
+        if !s.enabled {
+            continue;
+        }
         let dest = s.peer.ip();
         let name = &s.name;
         if dest.is_multicast() {

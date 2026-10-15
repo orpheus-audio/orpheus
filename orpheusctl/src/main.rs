@@ -644,6 +644,8 @@ struct RouteEntry {
     priority: String,
     peer: String,
     active: bool,
+    /// How a running route to a peer's receiver stands.
+    state: Option<String>,
     last_used: Option<u64>,
 }
 
@@ -790,7 +792,7 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
         .iter()
         .map(|r| {
             let state = match (r.active, r.last_used) {
-                (true, _) => p.mark(Level::Good, "connected"),
+                (true, _) => route_state(p, r.state.as_deref()),
                 (false, Some(t)) => {
                     let days = now.saturating_sub(t) / 86_400;
                     let ago = match days {
@@ -814,6 +816,19 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
     let header = ["NAME", "ID", "PEER", "PRIORITY", "STATE"];
     table(&mut o, p, header, [false; 5], &rows);
     o
+}
+
+/// How a running route stands, marked.
+fn route_state(p: Paint, state: Option<&str>) -> String {
+    match state {
+        None | Some("connected") => p.mark(Level::Good, "connected"),
+        Some("idle") => p.mark(Level::Off, "idle, claims a receiver when audio plays"),
+        Some("busy") => p.mark(Level::Warn, "waiting for a free receiver"),
+        Some("offline") => p.mark(Level::Off, "peer offline, sink hidden"),
+        Some("unreachable") => p.mark(Level::Warn, "peer unreachable"),
+        Some("disconnected") => p.mark(Level::Warn, "disconnected, paused"),
+        Some(s) => p.mark(Level::Off, s),
+    }
 }
 
 /// The device ID of the Orpheus node `query` names: by ID, alias or name.
@@ -1630,7 +1645,9 @@ fn peer_column(t: &Sender) -> String {
     let mut notes = vec![];
     match t.receiver.as_ref().map(|r| r.state.as_str()) {
         Some("disconnected") => notes.push("disconnected, paused".to_owned()),
-        Some(s @ ("unreachable" | "connecting")) => notes.push(s.to_owned()),
+        Some("busy") => notes.push("waiting for a free receiver".to_owned()),
+        Some("offline") => notes.push("peer offline, sink hidden".to_owned()),
+        Some(s @ ("unreachable" | "connecting" | "idle")) => notes.push(s.to_owned()),
         _ if !t.enabled => notes.push("off".into()),
         _ => {}
     }
@@ -1856,7 +1873,10 @@ Routes
                  "priority": "normal", "peer": "192.168.1.20:5004", "active": true},
                 {"id": "9F2D4C71", "name": "Kitchen",
                  "priority": "high", "peer": "192.168.1.20:5006", "active": false,
-                 "last_used": 1000}]"#,
+                 "last_used": 1000},
+                {"id": "M2R8D0C4", "name": "Bath",
+                 "priority": "normal", "peer": "192.168.1.21:5004", "active": true,
+                 "state": "idle"}]"#,
         )
         .unwrap();
         let out = render_routes(&routes, Paint(false), 1000 + 3 * 86_400);
@@ -1864,7 +1884,8 @@ Routes
             out,
             "  NAME     ID        PEER               PRIORITY  STATE\n  \
              Kitchen  K7QM3XRA  192.168.1.20:5004  normal    ● connected\n  \
-             Kitchen  9F2D4C71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n"
+             Kitchen  9F2D4C71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n  \
+             Bath     M2R8D0C4  192.168.1.21:5004  normal    ○ idle, claims a receiver when audio plays\n"
         );
     }
 

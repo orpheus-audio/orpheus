@@ -197,6 +197,26 @@ stays the same, as NMOS asks. Scheduled activations run on a timer; while
 one is pending, the staged parameters are locked (`423`) until it fires or is
 cancelled.
 
+Each sender meters what arrives from its sink on the TX thread: whether
+audio arrives at all (`playing`) and when it last carried sound above −60
+dBFS. With `[sender] claim = "on_play"`, a task looks at these ten times a
+second (`connection/claim.rs`): a route without a receiver claims one when
+its sink starts playing, carries sound or becomes the default output, the
+way `connect` does (pick a free receiver, point the sender at it, PATCH it,
+read it back), and an idle one lets it go after `release_after_s` of
+silence. While a route has no receiver, its sender sends nothing; when it
+resumes, it fades in over `fade_in_ms`. A route whose peer has no free
+receiver waits (`busy`) and tries every 5 seconds, also with `claim =
+"always"`, where a route without a receiver claims one at once. The peer
+watch ignores what a peer said before the last claim or release, and lets
+go of a receiver still connected to an idle route.
+
+A route whose peer has been unreachable for a minute, and isn't pinned,
+loses its sink (`offline`): the engine drops the sender and keeps its
+configuration, route and sink volume, and starts it again when the peer
+answers, so that applications play elsewhere meanwhile and find the same
+sink afterwards.
+
 `routes.json` in the state directory keeps, for each running route, its
 ID, name, last destination, the peer's output type and receiver; the
 disconnected routes remembered; and for each port the parameters last

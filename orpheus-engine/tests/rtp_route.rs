@@ -80,6 +80,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 remote: OutputType::Generic,
                 block_frames: Some(QUANTUM as u32),
                 volume: None,
+                fade_in_ms: 0,
             },
         )
         .unwrap();
@@ -219,6 +220,7 @@ fn routes_and_filters_change_at_runtime() {
                 remote: OutputType::Generic,
                 block_frames: Some(QUANTUM as u32),
                 volume: None,
+                fade_in_ms: 0,
             },
         )
         .unwrap();
@@ -317,6 +319,7 @@ fn gain_mutes_and_the_meter_hears_through_it() {
                 remote: OutputType::Generic,
                 block_frames: Some(QUANTUM as u32),
                 volume: None,
+                fade_in_ms: 0,
             },
         )
         .unwrap();

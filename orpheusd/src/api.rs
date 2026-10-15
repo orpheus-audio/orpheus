@@ -279,6 +279,9 @@ pub struct RouteEntry {
     /// Whether it runs; otherwise it is remembered from before and comes
     /// back when connecting the same peer with the same priority.
     active: bool,
+    /// For a running route to a peer's receiver: how that stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<crate::connection::PeerState>,
     /// When a remembered route last ran, in seconds since the Unix epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<u64>,
@@ -492,6 +495,7 @@ fn routes_of(node: &Node) -> Vec<RouteEntry> {
         .map(|e| e.lock().unwrap().status().senders)
         .unwrap_or_default();
     let conns = node.connections.lock().unwrap();
+    let links = conns.peer_links();
     let active = engine.into_iter().map(|(id, s)| RouteEntry {
         id,
         name: s.name,
@@ -499,6 +503,7 @@ fn routes_of(node: &Node) -> Vec<RouteEntry> {
         peer: s.peer,
         node: conns.sender_node(id),
         active: true,
+        state: links.get(&id).map(|l| l.state),
         last_used: None,
     });
     let cached = conns.cached().iter().map(|c| RouteEntry {
@@ -508,6 +513,7 @@ fn routes_of(node: &Node) -> Vec<RouteEntry> {
         peer: c.peer,
         node: c.node.clone(),
         active: false,
+        state: None,
         last_used: Some(c.used),
     });
     active.chain(cached).collect()
@@ -758,8 +764,8 @@ impl SettingsView {
     }
 }
 
-/// The settings that can change while the node runs: the clock and the
-/// receivers. Each comes from the default, config.toml, or a change over
+/// The settings that can change while the node runs: the clock, the
+/// receivers and the senders. Each comes from the default, config.toml, or a change over
 /// the API, which wins.
 #[utoipa::path(
     get,
@@ -811,6 +817,14 @@ async fn change_settings(
         let r = (&old.receiver, &new.receiver);
         if r.0.accept != r.1.accept || r.0.link_offset_ms != r.1.link_offset_ms {
             crate::connection::reapply_receivers(&node);
+        }
+        if old.sender.fade_in_ms != new.sender.fade_in_ms
+            && let Some(engine) = &node.engine
+        {
+            engine
+                .lock()
+                .unwrap()
+                .set_sender_fade_in(new.sender.fade_in_ms);
         }
         tracing::info!(%patch, "settings changed");
         Ok(Json(view))

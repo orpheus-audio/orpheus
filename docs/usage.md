@@ -17,9 +17,9 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `status` | Shows the node's ID, name, version, clock, receivers and routes. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
 | `nodes` | Lists the other nodes the node found on the network, with ID, address, version and link (`wired` or `Wi-Fi`, as each node announces it). Nodes that stopped stay listed as offline. A node with an [alias](#aliases-and-pins) is shown as `Alias (Name)`. |
-| `connect PEER [--name NAME] [--priority high] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a route: a sink called `NAME` (the route's name from before, else the peer's name), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. `--priority high` plays over the peer's other streams (see [several streams](#several-streams)). The route is kept across restarts. |
+| `connect PEER [--name NAME] [--priority high] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a route: a sink called `NAME` (the route's name from before, else the peer's name), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. `--priority high` plays over the peer's other streams (see [several streams](#several-streams)). The route is kept across restarts. By default it holds the peer's receiver all the time; it can also [claim it only while audio plays](#claiming-a-receiver-on-play). |
 | `connect PEER --send-only [--name NAME]` | Only sends; the peer's receiver is left alone. For devices without NMOS, and receivers set to accept any stream. |
-| `routes` | Lists the routes: the ones that run and the ones [remembered](#routes) from before. |
+| `routes` | Lists the routes: the ones that run, with how they stand (`connected`, `idle`, `waiting for a free receiver`, `peer offline`, …), and the ones [remembered](#routes) from before. |
 | `disconnect ROUTE` | Stops a route, removes its sink and disconnects the peer's receiver. The route is remembered. `ROUTE` is its name, or its ID or the start of it, as `routes` shows. |
 | `forget ROUTE` | Forgets a route, so that the next `connect` starts a new one; a route that runs is disconnected first. |
 | `alias NODE ALIAS` | Gives another node a name of your own, shown instead of the one it announces (see [aliases and pins](#aliases-and-pins)). `alias NODE --remove` removes it. |
@@ -88,16 +88,22 @@ arrive within a few seconds:
 - The sender follows the peer by its node ID: when the peer's address
   changes, the sender sends to the new one and tells the receiver its new
   source. When this node's own address changes, it tells the receiver too.
-- If someone else connects the receiver, the sender pauses and `status`
-  shows it as `disconnected, paused`. As soon as the peer has a free
-  receiver again, the sender takes it and resumes. It also resumes when its
-  old receiver is connected to it again, for example over IS-05;
-  `disconnect` removes it.
+- If another sender takes the receiver, the sender pauses and `status`
+  shows it as `waiting for a free receiver`. Every 5 seconds it looks for a
+  free receiver of the peer, and takes the first one to resume. It also
+  resumes when its old receiver is connected to it again, for example over
+  IS-05; `disconnect` removes it.
 - If a controller disconnects the receiver without connecting another
-  sender, that was meant: the sender stays paused until it is connected
-  again or removed.
+  sender, that was meant: the sender stays paused (`disconnected, paused`)
+  until it is connected again or removed. A route that [claims on
+  play](#claiming-a-receiver-on-play) goes `idle` instead, and claims a
+  receiver again the next time audio plays.
 - While the peer is offline or doesn't answer, `status` shows the sender as
   `unreachable`. It keeps sending, so the audio is back when the peer is.
+  After a minute, unless the peer is [pinned](#aliases-and-pins), the sink
+  goes (`peer offline, sink hidden`), so that applications play on another
+  output meanwhile. It comes back with the peer, under the same name; if
+  it was the default output, it is the default again.
 - When the peer's [policy](#several-streams) mutes or ducks the stream,
   `status` shows `muted by policy` or `ducked`. The sender keeps sending,
   so the peer can bring the stream back at once.
@@ -146,6 +152,33 @@ Routes are kept in `routes.json` in the [state
 directory](configuration.md#files); `orpheusd` starts the ones that ran
 again when it starts. How long disconnected routes are remembered is set
 in [`[routes]`](configuration.md#routes).
+
+### Claiming a receiver on play
+
+By default a route holds its receiver on the peer from `connect` to
+`disconnect`, also while nothing plays, so that short sounds such as
+alerts are heard in full. With [`[sender] claim =
+"on_play"`](configuration.md#sender), it holds one only while something
+plays into its sink, and the peer's receivers are free for other nodes
+the rest of the time:
+
+- When an application starts playing into the sink, sound arrives, or the
+  sink becomes the default output, the route claims a free receiver of the
+  peer and starts sending. That takes a few milliseconds plus the
+  receiver's start, so the first moments of a sound after a pause are
+  lost. Sending fades in over `fade_in_ms`, so that sound cut in midway
+  doesn't click.
+- After `release_after_s` (10 minutes) without sound, the route lets the
+  receiver go, and `routes` and `status` show it as `idle`. The sink stays.
+  An application that keeps its stream open but plays only silence does
+  not claim the receiver again.
+- If the peer has no free receiver when audio starts, the route waits
+  (`waiting for a free receiver`, and the warning `peer_busy`) and tries
+  again every 5 seconds while audio plays.
+
+Whichever receiver it gets, the peer plays the stream where it played
+before and as loud, since it remembers both per
+[source](#outputs-and-volume).
 
 ## Several streams
 
@@ -369,11 +402,19 @@ the sender's state:
 
 - `(off)`: a connection paused the sender. Its sink still takes audio, but
   nothing is sent.
-- `(disconnected, paused)`: someone else connected the peer's receiver, so
-  nothing is sent until the peer has a free receiver again (see
+- `(disconnected, paused)`: a controller disconnected the peer's receiver,
+  so nothing is sent until it is connected again (see
   [connecting](#connecting)).
+- `(waiting for a free receiver)`: another sender took the peer's
+  receiver, or all were taken when audio started; nothing is sent until
+  the peer has a free one.
+- `(idle)`: the route [claims a receiver on
+  play](#claiming-a-receiver-on-play) and nothing has played for a while;
+  nothing is sent until audio plays.
 - `(unreachable)`: the peer is offline or doesn't answer. The sender keeps
   sending.
+- `(peer offline, sink hidden)`: the peer has been unreachable for a
+  minute; the sink is gone until the peer is back.
 - `(connecting)`: `connect` is still setting up the peer's receiver.
 - `(muted by policy)`, `(ducked)`: the peer's [policy](#several-streams)
   holds the stream back. The sender keeps sending.
@@ -399,7 +440,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | Method and path | Effect |
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows); see [below](#the-status-json). |
-| `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, and for remembered ones `last_used` (Unix seconds). |
+| `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, for running routes to a peer's receiver `state` (as in [the status JSON](#the-status-json)), and for remembered ones `last_used` (Unix seconds). |
 | `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
 | `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
@@ -446,8 +487,14 @@ The same OpenAPI document is printed by `orpheusd --openapi`.
   is there while the receiver runs; `state` is what the
   [policy](#several-streams) does to it: `silent`, `playing`, `muted` or
   `ducked`.
-- `routes`: the routes that run. `routes[].receiver`: the peer's receiver, absent with `send_only`.
-  `state` is `connecting`, `connected`, `disconnected` or `unreachable`;
+- `routes`: the routes that run. `playing` says whether applications play
+  into the sink, `silent_ms` how long ago it last carried sound, and
+  `hidden` whether the sink is gone while the peer is offline.
+  `routes[].receiver`: the peer's receiver, absent with `send_only`.
+  `state` is `connecting`, `connected`, `disconnected`, `unreachable`,
+  `idle` (let go after silence, see [claiming on
+  play](#claiming-a-receiver-on-play)), `busy` (waiting for a free
+  receiver) or `offline` (the sink hidden);
   `policy` is `muted` or `ducked` while the peer holds the stream back.
 - `warnings`: a list of `{kind, on, sender, message}`, see
   [warnings](#warnings).
@@ -475,6 +522,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. |
 | `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. |
 | `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
+| `peer_busy` | sender | The route wants a receiver on the peer, but all of the peer's receivers play other senders; it tries again every 5 seconds. Raise `[receiver] max` on the peer, or let other routes [claim on play](#claiming-a-receiver-on-play). |
 
 Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
 the stream or PTP takes. Each node also announces its own link, that of its

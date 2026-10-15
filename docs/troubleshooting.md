@@ -119,9 +119,14 @@ affected.
      quiet for 5 seconds; set `[receiver] policy = "mix"` to hear all.
    - no receiver at all: they are disabled in `[receiver]`.
 
-   On the sending node, a sender shown as `(disconnected, paused)` or
-   `(off)` sends nothing; see [reading the
-   status](usage.md#reading-the-status).
+   On the sending node, a sender shown as `(disconnected, paused)`,
+   `(waiting for a free receiver)`, `(idle)` or `(off)` sends nothing; see
+   [reading the status](usage.md#reading-the-status). `idle` is a route
+   that [claims on play](usage.md#claiming-a-receiver-on-play) while
+   nothing plays into its sink; `waiting for a free receiver` means all of
+   the peer's receivers play other senders. If the sink is missing
+   altogether, `routes` shows `peer offline`: the peer has not answered for
+   a minute.
 2. If packets arrive but count as `late` or `early`, the clocks disagree. See
    the next section.
 3. Check that the sender's sink actually gets audio: the application must play

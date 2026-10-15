@@ -46,9 +46,17 @@ pub struct EngineStatus {
     pub receivers: Vec<(ReceiverId, ReceiverStatus)>,
 }
 
+/// A sender whose sink is gone for now: what it needs to start again.
+struct Hidden {
+    cfg: SenderConfig,
+    route: Route,
+    paused: bool,
+}
+
 pub struct Engine {
     // Routes go before the backend they live in.
     senders: BTreeMap<SenderId, Sender>,
+    hidden: BTreeMap<SenderId, Hidden>,
     receivers: BTreeMap<ReceiverId, Receiver>,
     loopback: Option<Loopback>,
     clock: Arc<dyn Clock>,
@@ -59,6 +67,7 @@ impl Engine {
     pub fn new(backend: Box<dyn AudioBackend>, clock: Arc<dyn Clock>) -> Self {
         Self {
             senders: BTreeMap::new(),
+            hidden: BTreeMap::new(),
             receivers: BTreeMap::new(),
             loopback: None,
             clock,
@@ -130,6 +139,7 @@ impl Engine {
     /// Starts a sender, replacing one with the same ID.
     pub fn insert_sender(&mut self, id: SenderId, cfg: &SenderConfig) -> Result<(), BackendError> {
         self.senders.remove(&id);
+        self.hidden.remove(&id);
         let sender = Sender::start(self.backend.as_mut(), self.clock.clone(), cfg)?;
         self.senders.insert(id, sender);
         Ok(())
@@ -137,9 +147,64 @@ impl Engine {
 
     /// Redirects a sender; `Ok(false)` if there is no such sender.
     pub fn set_sender_route(&mut self, id: SenderId, route: Route) -> std::io::Result<bool> {
+        if let Some(h) = self.hidden.get_mut(&id) {
+            h.route = route;
+            return Ok(true);
+        }
         match self.senders.get(&id) {
             Some(s) => s.set_route(route).map(|()| true),
             None => Ok(false),
+        }
+    }
+
+    /// Removes a sender's sink until [`show_sender`](Self::show_sender),
+    /// keeping its name, route and volume; nothing is sent meanwhile.
+    /// Returns whether the sender runs.
+    pub fn hide_sender(&mut self, id: SenderId) -> bool {
+        let Some(sender) = self.senders.remove(&id) else {
+            return self.hidden.contains_key(&id);
+        };
+        let hidden = Hidden {
+            cfg: sender.config(),
+            route: sender.route(),
+            paused: sender.paused(),
+        };
+        drop(sender);
+        self.hidden.insert(id, hidden);
+        true
+    }
+
+    /// Brings a hidden sender's sink back; `Ok(false)` if it isn't hidden.
+    pub fn show_sender(&mut self, id: SenderId) -> Result<bool, BackendError> {
+        let Some(h) = self.hidden.remove(&id) else {
+            return Ok(false);
+        };
+        let sender = match Sender::start(self.backend.as_mut(), self.clock.clone(), &h.cfg) {
+            Ok(s) => s,
+            Err(e) => {
+                self.hidden.insert(id, h);
+                return Err(e);
+            }
+        };
+        sender.pause(h.paused);
+        let routed = sender.set_route(h.route);
+        self.senders.insert(id, sender);
+        routed.map(|()| true).map_err(Into::into)
+    }
+
+    /// Whether sender `id`'s sink is hidden.
+    pub fn sender_hidden(&self, id: SenderId) -> bool {
+        self.hidden.contains_key(&id)
+    }
+
+    /// Changes how long the senders fade in, for those that run and those
+    /// started later with it.
+    pub fn set_sender_fade_in(&mut self, ms: u32) {
+        for s in self.senders.values() {
+            s.set_fade_in(ms);
+        }
+        for h in self.hidden.values_mut() {
+            h.cfg.fade_in_ms = ms;
         }
     }
 
@@ -251,42 +316,67 @@ impl Engine {
     /// Changes the kind of output a sender's sink shows; returns whether
     /// the sender exists.
     pub fn set_sender_remote(&mut self, id: SenderId, remote: OutputType) -> bool {
+        if let Some(h) = self.hidden.get_mut(&id) {
+            h.cfg.remote = remote;
+            return true;
+        }
         self.senders
-            .get(&id)
+            .get_mut(&id)
             .map(|s| s.set_remote(remote))
             .is_some()
     }
 
     /// The volume of a sender's sink, once the audio system has said.
     pub fn sender_volume(&self, id: SenderId) -> Option<Volume> {
+        if let Some(h) = self.hidden.get(&id) {
+            return h.cfg.volume.clone();
+        }
         self.senders.get(&id)?.sink().volume()
     }
 
     /// Shows a sender's sink under another name; returns whether the
     /// sender exists.
     pub fn rename_sender(&mut self, id: SenderId, name: &str) -> bool {
+        if let Some(h) = self.hidden.get_mut(&id) {
+            h.cfg.description = name.to_owned();
+            return true;
+        }
         self.senders.get_mut(&id).map(|s| s.rename(name)).is_some()
     }
 
     /// Holds a sender's packets back, or lets them go again, whatever its
     /// route says; returns whether the sender exists.
     pub fn pause_sender(&mut self, id: SenderId, paused: bool) -> bool {
+        if let Some(h) = self.hidden.get_mut(&id) {
+            h.paused = paused;
+            return true;
+        }
         self.senders.get(&id).map(|s| s.pause(paused)).is_some()
     }
 
     /// Stops a sender; returns whether it existed.
     pub fn remove_sender(&mut self, id: SenderId) -> bool {
-        self.senders.remove(&id).is_some()
+        let hidden = self.hidden.remove(&id).is_some();
+        self.senders.remove(&id).is_some() || hidden
     }
 
     pub fn status(&self) -> EngineStatus {
         EngineStatus {
             loopback: self.loopback.as_ref().map(|l| l.stats.snapshot()),
-            senders: self
-                .senders
-                .iter()
-                .map(|(id, s)| (*id, s.status()))
-                .collect(),
+            senders: {
+                let mut senders: Vec<_> = self
+                    .senders
+                    .iter()
+                    .map(|(id, s)| (*id, s.status()))
+                    .chain(
+                        self.hidden
+                            .iter()
+                            .map(|(id, h)| (*id, SenderStatus::hidden(&h.cfg, h.route))),
+                    )
+                    .collect();
+                senders.sort_by_key(|(id, _)| *id);
+                senders
+            },
             receivers: self
                 .receivers
                 .iter()

@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
 
-use crate::config::{Accept, Config, Policy};
+use crate::config::{Accept, Claim, Config, Policy};
 
 /// The settings in effect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -25,6 +25,7 @@ use crate::config::{Accept, Config, Policy};
 pub struct Settings {
     pub ptp: PtpSettings,
     pub receiver: ReceiverSettings,
+    pub sender: SenderSettings,
 }
 
 /// Clock synchronization. A change restarts PTP; the clock keeps running.
@@ -65,6 +66,23 @@ pub struct ReceiverSettings {
     /// audio system's default output.
     pub default_output: Option<String>,
 }
+
+/// The routes this node sends.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SenderSettings {
+    /// When a route holds its receiver on the peer: `always`, or
+    /// `on_play`, only while something plays into its sink.
+    pub claim: Claim,
+    /// With `on_play`: how long a sink stays silent before the peer's
+    /// receiver is let go.
+    pub release_after_s: u32,
+    /// How long sending fades in when it starts.
+    pub fade_in_ms: u32,
+}
+
+/// The longest fade-in.
+const MAX_FADE_IN_MS: u32 = 1000;
 
 /// The clock's configuration for these settings.
 pub fn ptp_config(p: &PtpSettings) -> PtpConfig {
@@ -118,6 +136,11 @@ impl Settings {
                 link_offset_ms: r.link_offset_ms,
                 default_output: r.default_output.clone(),
             },
+            sender: SenderSettings {
+                claim: config.sender.claim,
+                release_after_s: config.sender.release_after_s,
+                fade_in_ms: config.sender.fade_in_ms,
+            },
         }
     }
 
@@ -140,6 +163,12 @@ impl Settings {
             return Err(format!(
                 "[receiver] link_offset_ms must be 1 to {MAX_LINK_OFFSET_MS}"
             ));
+        }
+        if self.sender.release_after_s == 0 {
+            return Err("[sender] release_after_s must be above 0".into());
+        }
+        if self.sender.fade_in_ms > MAX_FADE_IN_MS {
+            return Err(format!("[sender] fade_in_ms must be 0 to {MAX_FADE_IN_MS}"));
         }
         Ok(())
     }
@@ -363,6 +392,8 @@ mod tests {
             s.patch(&json!({"receiver": {"link_offset_ms": 0}}))
                 .is_err()
         );
+        assert!(s.patch(&json!({"sender": {"release_after_s": 0}})).is_err());
+        assert!(s.patch(&json!({"sender": {"claim": "never"}})).is_err());
         assert!(s.patch(&json!([])).is_err());
     }
 

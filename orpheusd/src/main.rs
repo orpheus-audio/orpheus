@@ -123,6 +123,7 @@ async fn main() -> Result<()> {
     let mixer = tokio::spawn(policy::run(node.clone()));
     let events = tokio::spawn(events::watch(node.clone()));
     let streams = tokio::spawn(sources::run(node.clone()));
+    let claims = tokio::spawn(connection::claim_on_play(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -135,11 +136,13 @@ async fn main() -> Result<()> {
     events.abort();
     mixer.abort();
     streams.abort();
+    claims.abort();
     let _ = refresh.await;
     let _ = peers.await;
     let _ = health.await;
     let _ = mixer.await;
     let _ = streams.await;
+    let _ = claims.await;
     drop(node);
     tracing::info!("stopped");
     Ok(())
