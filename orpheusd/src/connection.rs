@@ -1610,7 +1610,6 @@ fn balance(node: &Node, conns: &mut Connections, engine: &mut Engine) {
             conns.receivers.remove(&id);
             conns.free_since.remove(&id);
             engine.remove_receiver(id);
-            node.mapping.lock().unwrap().forget(id);
             tracing::debug!(id, "free receiver removed");
         }
     }
@@ -1734,7 +1733,6 @@ fn apply_receiver(
                     link_offset_ms: settings.link_offset_ms,
                     block_frames: node.block_frames,
                     gain: 1.0,
-                    map: node.mapping.lock().unwrap().map(id),
                     key,
                     placement: placement.clone(),
                     volume: remembered.and_then(|s| s.volume),

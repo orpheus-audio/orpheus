@@ -89,19 +89,11 @@ python3 nmos-test.py suite IS-05-01 --host 10.99.0.2 --port 7480 \
   --version v1.1 --output is-05-01.json
 python3 nmos-test.py suite IS-05-02 --host 10.99.0.2 10.99.0.2 \
   --port 7480 7480 --version v1.3 v1.1 --output is-05-02.json
-python3 nmos-test.py suite IS-08-01 --host 10.99.0.2 --port 7480 \
-  --version v1.0 --selector null --output is-08-01.json
-python3 nmos-test.py suite IS-08-02 --host 10.99.0.2 10.99.0.2 \
-  --port 7480 7480 --version v1.3 v1.0 --selector null null \
-  --output is-08-02.json
 ```
 
 On first start the tool clones the NMOS specifications from GitHub, so a
-namespace without internet needs one run outside first. IS-05-01,
-IS-05-02 and IS-08-02 pass completely, and so does IS-08-01, except two
-tests for input constraints Orpheus doesn't have (re-ordering, blocks).
-IS-08-01 tests routing constraints only with two receivers; connect a
-route from the node to itself first. With IS-04-01 all Node API tests pass; the
+namespace without internet needs one run outside first. IS-05-01
+and IS-05-02 pass completely. With IS-04-01 all Node API tests pass; the
 registration tests fail, as expected, because nodes don't register with a
 registry. The tool decodes TXT records as ASCII, which
 is why the name is not in the TXT record.

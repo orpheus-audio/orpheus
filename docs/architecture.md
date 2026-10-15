@@ -40,7 +40,7 @@ Linux.
 |---|---|
 | `orpheus-core` | Platform-independent types shared by all nodes, including the planned ESP32 firmware: device ID, audio format, channel layouts, RTP packets, jitter buffer, media-clock arithmetic. |
 | `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of statime. |
-| `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their channel maps, level meters and gains, ASRC, the `AudioBackend` trait. |
+| `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their level meters and gains, ASRC, the `AudioBackend` trait. |
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
 | `orpheusd` | The node daemon: config, home directory, HTTP API, NMOS APIs, connecting to other nodes. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
@@ -77,9 +77,7 @@ media-clock time of its first frame.
 by RTP timestamp. Out-of-order, duplicate and late packets are handled there;
 missing audio becomes silence. On the media-clock grid, the thread takes out
 the audio whose timestamp is the current time minus the link offset,
-passes it through a channel map, which picks the stream's channel for each
-output channel (swapped, one on both sides, muted) and crossfades over 30 ms
-when it changes, a level meter, and a gain, which fades over 30 ms to the
+passes it through a level meter and a gain, which fades over 30 ms to the
 volume the [policy](#receiver-pool-and-policy) sets, resamples it
 to the sound card's clock and hands it to the receiver's own playback
 stream through a port. PipeWire mixes the playback streams.
@@ -113,7 +111,7 @@ time instead of catching up ("realign").
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
 | `orpheus-ptp` | PTP: sockets, timers, statime; restarts the port when its interface changes or the settings do, and retries while it can't start |
 | TX, one per sender | Pacing, ASRC, RTP send |
-| RX, one per running receiver | RTP receive, jitter buffer, channel map, level meter and gain, ASRC |
+| RX, one per running receiver | RTP receive, jitter buffer, level meter and gain, ASRC |
 | mDNS | mdns-sd's daemon, plus `mdns-monitor` (renames on name conflicts) and `mdns-browse` (the node list) |
 
 The TX, RX and PTP threads run at normal priority for now.
@@ -170,14 +168,10 @@ depth. Before `connect` takes a peer's receiver, it checks the receiver's
 constraint sets against the stream; constraints on other parameters are
 ignored, receivers without constraint sets are judged by `media_types`.
 
-The IS-08 Channel Mapping API (`mapping.rs`) gives each receiver one
-input and one output, whose map is the receiver's channel map. The maps
-are kept per receiver, also while it plays nothing, and given to the
-engine whenever the receiver runs. An input's parent is its receiver, not
-the sender's source, which the node's own IS-04 API doesn't list. Every
-activation gives the device a new IS-04 version. This model is
-provisional: M7 replaces the per-receiver maps with a patchbay across all
-receivers and outputs.
+There is no IS-08 Channel Mapping API: [wires](usage.md#wires) route
+channels, across all sources, inputs and outputs. IS-08 maps each output
+channel to one input channel and so can't show channels summed where
+wires meet; a view that hid them would mislead a controller.
 
 Each sender's `manifest_href` points to its SDP file. Its session version
 follows the sender's and the node's resource versions, so it changes when the

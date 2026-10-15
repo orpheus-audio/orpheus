@@ -6,7 +6,6 @@ mod connection;
 mod events;
 mod health;
 mod home;
-mod mapping;
 mod network;
 mod nmos;
 mod outputs;
@@ -116,7 +115,6 @@ async fn main() -> Result<()> {
             config.sources,
         )),
         events: events::Events::default(),
-        mapping: Mutex::default(),
         wires: Mutex::new(wires::Wires::load(home.state_dir().join("wires.json"))),
     });
     outputs::restore(&node);

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::rtp::Encoding;
-use orpheus_core::{AudioFormat, ChannelMap, Layout, OutputType};
+use orpheus_core::{AudioFormat, Layout, OutputType};
 use orpheus_engine::*;
 
 #[derive(Default, Clone)]
@@ -62,7 +62,6 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 link_offset_ms: LINK_OFFSET_MS,
                 block_frames: Some(QUANTUM as u32),
                 gain: 1.0,
-                map: ChannelMap::identity(format.channels as usize),
                 key: None,
                 placement: Placement::Default,
                 volume: None,
@@ -203,7 +202,6 @@ fn routes_and_filters_change_at_runtime() {
                 link_offset_ms: LINK_OFFSET_MS,
                 block_frames: Some(QUANTUM as u32),
                 gain: 1.0,
-                map: ChannelMap::identity(AudioFormat::AES67.channels as usize),
                 key: None,
                 placement: Placement::Default,
                 volume: None,
@@ -304,7 +302,6 @@ fn gain_mutes_and_the_meter_hears_through_it() {
                     link_offset_ms: LINK_OFFSET_MS,
                     block_frames: Some(QUANTUM as u32),
                     gain,
-                    map: ChannelMap::identity(format.channels as usize),
                     key: None,
                     placement: Placement::Default,
                     volume: None,
@@ -365,99 +362,4 @@ fn gain_mutes_and_the_meter_hears_through_it() {
     assert!((unmuted - 0.5).abs() < 0.05, "unmuted output {unmuted}");
     assert_eq!(engine.status().receivers[0].1.gain, 1.0);
     assert!(!engine.set_receiver_gain(2, 1.0));
-}
-
-/// A stream with sound on the left only: the channel map moves it to the
-/// right, plays it on both sides, or mutes it.
-#[test]
-fn channel_map_picks_the_channels() {
-    let format = AudioFormat::AES67;
-    let fake = FakeBackend::default();
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::new());
-    let mut engine = Engine::new(Box::new(fake.clone()), clock);
-    engine
-        .start_receiver(
-            0,
-            &ReceiverConfig {
-                name: "rx".into(),
-                description: "rx".into(),
-                format,
-                layout: Layout::default_for(2),
-                encoding: Encoding::L24,
-                listen: "127.0.0.1:0".parse().unwrap(),
-                link_offset_ms: LINK_OFFSET_MS,
-                block_frames: Some(QUANTUM as u32),
-                gain: 1.0,
-                map: ChannelMap::identity(format.channels as usize),
-                key: None,
-                placement: Placement::Default,
-                volume: None,
-            },
-        )
-        .unwrap();
-    let listen = engine.status().receivers[0].1.listen;
-    engine
-        .insert_sender(
-            SenderId::from_bits(1),
-            &SenderConfig {
-                name: "tx".into(),
-                description: "tx".into(),
-                format,
-                encoding: Encoding::L24,
-                peer: listen,
-                remote: OutputType::Generic,
-                block_frames: Some(QUANTUM as u32),
-                volume: None,
-                fade_in_ms: 0,
-            },
-        )
-        .unwrap();
-    let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
-    let mut playback = fake.playbacks.lock().unwrap().remove(0);
-
-    // Plays a 1 kHz sine at -6 dBFS on the left for `cycles` and returns
-    // the last cycle's peak output per channel.
-    let mut cycle = 0;
-    let mut run = |cycles: usize| {
-        let mut out = vec![0.0f32; QUANTUM * 2];
-        let start = Instant::now();
-        for n in 0..cycles {
-            let input: Vec<f32> = (0..QUANTUM)
-                .map(|i| (cycle * QUANTUM + i) as f32 * std::f32::consts::TAU / 48.0)
-                .flat_map(|phase| [0.5 * phase.sin(), 0.0])
-                .collect();
-            cycle += 1;
-            sink.push(&input);
-            playback.fill(&mut out);
-            let due = start + Duration::from_millis(5 * (n as u64 + 1));
-            thread::sleep(due.saturating_duration_since(Instant::now()));
-        }
-        let peak = |ch: usize| {
-            out.iter()
-                .skip(ch)
-                .step_by(2)
-                .fold(0.0f32, |p, s| p.max(s.abs()))
-        };
-        (peak(0), peak(1))
-    };
-    let near = |got: (f32, f32), want: (f32, f32)| {
-        assert!(
-            (got.0 - want.0).abs() < 0.05 && (got.1 - want.1).abs() < 0.05,
-            "got {got:?}, want {want:?}"
-        );
-    };
-
-    near(run(300), (0.5, 0.0));
-    for (map, want) in [
-        ([Some(1), Some(0)], (0.0, 0.5)),
-        ([Some(0), Some(0)], (0.5, 0.5)),
-        ([None, Some(1)], (0.0, 0.0)),
-    ] {
-        let map = ChannelMap::new(&map).unwrap();
-        assert!(engine.set_receiver_map(0, map));
-        near(run(100), want);
-        assert_eq!(engine.status().receivers[0].1.map, map);
-    }
-    assert!(!engine.set_receiver_map(0, ChannelMap::identity(1)));
-    assert!(!engine.set_receiver_map(1, ChannelMap::identity(2)));
 }
