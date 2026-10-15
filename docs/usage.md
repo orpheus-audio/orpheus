@@ -411,7 +411,8 @@ streams](#several-streams)):
 
 **Senders** have the same buffer columns, and `send errors` among their
 problems: packets the operating system could not send, for example because
-there is no route to the peer. After the peer, the `PEER` column may show
+there is no route to the peer, or because the link stalled and its send
+queue was full (Wi-Fi). After the peer, the `PEER` column may show
 the sender's state:
 
 - `(off)`: a connection paused the sender. Its sink still takes audio, but

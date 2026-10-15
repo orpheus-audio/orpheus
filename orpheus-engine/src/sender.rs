@@ -136,9 +136,13 @@ impl Link {
 }
 
 /// A socket sending from `source`, multicast through the interface of
-/// `source` if it names one.
+/// `source` if it names one. It doesn't block: when the link stalls (Wi-Fi)
+/// and the send queue is full, a packet is dropped and counted as a send
+/// error instead of stalling the TX thread, which would fall behind the
+/// media clock and hold the link lock meanwhile.
 fn bind(source: SocketAddr) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(source)?;
+    socket.set_nonblocking(true)?;
     match source.ip() {
         IpAddr::V4(ip) => {
             socket.set_multicast_ttl_v4(MULTICAST_TTL)?;
