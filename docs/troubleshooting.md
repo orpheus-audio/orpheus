@@ -94,8 +94,12 @@ affected.
   paused`, it takes the next free receiver of the peer by itself.
 - `409 other senders took …'s free receivers meanwhile`: other nodes
   connected at the same moment; try again.
-- `502 … no answer`: the peer's API is unreachable: wrong name or address,
-  the node is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
+- `422 resolving …`: no node of that name was discovered, and the name is
+  not a host name either. `orpheusctl nodes` lists the names known.
+- `422 … has no receiver for L24/48000/2`: none of the peer's receivers can
+  play the stream.
+- `502 … no answer`: the peer's API is unreachable: wrong address, the node
+  is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
   whether the node was discovered and under which address.
 - `502 … refused`: the peer's receiver rejected the connection; the message
   says why.

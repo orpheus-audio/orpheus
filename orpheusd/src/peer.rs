@@ -94,6 +94,7 @@ fn unreachable(api: &str, e: ureq::Error) -> Fail {
 /// (its API on port 7480), or by the URL of its API.
 pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
     let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let unknown = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
     if let Some(rest) = peer
         .strip_prefix("http://")
         .or_else(|| peer.strip_prefix("https://"))
@@ -105,7 +106,7 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
         return Ok(Peer {
             node: announced_at(node, &api),
             api,
-            ip: lookup(host).map_err(bad)?,
+            ip: lookup(host).map_err(unknown)?,
             name: None,
         });
     }
@@ -135,7 +136,7 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
         });
     if let Some(k) = found {
         let (ip, api) =
-            address(&k.node).ok_or_else(|| bad(format!("{} has no usable address", k.shown())))?;
+            address(&k.node).ok_or_else(|| gateway(k.shown(), "announces no usable address"))?;
         return Ok(Peer {
             api,
             ip,
@@ -151,7 +152,7 @@ pub fn resolve(node: &Node, peer: &str) -> Result<Peer, Fail> {
             "{peer}: the peer's receiver chooses the port; give one only to send without connecting it"
         )));
     }
-    let ip = lookup(host).map_err(bad)?;
+    let ip = lookup(host).map_err(unknown)?;
     let api = api_at(ip);
     Ok(Peer {
         node: announced_at(node, &api),
@@ -249,7 +250,7 @@ pub fn find_receiver(peer: &Peer, ours: &[Uuid], force: bool) -> Result<Target, 
     let name = peer.name.as_deref().unwrap_or(&peer.api);
     if fitting.is_empty() {
         return Err((
-            StatusCode::CONFLICT,
+            StatusCode::UNPROCESSABLE_ENTITY,
             format!("{name} has no receiver for L24/48000/2 over RTP"),
         ));
     }

@@ -89,7 +89,11 @@ pub fn refresh(node: &Node) -> Snapshot {
 
 /// An NMOS error response.
 pub fn error(code: StatusCode, msg: String) -> Response {
-    let body = serde_json::json!({ "code": code.as_u16(), "error": msg, "debug": null });
+    let body = crate::api::ErrorBody {
+        code: code.as_u16(),
+        error: msg,
+        debug: None,
+    };
     (code, Json(body)).into_response()
 }
 

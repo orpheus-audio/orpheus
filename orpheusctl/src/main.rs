@@ -913,7 +913,8 @@ fn reply(mut r: ureq::http::Response<ureq::Body>) -> Result<String> {
     if r.status().is_success() {
         return Ok(text);
     }
-    // Orpheus answers in plain text, NMOS in JSON with an "error" field.
+    // Nodes answer errors in JSON with an "error" field; anything else in
+    // between, such as a proxy, may answer in plain text.
     let message = serde_json::from_str::<serde_json::Value>(&text)
         .ok()
         .and_then(|v| v.get("error")?.as_str().map(str::to_owned))

@@ -444,21 +444,38 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows); see [below](#the-status-json). |
 | `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, for running routes to a peer's receiver `state` (as in [the status JSON](#the-status-json)), and for remembered ones `last_used` (Unix seconds). |
-| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
+| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `422` if there is no such peer or none of its receivers can play the stream, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
 | `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
 | `GET /x-orpheus/v1/sources` | The [sources](#outputs-and-volume) the receivers remember, most recently played first: `id`, `name`, `key` (what the stream is recognized by), `node` (the sending node's ID, if Orpheus), `output` (machine name, absent for the default), `volume` (`channels`, linear per channel, and `mute`), `receiver` (while it plays) and `last_used` (Unix seconds). |
 | `DELETE /x-orpheus/v1/sources/{id}` | Forgets a source's output and volume; a stream playing it goes to the default output at full volume. Returns `204`, or `404` if there is no such source. |
-| `PUT /x-orpheus/v1/receivers/{id}/output` | Plays a receiver's stream on an output, remembered for its source. Body: `{"output": "<name>"}`. Returns `204`; `404` if there is no such output or the receiver is not playing. `DELETE` goes back to the default. |
+| `PUT /x-orpheus/v1/receivers/{id}/output` | Plays a receiver's stream on an output, remembered for its source. Body: `{"output": "<name>"}`. Returns `204`; `404` if there is no such receiver or output, `409` if the receiver is not playing. `DELETE` goes back to the default. |
 | `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receivers`: the IDs of the receivers that play there. |
 | `PUT /x-orpheus/v1/outputs/{name}` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
-| `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `409` if the audio system can't change it, or `503` without an audio system. |
+| `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |
-| `PATCH /x-orpheus/v1/nodes/{id}` | Sets a node's [alias or pin](#aliases-and-pins), by its node ID. Body: `{"alias": "Kitchen"}`, `{"alias": null}` to remove it, `{"pinned": true}`, or both keys. Returns `204`; `400` for an empty alias or a malformed ID, `404` if the node was never seen, `409` if another node has the alias. |
+| `PATCH /x-orpheus/v1/nodes/{id}` | Sets a node's [alias or pin](#aliases-and-pins), by its node ID. Body: `{"alias": "Kitchen"}`, `{"alias": null}` to remove it, `{"pinned": true}`, or both keys. Returns `204`; `400` for an empty alias, `404` if the node was never seen, `409` if another node has the alias. |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
 
 The same OpenAPI document is printed by `orpheusd --openapi`.
+
+Errors come as JSON, as in the NMOS APIs: `{"code": 404, "error": "no route
+3XJ7Q2WC", "debug": null}`. The status codes mean the same on every
+endpoint:
+
+| Code | Meaning |
+|---|---|
+| `400` | The request is malformed: not JSON, a field missing or of the wrong type, an invalid value. |
+| `404` | The path, or the route, source, output, receiver or node it names, doesn't exist. |
+| `409` | The state of this node or the peer is in the way; it may work later or with `force`: the peer's receivers are busy, the receiver isn't playing, the alias is taken. |
+| `422` | The request is fine, but it can't work: the peer is unknown, none of its receivers can play the stream, PTP can't run with the new settings. |
+| `500` | The node failed, for example the audio system didn't do what it was asked. |
+| `502` | The peer can't be reached, or answered with an error. |
+| `503` | A part of the node isn't running: the audio system or mDNS. |
+
+The NMOS APIs also use `423` (IS-05: an activation is scheduled) and `501`
+(IS-04's deprecated receiver `target`).
 
 ### The status JSON
 

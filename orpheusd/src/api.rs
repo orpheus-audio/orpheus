@@ -9,14 +9,17 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
+use axum::http::request::Parts;
 use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
 use orpheus_core::{DeviceId, SourceId};
 use orpheus_discovery::Discovery;
 use orpheus_engine::{Engine, ReceiverId, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_axum::router::OpenApiRouter;
@@ -88,8 +91,114 @@ impl Node {
     }
 }
 
-/// An error status with a plain-text message.
-type ApiError = (StatusCode, String);
+/// A failure: status and message.
+pub type Fail = (StatusCode, String);
+
+/// An error answer, in the format of the NMOS APIs, as every API of the
+/// node answers errors: `{"code": 404, "error": "no route X", "debug":
+/// null}`.
+///
+/// - 400: the request is malformed or has an invalid value;
+/// - 404: the path, or what it names, doesn't exist;
+/// - 409: the node's or the peer's state is in the way; it may work later,
+///   or with `force`;
+/// - 422: the request is valid, but what it asks for can't work: an
+///   unknown peer, one whose receivers can't play the stream, settings
+///   PTP can't run with;
+/// - 500: the node failed;
+/// - 502: the peer can't be reached, or answered with an error or nonsense;
+/// - 503: a part of the node isn't running: the audio system, mDNS.
+///
+/// The NMOS APIs add 423 and 501 where they prescribe them.
+pub struct ApiError(pub StatusCode, pub String);
+
+impl From<Fail> for ApiError {
+    fn from((code, msg): Fail) -> Self {
+        Self(code, msg)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        crate::nmos::error(self.0, self.1)
+    }
+}
+
+/// The body of an error answer.
+#[derive(Serialize, ToSchema)]
+pub struct ErrorBody {
+    /// The HTTP status code.
+    #[schema(example = 404)]
+    pub code: u16,
+    #[schema(example = "no route 3XJ7Q2WC")]
+    pub error: String,
+    /// Always `null`.
+    pub debug: Option<String>,
+}
+
+/// A JSON request body; a body that is not JSON or doesn't fit is a 400.
+pub struct Body<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequest<S> for Body<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, ApiError> {
+        Json::<T>::from_request(req, state)
+            .await
+            .map(|Json(v)| Self(v))
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.body_text()))
+    }
+}
+
+/// Query parameters; ones that don't fit are a 400.
+pub struct Params<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned> FromRequestParts<S> for Params<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Query(v)| Self(v))
+            .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.body_text()))
+    }
+}
+
+/// An ID in the path; one that can't be an ID names nothing, a 404.
+pub struct Id<T>(pub T);
+
+impl<S: Send + Sync, T: DeserializeOwned + Send> FromRequestParts<S> for Id<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, ApiError> {
+        use axum::extract::path::ErrorKind;
+        use axum::extract::rejection::PathRejection;
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(v)| Self(v))
+            .map_err(|e| match e {
+                PathRejection::FailedToDeserializePathParams(e) => match e.into_kind() {
+                    ErrorKind::ParseErrorAtKey { value, .. }
+                    | ErrorKind::ParseErrorAtIndex { value, .. }
+                    | ErrorKind::ParseError { value, .. } => {
+                        ApiError(StatusCode::NOT_FOUND, format!("no {value}"))
+                    }
+                    kind => ApiError(StatusCode::NOT_FOUND, kind.to_string()),
+                },
+                e => ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.body_text()),
+            })
+    }
+}
+
+/// Runs `f` where it may block.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, Fail> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(ApiError::from)
+}
 
 const BASE: &str = "/x-orpheus/v1";
 
@@ -600,18 +709,19 @@ async fn list_sources(State(node): State<Arc<Node>>) -> Json<Vec<SourceEntry>> {
     params(("id" = String, Path, description = "Source ID")),
     responses(
         (status = NO_CONTENT, description = "Forgotten"),
-        (status = NOT_FOUND, description = "No such source", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "No such source", body = ErrorBody),
     ),
 )]
 async fn forget_source(
     State(node): State<Arc<Node>>,
-    Path(id): Path<SourceId>,
+    Id(id): Id<SourceId>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || crate::sources::forget(&node, id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .then_some(StatusCode::NO_CONTENT)
-        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no source {id}")))
+    blocking(move || {
+        crate::sources::forget(&node, id)
+            .then_some(StatusCode::NO_CONTENT)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no source {id}")))
+    })
+    .await
 }
 
 /// The routes that run, then the ones remembered, most recently used
@@ -639,27 +749,25 @@ async fn list_routes(State(node): State<Arc<Node>>) -> Json<Vec<RouteEntry>> {
     request_body = NewSender,
     responses(
         (status = CREATED, description = "Route started", body = Created),
-        (status = BAD_REQUEST, description = "The peer does not resolve", body = String, content_type = "text/plain"),
-        (status = CONFLICT, description = "The peer has no free receiver, or this node is already connected to it with the same priority", body = String, content_type = "text/plain"),
-        (status = BAD_GATEWAY, description = "The peer cannot be reached or refused the connection", body = String, content_type = "text/plain"),
-        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
-        (status = INTERNAL_SERVER_ERROR, description = "Creating the sink failed", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "A malformed request or peer", body = ErrorBody),
+        (status = CONFLICT, description = "The peer has no free receiver, or this node is already connected to it with the same priority", body = ErrorBody),
+        (status = UNPROCESSABLE_ENTITY, description = "No such peer, or it has no receiver that can play the stream", body = ErrorBody),
+        (status = BAD_GATEWAY, description = "The peer cannot be reached or refused the connection", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
+        (status = INTERNAL_SERVER_ERROR, description = "Creating the sink failed", body = ErrorBody),
     ),
 )]
 async fn add_sender(
     State(node): State<Arc<Node>>,
-    Json(req): Json<NewSender>,
+    Body(req): Body<NewSender>,
 ) -> Result<(StatusCode, Json<Created>), ApiError> {
     let created = if req.send_only {
         let peer = resolve(&req.peer).await?;
         let name = req.name.unwrap_or_else(|| req.peer.clone());
         let label = name.clone();
         let priority = req.priority;
-        let id = tokio::task::spawn_blocking(move || {
-            crate::connection::add_sender(&node, peer, label, priority)
-        })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+        let id =
+            blocking(move || crate::connection::add_sender(&node, peer, label, priority)).await?;
         Created {
             id,
             name,
@@ -667,11 +775,10 @@ async fn add_sender(
             receiver: None,
         }
     } else {
-        let c = tokio::task::spawn_blocking(move || {
+        let c = blocking(move || {
             crate::connection::connect(&node, &req.peer, req.name, req.force, req.priority)
         })
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+        .await?;
         Created {
             id: c.id,
             name: c.name,
@@ -701,25 +808,23 @@ struct RemoveQuery {
     params(("id" = String, Path, description = "Route ID"), RemoveQuery),
     responses(
         (status = NO_CONTENT, description = "Disconnected or forgotten"),
-        (status = NOT_FOUND, description = "No such route", body = String, content_type = "text/plain"),
-        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "A malformed query", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such route", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
     ),
 )]
 async fn remove_sender(
     State(node): State<Arc<Node>>,
-    Path(id): Path<SenderId>,
-    Query(q): Query<RemoveQuery>,
+    Id(id): Id<SenderId>,
+    Params(q): Params<RemoveQuery>,
 ) -> Result<StatusCode, ApiError> {
     let forget = q.forget;
-    let removed =
-        tokio::task::spawn_blocking(move || crate::connection::remove_sender(&node, id, forget))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))??;
+    let removed = blocking(move || crate::connection::remove_sender(&node, id, forget)).await?;
     if removed {
         tracing::info!(%id, forget, "route disconnected");
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err((StatusCode::NOT_FOUND, format!("no route {id}")))
+        Err(ApiError(StatusCode::NOT_FOUND, format!("no route {id}")))
     }
 }
 
@@ -732,18 +837,19 @@ async fn remove_sender(
     params(("id" = String, Path, description = "Route ID")),
     responses(
         (status = OK, description = "The SDP file", body = String, content_type = "application/sdp"),
-        (status = NOT_FOUND, description = "No such route running", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "No such route running", body = ErrorBody),
     ),
 )]
 async fn sender_sdp(
     State(node): State<Arc<Node>>,
-    Path(id): Path<SenderId>,
+    Id(id): Id<SenderId>,
 ) -> Result<([(header::HeaderName, &'static str); 1], String), ApiError> {
-    tokio::task::spawn_blocking(move || crate::nmos::sdp(&node, id))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .map(|sdp| ([(header::CONTENT_TYPE, "application/sdp")], sdp))
-        .ok_or((StatusCode::NOT_FOUND, format!("no route {id} running")))
+    blocking(move || {
+        crate::nmos::sdp(&node, id)
+            .map(|sdp| ([(header::CONTENT_TYPE, "application/sdp")], sdp))
+            .ok_or((StatusCode::NOT_FOUND, format!("no route {id} running")))
+    })
+    .await
 }
 
 /// The settings in effect and where each comes from.
@@ -791,14 +897,15 @@ async fn settings(State(node): State<Arc<Node>>) -> Json<SettingsView> {
     request_body(content = serde_json::Value, description = "Sections of keys to change", content_type = "application/merge-patch+json"),
     responses(
         (status = OK, description = "The settings now in effect", body = SettingsView),
-        (status = BAD_REQUEST, description = "An unknown or invalid setting, or PTP could not start with it; nothing changed", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "An unknown or invalid setting; nothing changed", body = ErrorBody),
+        (status = UNPROCESSABLE_ENTITY, description = "PTP could not start with the new settings; nothing changed", body = ErrorBody),
     ),
 )]
 async fn change_settings(
     State(node): State<Arc<Node>>,
-    Json(patch): Json<serde_json::Value>,
+    Body(patch): Body<serde_json::Value>,
 ) -> Result<Json<SettingsView>, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         let mut store = node.settings.lock().unwrap();
         let change = store
             .patch(&patch)
@@ -809,7 +916,7 @@ async fn change_settings(
             && let Some(ptp) = &node.ptp
         {
             ptp.reconfigure(crate::settings::ptp_config(&new.ptp))
-                .map_err(|e| (StatusCode::BAD_REQUEST, format!("PTP: {e}")))?;
+                .map_err(|e| (StatusCode::UNPROCESSABLE_ENTITY, format!("PTP: {e}")))?;
             tracing::info!(settings = ?new.ptp, "PTP restarted");
         }
         store.commit(change);
@@ -831,7 +938,6 @@ async fn change_settings(
         Ok(Json(view))
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// The other nodes found over mDNS: Orpheus nodes and other NMOS nodes,
@@ -843,11 +949,11 @@ async fn change_settings(
     tag = "discovery",
     responses(
         (status = OK, description = "Online nodes first, then by the name shown", body = Vec<crate::peers::Known>),
-        (status = SERVICE_UNAVAILABLE, description = "mDNS is not running", body = String, content_type = "text/plain"),
+        (status = SERVICE_UNAVAILABLE, description = "mDNS is not running", body = ErrorBody),
     ),
 )]
 async fn nodes(State(node): State<Arc<Node>>) -> Result<Json<Vec<crate::peers::Known>>, ApiError> {
-    nodes_of(&node).map(Json).ok_or((
+    nodes_of(&node).map(Json).ok_or(ApiError(
         StatusCode::SERVICE_UNAVAILABLE,
         "mDNS is not running".to_string(),
     ))
@@ -891,21 +997,18 @@ where
     request_body = NodeChange,
     responses(
         (status = NO_CONTENT, description = "Changed"),
-        (status = BAD_REQUEST, description = "Not a device ID, or an empty alias", body = String, content_type = "text/plain"),
-        (status = NOT_FOUND, description = "Not an Orpheus node this node has seen", body = String, content_type = "text/plain"),
-        (status = CONFLICT, description = "Another node has that alias", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "A malformed request, or an empty alias", body = ErrorBody),
+        (status = NOT_FOUND, description = "Not an Orpheus node this node has seen", body = ErrorBody),
+        (status = CONFLICT, description = "Another node has that alias", body = ErrorBody),
     ),
 )]
 async fn change_node(
     State(node): State<Arc<Node>>,
-    Path(id): Path<String>,
-    Json(req): Json<NodeChange>,
+    Id(dev): Id<DeviceId>,
+    Body(req): Body<NodeChange>,
 ) -> Result<StatusCode, ApiError> {
     use crate::peers::{Change, Refused};
-    let dev: DeviceId = id
-        .parse()
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("{id} is not a device ID")))?;
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         let seen = node.discovery.as_ref().map(|d| d.nodes()).unwrap_or_default();
         let renames = req.alias.is_some();
         let change = Change {
@@ -930,7 +1033,6 @@ async fn change_node(
         Ok(StatusCode::NO_CONTENT)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// The audio system's outputs and their types. The receiver announces the
@@ -999,32 +1101,35 @@ struct EventsQuery {
     params(EventsQuery),
     responses(
         (status = SWITCHING_PROTOCOLS, description = "WebSocket opened"),
-        (status = BAD_REQUEST, description = "Unknown topic, or not a WebSocket request", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "Unknown topic, or not a WebSocket request", body = ErrorBody),
     ),
 )]
 async fn events(
     State(node): State<Arc<Node>>,
-    Query(q): Query<EventsQuery>,
-    ws: WebSocketUpgrade,
+    Params(q): Params<EventsQuery>,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Result<axum::response::Response, ApiError> {
+    let unknown = |t: &str| {
+        let known: Vec<String> = Topic::ALL
+            .iter()
+            .filter_map(|t| serde_json::to_value(t).ok()?.as_str().map(str::to_owned))
+            .collect();
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown topic {t:?}; expected {}", known.join(", ")),
+        )
+    };
     let topics = match q.topics.as_deref() {
         None => Topic::ALL.to_vec(),
         Some(list) => list
             .split(',')
             .map(|t| {
-                serde_json::from_value(serde_json::Value::String(t.trim().to_owned())).map_err(
-                    |_| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            format!(
-                                "unknown topic {t:?}; expected status, nodes, outputs or settings"
-                            ),
-                        )
-                    },
-                )
+                serde_json::from_value(serde_json::Value::String(t.trim().to_owned()))
+                    .map_err(|_| unknown(t))
             })
             .collect::<Result<_, _>>()?,
     };
+    let ws = ws.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.body_text()))?;
     Ok(ws.on_upgrade(move |socket| crate::events::serve(socket, node, topics)))
 }
 
@@ -1038,15 +1143,16 @@ async fn events(
     request_body = SetType,
     responses(
         (status = NO_CONTENT, description = "Set"),
-        (status = NOT_FOUND, description = "No such output", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "A malformed request", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such output", body = ErrorBody),
     ),
 )]
 async fn set_output_type(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
-    Json(req): Json<SetType>,
+    Body(req): Body<SetType>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         if crate::outputs::View::of(&node).find(&name).is_none() {
             return Err((StatusCode::NOT_FOUND, format!("no output {name}")));
         }
@@ -1054,7 +1160,6 @@ async fn set_output_type(
         Ok(StatusCode::NO_CONTENT)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// Goes back to the detected type of an output.
@@ -1065,14 +1170,14 @@ async fn set_output_type(
     params(("name" = String, Path, description = "Machine name of the output")),
     responses(
         (status = NO_CONTENT, description = "Back to the detected type"),
-        (status = NOT_FOUND, description = "The output has no type set", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "The output has no type set", body = ErrorBody),
     ),
 )]
 async fn clear_output_type(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         if set_type(&node, &name, None) {
             Ok(StatusCode::NO_CONTENT)
         } else {
@@ -1080,7 +1185,6 @@ async fn clear_output_type(
         }
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// Makes an output the default one, where applications play and
@@ -1094,16 +1198,16 @@ async fn clear_output_type(
     params(("name" = String, Path, description = "Machine name of the output")),
     responses(
         (status = NO_CONTENT, description = "Now the default"),
-        (status = NOT_FOUND, description = "No such output", body = String, content_type = "text/plain"),
-        (status = CONFLICT, description = "The audio system cannot change the default", body = String, content_type = "text/plain"),
-        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "No such output", body = ErrorBody),
+        (status = INTERNAL_SERVER_ERROR, description = "The audio system did not change the default", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
     ),
 )]
 async fn set_default_output(
     State(node): State<Arc<Node>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || {
+    blocking(move || {
         let Some(engine) = &node.engine else {
             return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
         };
@@ -1114,12 +1218,11 @@ async fn set_default_output(
             .lock()
             .unwrap()
             .set_default_output(&name)
-            .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
         tracing::info!(output = %name, "default output");
         Ok(StatusCode::NO_CONTENT)
     })
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 /// Plays a receiver's stream on an output. The audio system remembers the
@@ -1133,19 +1236,19 @@ async fn set_default_output(
     request_body = PlayOn,
     responses(
         (status = NO_CONTENT, description = "Moved"),
-        (status = NOT_FOUND, description = "No such output, or the receiver is not playing", body = String, content_type = "text/plain"),
-        (status = CONFLICT, description = "The audio system cannot move the stream", body = String, content_type = "text/plain"),
-        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+        (status = BAD_REQUEST, description = "A malformed request", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such receiver or output", body = ErrorBody),
+        (status = CONFLICT, description = "The receiver is not playing", body = ErrorBody),
+        (status = INTERNAL_SERVER_ERROR, description = "The audio system did not move the stream", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
     ),
 )]
 async fn set_receiver_output(
     State(node): State<Arc<Node>>,
-    Path(id): Path<ReceiverId>,
-    Json(req): Json<PlayOn>,
+    Id(id): Id<ReceiverId>,
+    Body(req): Body<PlayOn>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || play_on(&node, id, Some(&req.output)))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    blocking(move || play_on(&node, id, Some(&req.output))).await
 }
 
 /// Plays a receiver's stream on the default output again, also later for
@@ -1157,26 +1260,34 @@ async fn set_receiver_output(
     params(("id" = u32, Path, description = "Receiver ID from the status")),
     responses(
         (status = NO_CONTENT, description = "Back on the default output"),
-        (status = NOT_FOUND, description = "The receiver is not playing", body = String, content_type = "text/plain"),
-        (status = CONFLICT, description = "The audio system cannot move the stream", body = String, content_type = "text/plain"),
-        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+        (status = NOT_FOUND, description = "No such receiver", body = ErrorBody),
+        (status = CONFLICT, description = "The receiver is not playing", body = ErrorBody),
+        (status = INTERNAL_SERVER_ERROR, description = "The audio system did not move the stream", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
     ),
 )]
 async fn clear_receiver_output(
     State(node): State<Arc<Node>>,
-    Path(id): Path<ReceiverId>,
+    Id(id): Id<ReceiverId>,
 ) -> Result<StatusCode, ApiError> {
-    tokio::task::spawn_blocking(move || play_on(&node, id, None))
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+    blocking(move || play_on(&node, id, None)).await
 }
 
 /// Moves receiver `id`'s stream to `output`, or with `None` to the
 /// default output.
-fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCode, ApiError> {
+fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCode, Fail> {
     let Some(engine) = &node.engine else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
     };
+    if !node
+        .connections
+        .lock()
+        .unwrap()
+        .receiver_ids()
+        .contains(&id)
+    {
+        return Err((StatusCode::NOT_FOUND, format!("no receiver {id}")));
+    }
     if let Some(name) = output
         && crate::outputs::View::of(node).find(name).is_none()
     {
@@ -1192,10 +1303,10 @@ fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCo
             Ok(StatusCode::NO_CONTENT)
         }
         Ok(false) => Err((
-            StatusCode::NOT_FOUND,
+            StatusCode::CONFLICT,
             format!("receiver {id} is not playing"),
         )),
-        Err(e) => Err((StatusCode::CONFLICT, e.to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
@@ -1215,7 +1326,8 @@ fn set_type(node: &Node, name: &str, kind: Option<OutputType>) -> bool {
 /// Resolves a peer: a host name or address, optionally with a port.
 /// Prefers IPv4, which every receiver (also AES67 devices) listens on.
 async fn resolve(peer: &str) -> Result<SocketAddr, ApiError> {
-    let bad = |e: String| (StatusCode::BAD_REQUEST, e);
+    let bad = |e: String| ApiError(StatusCode::BAD_REQUEST, e);
+    let unknown = |e: String| ApiError(StatusCode::UNPROCESSABLE_ENTITY, e);
     let (host, port) = split_host_port(peer).ok_or_else(|| bad(format!("bad peer {peer:?}")))?;
     let port = port.unwrap_or(RTP_PORT);
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -1224,14 +1336,14 @@ async fn resolve(peer: &str) -> Result<SocketAddr, ApiError> {
     // Also link-local addresses with an interface name (`fe80::1%eth0`).
     let found: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
         .await
-        .map_err(|e| bad(format!("resolving {peer}: {e}")))?
+        .map_err(|e| unknown(format!("resolving {peer}: {e}")))?
         .collect();
     found
         .iter()
         .find(|a| a.is_ipv4())
         .or(found.first())
         .copied()
-        .ok_or_else(|| bad(format!("{peer} has no address")))
+        .ok_or_else(|| unknown(format!("{peer} has no address")))
 }
 
 /// `host`, `host:port`, `[v6]` or `[v6]:port`; a bare IPv6 address has no
