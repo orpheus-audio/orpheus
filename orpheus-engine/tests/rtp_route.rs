@@ -61,7 +61,9 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 link_offset_ms: LINK_OFFSET_MS,
                 block_frames: Some(QUANTUM as u32),
                 gain: 1.0,
-                restore_key: None,
+                key: None,
+                placement: Placement::Default,
+                volume: None,
             },
         )
         .unwrap();
@@ -77,6 +79,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 peer: listen,
                 remote: OutputType::Generic,
                 block_frames: Some(QUANTUM as u32),
+                volume: None,
             },
         )
         .unwrap();
@@ -196,7 +199,9 @@ fn routes_and_filters_change_at_runtime() {
                 link_offset_ms: LINK_OFFSET_MS,
                 block_frames: Some(QUANTUM as u32),
                 gain: 1.0,
-                restore_key: None,
+                key: None,
+                placement: Placement::Default,
+                volume: None,
             },
         )
         .unwrap();
@@ -213,6 +218,7 @@ fn routes_and_filters_change_at_runtime() {
                 peer: listen,
                 remote: OutputType::Generic,
                 block_frames: Some(QUANTUM as u32),
+                volume: None,
             },
         )
         .unwrap();
@@ -291,7 +297,9 @@ fn gain_mutes_and_the_meter_hears_through_it() {
                     link_offset_ms: LINK_OFFSET_MS,
                     block_frames: Some(QUANTUM as u32),
                     gain,
-                    restore_key: None,
+                    key: None,
+                    placement: Placement::Default,
+                    volume: None,
                 },
             )
             .unwrap();
@@ -308,6 +316,7 @@ fn gain_mutes_and_the_meter_hears_through_it() {
                 peer: listen,
                 remote: OutputType::Generic,
                 block_frames: Some(QUANTUM as u32),
+                volume: None,
             },
         )
         .unwrap();

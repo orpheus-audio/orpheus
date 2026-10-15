@@ -157,10 +157,9 @@ is disconnected (within the `[routes]` limits), and reused by the next
 route ID names its sink (`orpheus.send.<route ID>`) and appears in logs,
 the API and orpheusctl; the sender's NMOS source ID, derived from it, is
 `a=x-orpheus-source` in its SDP file, globally unique. A
-receiver hands the audio system `orpheus.source.<ID>` as the stream's
-`application.id`, which WirePlumber keys the output and volume it
-restores on; streams from other senders fall back to the SDP origin's user
-name, session ID and address, then to the source address.
+receiver keys what it remembers of a stream on `orpheus.source.<ID>`;
+streams from other senders fall back to the SDP origin's user name,
+session ID and address, then to the source address (see below).
 
 ## Connections
 
@@ -258,9 +257,31 @@ connection in `routes.json` is never handed to another, and free slots
 beyond the lowest go after 60 seconds, so that a controller that just saw
 one can still use it. A receiver runs in the engine only while it is
 connected, or while free with `accept = "any"`. Its PipeWire stream has
-`node.name` `orpheus.receive.<k>` and `application.id`
-`orpheus.from.<node ID>`, under which WirePlumber restores volume and
-output per sending node; the description is the alias or the SDP's `s=`.
+`node.name` `orpheus.receive.<k>` and the source's key as
+`application.id`, for WirePlumber's rules; the description is the alias or
+the SDP's `s=`.
+
+`sources.rs` keeps the output and volume per source in `sources.json`
+(short `SourceId`s, evicted by `[sources]`), not WirePlumber, whose
+`stream-properties` cannot be edited while it runs and would outlive what
+Orpheus forgets: the streams set `state.restore-props` and
+`state.restore-target` to `false`. The engine's backend takes a
+`Placement` (`Default`, `Output(name)`, `Held`) and a volume when it
+creates a playback stream, and reports the volume (`channelVolumes` and
+`mute` controls) and the output the user chose: a `target.object` or
+`target.node` in the default metadata that Orpheus did not write. Every
+second `sources.rs` records both and places each stream: the remembered
+output, else `default_output`, else the system default, or `Held` if that
+is a sink to another node. Moves go through the metadata (`-1` for the
+default, which also overrides a target in the stream's properties);
+holding connects the stream again without autoconnect, so WirePlumber
+leaves it unlinked. A new node's volume is set once it reports its
+controls; without one remembered it starts at full volume on every
+channel, which WirePlumber's restore would otherwise have set, and
+without which mixers find no channels to set. Sinks to other nodes work
+the same way for their volume: `connection.rs` notes it every second in
+the route's entry in `routes.json`, also for remembered routes, and
+passes it to the sink when the route starts again.
 
 `policy.rs` runs every 50 ms. It reads each receiver's last sound from the
 engine's meter (peak above -60 dBFS, measured before the gain) and the

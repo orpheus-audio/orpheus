@@ -10,6 +10,8 @@ A node keeps its files where the XDG base directory specification says:
 ~/.local/state/orpheus/routes.json  routes and connections, kept across restarts
 ~/.local/state/orpheus/outputs.json types set for outputs (`orpheusctl set-type`)
 ~/.local/state/orpheus/peers.json   aliases and pins of other nodes
+~/.local/state/orpheus/sources.json output and volume of each source played here
+~/.local/state/orpheus/settings.json settings changed over the API
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
 ```
 
@@ -144,6 +146,7 @@ an output; see [several streams](usage.md#several-streams).
 | `accept` | `"connected"` | What the free receiver plays: `"connected"` plays nothing, `"any"` plays any stream sent to its port. |
 | `policy` | `"last"` | Which streams are heard when several play at once: `"last"` the one that started most recently, `"first"` the one that started first, `"mix"` all. See [several streams](usage.md#several-streams). |
 | `duck_db` | `20` | How far the other streams are turned down while a high-priority stream plays, in dB: 0 to 96. |
+| `default_output` | unset | Machine name of the output (see `orpheusctl outputs --json`) for streams whose source has no output [remembered](usage.md#outputs-and-volume). Unset: the audio system's default output, unless that is a sink to another node. |
 
 Orpheus connects both ends of a stream: `orpheusctl connect` connects the
 peer's receiver to the new sender through [IS-05](usage.md#connections-is-05),
@@ -153,12 +156,13 @@ for example from `orpheusctl connect --send-only` or an AES67 device sending
 to it. Such a receiver follows one stream at a time: a second sender is
 ignored until the first has been quiet for a second.
 
-Receivers play on the default output. To play a stream on another one,
-move it (named after the sending node, else "Orpheus") in `pavucontrol`
-or with `wpctl`; WirePlumber remembers the output and the volume per
-source, which for another Orpheus node is its [route](usage.md#routes). Other nodes are told what kind of device that output is;
-see [output types](usage.md#output-types). Types are set per output over
-the API, not in this file.
+Receivers play on the default output, or on `default_output`. To play a
+stream on another one, move it (named after the sending node, else
+"Orpheus") in `pavucontrol`, with `wpctl` or with `orpheusctl play`; the
+node remembers the output and the volume per
+[source](usage.md#outputs-and-volume). Other nodes are told what kind of
+device that output is; see [output types](usage.md#output-types). Types
+are set per output over the API, not in this file.
 
 Which streams go where is routing, which belongs to the API, not to this
 file: routes and connections are kept in `routes.json` in the state
@@ -174,6 +178,18 @@ connecting the same peer again brings it back as it was. Routes to
 |---|---|---|
 | `max_age_days` | `365` | Forget a route this many days after it last ran. |
 | `max_entries` | `100` | Forget the oldest routes beyond this many. |
+
+### `[sources]`
+
+How long the receivers remember the output and volume of a
+[source](usage.md#outputs-and-volume) after it last played. Sources from
+[pinned](usage.md#aliases-and-pins) nodes and those playing are kept
+regardless.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `max_age_days` | `365` | Forget a source this many days after it last played. |
+| `max_entries` | `100` | Forget the oldest sources beyond this many. |
 
 ### `[ptp]`
 

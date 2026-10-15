@@ -34,7 +34,7 @@ use orpheus_core::{AudioFormat, OutputType};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::asrc::{Asrc, Fixed};
-use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
+use crate::backend::{AudioBackend, BackendError, Placement, StreamHandle, StreamSpec, Volume};
 use crate::grid::{Grid, Tick};
 use crate::port::{CapturePort, PortStats, StatsSnapshot, port_pair};
 
@@ -68,8 +68,12 @@ pub struct ReceiverConfig {
     pub block_frames: Option<u32>,
     /// The gain to start with, 0 to 1.
     pub gain: f32,
-    /// See [`StreamSpec::restore_key`].
-    pub restore_key: Option<String>,
+    /// See [`StreamSpec::key`].
+    pub key: Option<String>,
+    /// See [`StreamSpec::placement`].
+    pub placement: Placement,
+    /// See [`StreamSpec::volume`].
+    pub volume: Option<Volume>,
 }
 
 /// Which packets the receiver plays.
@@ -224,7 +228,7 @@ fn bind(listen: SocketAddr) -> io::Result<UdpSocket> {
 pub(crate) struct Receiver {
     /// The configured description of the playback stream.
     description: String,
-    restore_key: Option<String>,
+    key: Option<String>,
     /// The address to listen on, with whatever port.
     bind_ip: IpAddr,
     link_offset_ms: u32,
@@ -260,7 +264,9 @@ impl Receiver {
                 group: None,
                 remote: Some(OutputType::Generic),
                 block_frames: cfg.block_frames,
-                restore_key: cfg.restore_key.clone(),
+                key: cfg.key.clone(),
+                placement: cfg.placement.clone(),
+                volume: cfg.volume.clone(),
                 process_latency: 0,
             },
             playback,
@@ -325,7 +331,7 @@ impl Receiver {
         })?;
         Ok(Self {
             description: cfg.description.clone(),
-            restore_key: cfg.restore_key.clone(),
+            key: cfg.key.clone(),
             bind_ip: cfg.listen.ip(),
             link_offset_ms: cfg.link_offset_ms,
             filter,
@@ -363,8 +369,12 @@ impl Receiver {
             .describe(description.unwrap_or(&self.description));
     }
 
-    pub fn restore_key(&self) -> Option<&str> {
-        self.restore_key.as_deref()
+    pub fn key(&self) -> Option<&str> {
+        self.key.as_deref()
+    }
+
+    pub fn playback(&self) -> &StreamHandle {
+        &self.playback
     }
 
     pub fn link_offset_ms(&self) -> u32 {

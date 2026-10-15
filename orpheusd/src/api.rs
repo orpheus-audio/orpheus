@@ -14,7 +14,7 @@ use axum::http::{StatusCode, header};
 use axum::routing::get;
 use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
-use orpheus_core::DeviceId;
+use orpheus_core::{DeviceId, SourceId};
 use orpheus_discovery::Discovery;
 use orpheus_engine::{Engine, ReceiverId, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
 use serde::{Deserialize, Serialize};
@@ -58,6 +58,9 @@ pub struct Node {
     pub mixer: Mutex<crate::policy::Mixer>,
     /// Aliases and pins of other nodes. Lock it last.
     pub peers: Mutex<crate::peers::Peers>,
+    /// What the receivers remember of the sources they played. Lock it
+    /// last.
+    pub sources: Mutex<crate::sources::Sources>,
     /// Snapshots for the event stream.
     pub events: crate::events::Events,
 }
@@ -104,6 +107,7 @@ const BASE: &str = "/x-orpheus/v1";
         (name = "outputs", description = "The audio system's outputs and their types"),
         (name = "receivers", description = "Streams this node plays"),
         (name = "routes", description = "Where this node sends: a sink each, streamed to a peer"),
+        (name = "sources", description = "What the receivers remember of the streams they played"),
         (name = "discovery", description = "Other nodes on the network"),
         (name = "events", description = "State pushed over a WebSocket"),
     ),
@@ -169,6 +173,11 @@ struct ReceiverEntry {
     /// default.
     #[serde(skip_serializing_if = "Option::is_none")]
     plays_on: Option<String>,
+    /// The stream plays nowhere: the default output is a sink to another
+    /// node, and Orpheus passes streams on to other nodes only when told.
+    /// Choose an output for it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    held: bool,
 }
 
 /// An output of the audio system.
@@ -328,6 +337,8 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(outputs))
         .routes(routes!(set_output_type, clear_output_type))
         .routes(routes!(set_receiver_output, clear_receiver_output))
+        .routes(routes!(list_sources))
+        .routes(routes!(forget_source))
         .routes(routes!(events))
         .split_for_parts()
 }
@@ -374,6 +385,7 @@ pub fn snapshot(node: &Node, topic: Topic) -> serde_json::Value {
         Topic::Outputs => serde_json::to_value(outputs_of(node)),
         Topic::Settings => serde_json::to_value(SettingsView::of(&node.settings.lock().unwrap())),
         Topic::Routes => serde_json::to_value(routes_of(node)),
+        Topic::Sources => serde_json::to_value(sources_of(node)),
     }
     .unwrap_or_default()
 }
@@ -410,6 +422,14 @@ fn status_of(node: &Node) -> Status {
     let mut engine = engine.unwrap_or_default();
     let view = crate::outputs::View::of(node);
     let mixer = node.mixer.lock().unwrap();
+    let held: Vec<ReceiverId> = {
+        let sources = node.sources.lock().unwrap();
+        ports
+            .iter()
+            .map(|p| p.0)
+            .filter(|&id| sources.held(id))
+            .collect()
+    };
     let receivers = ports
         .into_iter()
         .map(|(id, port, sender, priority)| {
@@ -427,7 +447,11 @@ fn status_of(node: &Node) -> Status {
                 stream,
                 priority,
                 output: view.receiver_type(node, id),
-                plays_on: view.receiver(id).map(|o| o.description.clone()),
+                plays_on: view
+                    .receiver(id)
+                    .filter(|_| !held.contains(&id))
+                    .map(|o| o.description.clone()),
+                held: held.contains(&id),
             }
         })
         .collect();
@@ -487,6 +511,100 @@ fn routes_of(node: &Node) -> Vec<RouteEntry> {
         last_used: Some(c.used),
     });
     active.chain(cached).collect()
+}
+
+/// A source the receivers remember.
+#[derive(Serialize, ToSchema)]
+pub struct SourceEntry {
+    #[schema(value_type = String, example = "K7QM3XRA")]
+    id: SourceId,
+    /// The name its stream had when it last played.
+    name: String,
+    /// What its stream is recognized by: `orpheus.source.<NMOS source ID>`
+    /// from an Orpheus or NMOS sender, else `orpheus.session.<SDP origin>`,
+    /// else `orpheus.from.<address>`.
+    key: String,
+    /// The sending Orpheus node's device ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node: Option<String>,
+    /// The output chosen for it, by machine name; absent for wherever
+    /// streams play by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<orpheus_engine::Volume>,
+    /// The receiver playing it now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver: Option<ReceiverId>,
+    /// When it last played, in seconds since the Unix epoch.
+    last_used: u64,
+}
+
+fn sources_of(node: &Node) -> Vec<SourceEntry> {
+    let playing: BTreeMap<String, ReceiverId> = match &node.engine {
+        Some(engine) => {
+            let engine = engine.lock().unwrap();
+            engine
+                .status()
+                .receivers
+                .iter()
+                .filter_map(|&(id, _)| Some((engine.receiver_key(id)??.to_owned(), id)))
+                .collect()
+        }
+        None => BTreeMap::new(),
+    };
+    let sources = node.sources.lock().unwrap();
+    sources
+        .list()
+        .iter()
+        .map(|s| SourceEntry {
+            id: s.id,
+            name: s.name.clone(),
+            key: s.key.clone(),
+            node: s.node.clone(),
+            output: s.output.clone(),
+            volume: s.volume.clone(),
+            receiver: playing.get(&s.key).copied(),
+            last_used: s.used,
+        })
+        .collect()
+}
+
+/// The sources the receivers remember, most recently played first: where
+/// each plays and how loud. A stream is put on its source's output when it
+/// starts; moving it or changing its volume, in a mixer or over this API,
+/// is remembered for its source.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/sources",
+    tag = "sources",
+    responses((status = OK, description = "Sources", body = Vec<SourceEntry>)),
+)]
+async fn list_sources(State(node): State<Arc<Node>>) -> Json<Vec<SourceEntry>> {
+    Json(sources_of(&node))
+}
+
+/// Forgets a source's output and volume. A stream playing it goes to the
+/// default output at full volume and stays listed; others are dropped.
+#[utoipa::path(
+    delete,
+    path = "/x-orpheus/v1/sources/{id}",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source ID")),
+    responses(
+        (status = NO_CONTENT, description = "Forgotten"),
+        (status = NOT_FOUND, description = "No such source", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn forget_source(
+    State(node): State<Arc<Node>>,
+    Path(id): Path<SourceId>,
+) -> Result<StatusCode, ApiError> {
+    tokio::task::spawn_blocking(move || crate::sources::forget(&node, id))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .then_some(StatusCode::NO_CONTENT)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no source {id}")))
 }
 
 /// The routes that run, then the ones remembered, most recently used
@@ -1010,8 +1128,12 @@ fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCo
     {
         return Err((StatusCode::NOT_FOUND, format!("no output {name}")));
     }
-    match engine.lock().unwrap().set_receiver_output(id, output) {
+    let engine = engine.lock().unwrap();
+    match engine.set_receiver_output(id, output) {
         Ok(true) => {
+            if let Some(key) = engine.receiver_key(id).flatten() {
+                node.sources.lock().unwrap().choose(key, output);
+            }
             tracing::info!(id, output = output.unwrap_or("default"), "receiver output");
             Ok(StatusCode::NO_CONTENT)
         }
@@ -1117,6 +1239,8 @@ mod tests {
                 "/x-orpheus/v1/routes/{id}",
                 "/x-orpheus/v1/routes/{id}/sdp",
                 "/x-orpheus/v1/settings",
+                "/x-orpheus/v1/sources",
+                "/x-orpheus/v1/sources/{id}",
                 "/x-orpheus/v1/status",
             ]
         );

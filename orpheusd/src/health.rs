@@ -67,6 +67,9 @@ pub enum WarningKind {
     PtpSteps,
     /// PTP is not running; the clock runs on by itself.
     PtpDown,
+    /// The receiver's stream plays nowhere: the default output is a sink
+    /// to another node.
+    Held,
 }
 
 /// What a warning is about.
@@ -169,6 +172,7 @@ fn check(node: &Node, state: &mut State) {
     let mut found = clock(node, state);
     found.extend(receivers(node, state, &nodes));
     found.extend(senders(node, &nodes));
+    found.extend(held(node));
 
     let mut health = node.health.lock().unwrap();
     for w in &found {
@@ -385,6 +389,26 @@ fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) 
         }
     }
     found
+}
+
+/// Streams waiting for an output.
+fn held(node: &Node) -> Vec<Warning> {
+    let ids = node.connections.lock().unwrap().receiver_ids();
+    let sources = node.sources.lock().unwrap();
+    ids.into_iter()
+        .filter(|&id| sources.held(id))
+        .map(|id| Warning {
+            kind: WarningKind::Held,
+            on: Subject::Receiver,
+            sender: None,
+            receiver: Some(id),
+            message: format!(
+                "receiver {id} plays nowhere: the default output is a sink to another node, \
+                 and streams are passed on only when told; choose an output with \
+                 `orpheusctl play {id} <output>` or set [receiver] default_output"
+            ),
+        })
+        .collect()
 }
 
 fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {

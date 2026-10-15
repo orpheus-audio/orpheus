@@ -6,7 +6,9 @@ use std::sync::Arc;
 use orpheus_clock::Clock;
 use orpheus_core::{AudioFormat, OutputType};
 
-use crate::backend::{AudioBackend, BackendError, Output, StreamHandle, StreamSpec};
+use crate::backend::{
+    AudioBackend, BackendError, Output, Placement, StreamHandle, StreamSpec, Volume,
+};
 use crate::port::{PortStats, StatsSnapshot, port_pair};
 use crate::receiver::{Filter, Receiver, ReceiverConfig, ReceiverStatus};
 use crate::sender::{Route, Sender, SenderConfig, SenderStatus};
@@ -78,7 +80,9 @@ impl Engine {
                 group: Some(cfg.name.clone()),
                 remote: None,
                 block_frames: cfg.block_frames,
-                restore_key: None,
+                key: None,
+                placement: Placement::Default,
+                volume: None,
                 process_latency: 0,
             },
             playback,
@@ -91,7 +95,9 @@ impl Engine {
                 group: Some(cfg.name.clone()),
                 remote: None,
                 block_frames: cfg.block_frames,
-                restore_key: None,
+                key: None,
+                placement: Placement::Default,
+                volume: None,
                 process_latency: target as u32,
             },
             capture,
@@ -163,9 +169,9 @@ impl Engine {
         }
     }
 
-    /// Whether receiver `id` runs, and under which restore key.
-    pub fn receiver_restore_key(&self, id: ReceiverId) -> Option<Option<&str>> {
-        self.receivers.get(&id).map(Receiver::restore_key)
+    /// Whether receiver `id` runs, and under which key.
+    pub fn receiver_key(&self, id: ReceiverId) -> Option<Option<&str>> {
+        self.receivers.get(&id).map(Receiver::key)
     }
 
     /// The link offset receiver `id` runs with, if it runs.
@@ -210,6 +216,38 @@ impl Engine {
         }
     }
 
+    /// The output the user last moved receiver `id`'s stream to; see
+    /// [`StreamControl::chosen_output`](crate::StreamControl::chosen_output).
+    pub fn receiver_chosen_output(&self, id: ReceiverId) -> Option<Option<String>> {
+        self.receivers.get(&id)?.playback().chosen_output()
+    }
+
+    /// Plays receiver `id`'s stream where `placement` says; `Ok(false)` if
+    /// the receiver is not running.
+    pub fn place_receiver(
+        &self,
+        id: ReceiverId,
+        placement: &Placement,
+    ) -> Result<bool, BackendError> {
+        match self.receivers.get(&id) {
+            Some(r) => r.playback().place(placement).map(|()| true),
+            None => Ok(false),
+        }
+    }
+
+    /// The volume of receiver `id`'s stream, once the audio system has said.
+    pub fn receiver_volume(&self, id: ReceiverId) -> Option<Volume> {
+        self.receivers.get(&id)?.playback().volume()
+    }
+
+    /// Sets the volume of receiver `id`'s stream; returns whether it runs.
+    pub fn set_receiver_volume(&self, id: ReceiverId, volume: &Volume) -> bool {
+        self.receivers
+            .get(&id)
+            .map(|r| r.playback().set_volume(volume))
+            .is_some()
+    }
+
     /// Changes the kind of output a sender's sink shows; returns whether
     /// the sender exists.
     pub fn set_sender_remote(&mut self, id: SenderId, remote: OutputType) -> bool {
@@ -217,6 +255,11 @@ impl Engine {
             .get(&id)
             .map(|s| s.set_remote(remote))
             .is_some()
+    }
+
+    /// The volume of a sender's sink, once the audio system has said.
+    pub fn sender_volume(&self, id: SenderId) -> Option<Volume> {
+        self.senders.get(&id)?.sink().volume()
     }
 
     /// Shows a sender's sink under another name; returns whether the

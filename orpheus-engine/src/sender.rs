@@ -21,7 +21,7 @@ use orpheus_core::timebase::MediaClock;
 use orpheus_core::{AudioFormat, OutputType};
 
 use crate::asrc::{Asrc, Fixed};
-use crate::backend::{AudioBackend, BackendError, StreamHandle, StreamSpec};
+use crate::backend::{AudioBackend, BackendError, Placement, StreamHandle, StreamSpec, Volume};
 use crate::grid::{Grid, Tick};
 use crate::port::{PlaybackPort, PortStats, StatsSnapshot, port_pair};
 
@@ -47,6 +47,9 @@ pub struct SenderConfig {
     pub remote: OutputType,
     /// Frames per audio-system cycle, as configured.
     pub block_frames: Option<u32>,
+    /// The sink's volume to start with; `None` leaves the audio system's
+    /// default.
+    pub volume: Option<Volume>,
 }
 
 /// Hops a multicast stream may take; AES67 devices commonly use 32.
@@ -174,6 +177,10 @@ pub(crate) struct Sender {
 }
 
 impl Sender {
+    pub fn sink(&self) -> &StreamHandle {
+        &self.sink
+    }
+
     /// Changes the kind of output the sink shows.
     pub fn set_remote(&self, remote: OutputType) {
         self.sink.set_remote(remote);
@@ -216,7 +223,9 @@ impl Sender {
                 group: None,
                 remote: Some(cfg.remote),
                 block_frames: cfg.block_frames,
-                restore_key: None,
+                key: None,
+                placement: Placement::Default,
+                volume: cfg.volume.clone(),
                 process_latency: (target + asrc.delay()) as u32,
             },
             capture,

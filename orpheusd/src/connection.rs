@@ -40,7 +40,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use orpheus_core::OutputType;
 use orpheus_engine::{
-    Engine, Filter, Group, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId,
+    Engine, Filter, Group, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId, Volume,
 };
 use orpheus_nmos::is04::Version;
 use orpheus_nmos::is05::{
@@ -182,6 +182,9 @@ pub struct Cached {
     pub peer: SocketAddr,
     /// When it last ran, in seconds since the Unix epoch.
     pub used: u64,
+    /// The sink's volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume: Option<Volume>,
 }
 
 impl Cached {
@@ -247,6 +250,9 @@ struct Link {
     /// goes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     receiver: Option<PeerReceiver>,
+    /// The sink's volume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    volume: Option<Volume>,
 }
 
 /// How a sender's connection to a peer's receiver stands.
@@ -509,7 +515,14 @@ pub fn restore(node: &Node) {
         let started = engine
             .insert_sender(
                 s.id,
-                &sender_config(node, s.id, s.name, peer, sink_type(node, s.id, &s.link)),
+                &sender_config(
+                    node,
+                    s.id,
+                    s.name,
+                    peer,
+                    sink_type(node, s.id, &s.link),
+                    s.link.volume.clone(),
+                ),
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
             .and_then(|()| apply_sender(&mut engine, s.id, &s.requested));
@@ -533,6 +546,7 @@ fn sender_config(
     name: String,
     peer: SocketAddr,
     remote: OutputType,
+    volume: Option<Volume>,
 ) -> SenderConfig {
     SenderConfig {
         name: outputs::sender_sink(id),
@@ -542,6 +556,7 @@ fn sender_config(
         peer,
         remote,
         block_frames: node.block_frames,
+        volume,
     }
 }
 
@@ -563,17 +578,18 @@ pub fn add_sender(
     name: String,
     priority: Priority,
 ) -> Result<SenderId, Fail> {
-    let id = {
+    let (id, volume) = {
         let conns = node.connections.lock().unwrap();
         conns
             .cached
             .iter()
             .find(|c| c.sends(peer, priority))
-            .map_or_else(|| conns.new_id(), |c| c.id)
+            .map_or_else(|| (conns.new_id(), None), |c| (c.id, c.volume.clone()))
     };
     let link = Link {
         named: true,
         priority,
+        volume,
         ..Link::default()
     };
     start_sender(node, id, peer, name, link)
@@ -638,6 +654,7 @@ pub fn connect(
         displaced: false,
         output: target.output,
         receiver: Some(to.clone()),
+        volume: cached.as_ref().and_then(|c| c.volume.clone()),
     };
     start_sender(
         node,
@@ -776,7 +793,10 @@ fn start_sender(
     let mut engine = lock_engine(node)?;
     let remote = sink_type(node, id, &link);
     engine
-        .insert_sender(id, &sender_config(node, id, name, peer, remote))
+        .insert_sender(
+            id,
+            &sender_config(node, id, name, peer, remote, link.volume.clone()),
+        )
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let params = SenderParams {
         receiver_id: link.receiver.as_ref().map(|r| r.id),
@@ -1341,6 +1361,7 @@ fn stop_sender(node: &Node, id: SenderId, keep: bool) -> Result<bool, Fail> {
                     node: link.receiver.and_then(|r| r.node),
                     peer,
                     used: unix_now(),
+                    volume: engine.sender_volume(id).or(link.volume),
                 },
             );
             conns.evict(&node.peers.lock().unwrap());
@@ -1349,6 +1370,26 @@ fn stop_sender(node: &Node, id: SenderId, keep: bool) -> Result<bool, Fail> {
     let removed = engine.remove_sender(id);
     conns.save(Some(&engine));
     Ok(removed)
+}
+
+/// Notes the volume of each running sender's sink, as the user set it.
+pub fn follow_sinks(node: &Node) {
+    let mut conns = node.connections.lock().unwrap();
+    let Ok(engine) = lock_engine(node) else {
+        return;
+    };
+    let mut changed = false;
+    for (&id, link) in &mut conns.links {
+        if let Some(v) = engine.sender_volume(id)
+            && !link.volume.as_ref().is_some_and(|old| old.same(&v))
+        {
+            link.volume = Some(v);
+            changed = true;
+        }
+    }
+    if changed {
+        conns.save(Some(&engine));
+    }
 }
 
 fn lock_engine(node: &Node) -> Result<std::sync::MutexGuard<'_, Engine>, Fail> {
@@ -1544,10 +1585,9 @@ fn apply_receiver(
         engine.remove_receiver(id);
         return Ok(resolved(port));
     }
-    // The audio system remembers the stream's volume and output by this:
-    // what is sent, as the sender names it, else the session, else where
-    // it comes from.
-    let restore_key = stream
+    // What is sent, as the sender names it, else the session, else where
+    // it comes from: the receivers remember its output and volume by this.
+    let key = stream
         .as_ref()
         .and_then(|s| {
             s.source_id
@@ -1572,9 +1612,23 @@ fn apply_receiver(
             format!("receiving on port {port}: {e}"),
         )
     };
-    let started = engine.receiver_restore_key(id) == Some(restore_key.as_deref())
+    let started = engine.receiver_key(id) == Some(key.as_deref())
         && engine.receiver_link_offset(id) == Some(settings.link_offset_ms);
     if !started {
+        let remembered = key.as_deref().map(|k| {
+            let shown = name
+                .clone()
+                .or_else(|| leg.source_ip.or(leg.multicast_ip).map(|ip| ip.to_string()))
+                .unwrap_or_default();
+            let from = stream.as_ref().and_then(|s| s.node.as_deref());
+            node.sources.lock().unwrap().played(k, &shown, from)
+        });
+        let output = remembered.as_ref().and_then(|s| s.output.as_deref());
+        let placement = crate::sources::resolve(
+            output,
+            settings.default_output.as_deref(),
+            &engine.outputs(),
+        );
         engine
             .start_receiver(
                 id,
@@ -1587,10 +1641,13 @@ fn apply_receiver(
                     link_offset_ms: settings.link_offset_ms,
                     block_frames: node.block_frames,
                     gain: 1.0,
-                    restore_key,
+                    key,
+                    placement: placement.clone(),
+                    volume: remembered.and_then(|s| s.volume),
                 },
             )
             .map_err(|e| failed(e.to_string()))?;
+        node.sources.lock().unwrap().place(id, placement);
         tracing::info!(id, %listen, "receiver running");
     }
     engine
@@ -2208,6 +2265,7 @@ mod tests {
             node: node.map(Into::into),
             peer: "10.0.0.2:5004".parse().unwrap(),
             used,
+            volume: None,
         }
     }
 

@@ -25,6 +25,9 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `alias NODE ALIAS` | Gives another node a name of your own, shown instead of the one it announces (see [aliases and pins](#aliases-and-pins)). `alias NODE --remove` removes it. |
 | `pin NODE`, `unpin NODE` | Keeps another node listed while it is offline, also after a restart, or stops doing so. |
 | `outputs` | Lists the node's outputs with their [types](#output-types), and which receivers play on each. |
+| `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
+| `sources` | Lists the [sources](#outputs-and-volume) the receivers remember: where each plays, how loud, and whether it plays now. |
+| `forget-source SOURCE` | Forgets where a source plays and how loud; one that plays now goes to the default output at full volume. `SOURCE` is its name, or its ID or the start of it, as `sources` shows. |
 | `set-type OUTPUT TYPE` | Sets what kind of device an output is; `auto` goes back to the detected type. `OUTPUT` is the name or description from `outputs`, or a part of either that only one output has. |
 
 `--json` prints the node's JSON responses instead of text: the status as the
@@ -129,9 +132,12 @@ that should be the same next time hangs on it:
 - the sink's machine name, `orpheus.send.<ID>`, so that applications the
   desktop's volume control moved there find it again, as does the
   [output type](#output-types) set for it;
+- the sink's volume, which the node keeps with the route in `routes.json`
+  (WirePlumber keeps nothing for these sinks);
 - the source the stream announces (`a=x-orpheus-source` in the SDP file,
   and its NMOS source ID): the peer remembers by it on which output and at
-  what volume the stream plays.
+  what volume the stream plays (see [outputs and
+  volume](#outputs-and-volume)).
 
 `disconnect` stops a route but remembers it. The next `connect` to the
 same peer with the same priority brings it back with its ID and its name,
@@ -155,9 +161,8 @@ A node can receive several streams at once, one per receiver:
 - **One playback stream each.** A receiver runs a playback stream only
   while it is connected (with [`accept = "any"`](configuration.md#receiver)
   the free one runs too). The stream is named after the sending node, and
-  WirePlumber remembers its volume and output per sending node, so each
-  sender can have its own volume and play on its own output here.
-  PipeWire mixes the streams.
+  plays on the output and at the volume [remembered](#outputs-and-volume)
+  for its source. PipeWire mixes the streams.
 
 Which of the streams are heard is the receiving node's
 [policy](configuration.md#receiver), `[receiver] policy`:
@@ -184,6 +189,52 @@ SDP file, so it takes effect on any Orpheus receiver.
 `orpheusctl status` shows on the receiving node which streams are `muted`
 or `ducked`, and on the sending node `muted by policy` or `ducked` after
 the peer.
+
+### Outputs and volume
+
+A receiving node remembers, for each source it played, the output the
+stream plays on and its volume. A source is what one sender sends: for
+another Orpheus node one of its [routes](#routes), recognized by the
+source ID in the stream's SDP file; for other senders their SDP session,
+else their address. Each source gets an ID of 8 characters, like a node.
+
+- **Choosing:** move the stream in `pavucontrol` or with `wpctl`, or use
+  `orpheusctl play RECEIVER OUTPUT`; change its volume in any mixer. The
+  node notices within a second and keeps it in `sources.json` in the
+  [state directory](configuration.md#files).
+- **Playing:** when a source plays again, its stream starts on the
+  remembered output at the remembered volume. If that output is missing,
+  it plays on `[receiver] default_output`, else on the audio system's
+  default output, and moves back when the output returns.
+- **Not passed on:** a stream from another node is never played into a
+  sink to another node unless you choose that. If the only output left is
+  such a sink (the default output is one, as on a desktop that sends its
+  audio elsewhere), the stream waits unlinked: `orpheusctl status` shows
+  the receiver's output as `none` and the node warns (`held`). Choose an
+  output with `orpheusctl play`, or set `default_output`.
+- **Forgetting:** `orpheusctl forget-source` drops a source's output and
+  volume. Unused sources are forgotten after the [`[sources]`
+  limits](configuration.md#sources); those from pinned nodes are kept.
+
+```sh
+orpheusctl sources
+orpheusctl play 0 "Built-in Audio"
+orpheusctl set receiver.default_output=alsa_output.pci-0000_00_1f.3.analog-stereo
+orpheusctl forget-source Desk
+```
+
+WirePlumber restores nothing for these streams: they carry
+`state.restore-props` and `state.restore-target` set to `false`.
+
+**Two volumes for one route.** The sink on the sending node ("Kitchen")
+and the stream on the receiving node both scale the same audio, and they
+multiply: 50% on each (as mixers show it) is 25%. The sink's volume is
+applied before sending, so it changes what goes over the network; the
+stream's volume is applied where it plays, before the output's own
+volume. Neither costs quality: audio stays floating point in PipeWire and
+24 bit on the wire. Use the sink's for "this computer to the kitchen",
+the stream's for "this source in this room". Each is remembered by its
+own node.
 
 ## Aliases and pins
 
@@ -352,6 +403,9 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
 | `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
+| `GET /x-orpheus/v1/sources` | The [sources](#outputs-and-volume) the receivers remember, most recently played first: `id`, `name`, `key` (what the stream is recognized by), `node` (the sending node's ID, if Orpheus), `output` (machine name, absent for the default), `volume` (`channels`, linear per channel, and `mute`), `receiver` (while it plays) and `last_used` (Unix seconds). |
+| `DELETE /x-orpheus/v1/sources/{id}` | Forgets a source's output and volume; a stream playing it goes to the default output at full volume. Returns `204`, or `404` if there is no such source. |
+| `PUT /x-orpheus/v1/receivers/{id}/output` | Plays a receiver's stream on an output, remembered for its source. Body: `{"output": "<name>"}`. Returns `204`; `404` if there is no such output or the receiver is not playing. `DELETE` goes back to the default. |
 | `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receivers`: the IDs of the receivers that play there. |
 | `PUT /x-orpheus/v1/outputs/{name}` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
@@ -420,6 +474,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `peer_jitter` | sender | The peer's receiver warns about `jitter` for this sender. |
 | `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. |
 | `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. |
+| `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
 
 Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
 the stream or PTP takes. Each node also announces its own link, that of its

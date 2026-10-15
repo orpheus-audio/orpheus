@@ -25,9 +25,16 @@ pub struct StreamSpec {
     /// Frames per processing cycle to ask the audio system for; `None` keeps
     /// the system default.
     pub block_frames: Option<u32>,
-    /// Identifies the stream across restarts, so that the audio system can
-    /// restore its volume and output; e.g. the node a stream comes from.
-    pub restore_key: Option<String>,
+    /// For a playback stream: what it plays, the same across restarts,
+    /// for the audio system's per-application rules; e.g. the source a
+    /// stream comes from. The audio system itself restores nothing for it;
+    /// see `placement` and `volume`.
+    pub key: Option<String>,
+    /// For a playback stream: where it plays.
+    pub placement: Placement,
+    /// For a playback stream: the volume to start with; `None` leaves the
+    /// audio system's default.
+    pub volume: Option<Volume>,
     /// Latency the stream adds on top of the audio system, in frames.
     /// Reported so that players can delay video to match.
     pub process_latency: u32,
@@ -73,6 +80,43 @@ pub struct Output {
     pub default: bool,
 }
 
+/// Where a playback stream plays.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Placement {
+    /// Wherever the audio system plays streams that name no output.
+    #[default]
+    Default,
+    /// On this output, by its machine name; on the default one while it
+    /// is missing.
+    Output(String),
+    /// Nowhere: the stream is not linked to any output.
+    Held,
+}
+
+/// The volume of a stream, as the audio system's mixers show it.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+pub struct Volume {
+    /// Linear gain per channel, 1.0 for unchanged.
+    pub channels: Vec<f32>,
+    pub mute: bool,
+}
+
+impl Volume {
+    /// Whether `other` is the same volume to the 4th decimal, as mixers
+    /// round.
+    pub fn same(&self, other: &Self) -> bool {
+        self.mute == other.mute
+            && self.channels.len() == other.channels.len()
+            && self
+                .channels
+                .iter()
+                .zip(&other.channels)
+                .all(|(a, b)| (a - b).abs() < 1e-4)
+    }
+}
+
 /// What a backend can do with a running stream besides removing it.
 pub trait StreamControl: Send {
     /// Changes the name shown to the user.
@@ -86,11 +130,29 @@ pub trait StreamControl: Send {
         None
     }
     /// For a playback stream: plays on output `name`, or with `None` on
-    /// the default output again. The audio system remembers this the way
-    /// it remembers a move by the user.
+    /// the default output again, as if the user moved it; see
+    /// [`chosen_output`](Self::chosen_output).
     fn set_output(&self, _name: Option<&str>) -> Result<(), BackendError> {
         Err("this audio system cannot move streams".into())
     }
+    /// For a playback stream: the output the user last moved it to
+    /// (`Some(None)` for back to the default), in a mixer or with
+    /// [`set_output`](Self::set_output); `None` if nobody has since it
+    /// started or was last [placed](Self::place).
+    fn chosen_output(&self) -> Option<Option<String>> {
+        None
+    }
+    /// For a playback stream: plays it where `placement` says. Not a
+    /// choice of the user's: it clears [`chosen_output`](Self::chosen_output).
+    fn place(&self, _placement: &Placement) -> Result<(), BackendError> {
+        Err("this audio system cannot move streams".into())
+    }
+    /// For a playback stream: its volume, once the audio system has said.
+    fn volume(&self) -> Option<Volume> {
+        None
+    }
+    /// For a playback stream: sets its volume.
+    fn set_volume(&self, _volume: &Volume) {}
 }
 
 /// Keeps a backend stream alive; dropping it removes the stream.
@@ -133,11 +195,36 @@ impl StreamHandle {
     }
 
     /// Moves a playback stream to output `name`, or with `None` back to
-    /// the default output.
+    /// the default output, as the user would.
     pub fn set_output(&self, name: Option<&str>) -> Result<(), BackendError> {
         match &self.control {
             Some(c) => c.set_output(name),
             None => Err("this audio system cannot move streams".into()),
+        }
+    }
+
+    /// See [`StreamControl::chosen_output`].
+    pub fn chosen_output(&self) -> Option<Option<String>> {
+        self.control.as_ref().and_then(|c| c.chosen_output())
+    }
+
+    /// See [`StreamControl::place`].
+    pub fn place(&self, placement: &Placement) -> Result<(), BackendError> {
+        match &self.control {
+            Some(c) => c.place(placement),
+            None => Err("this audio system cannot move streams".into()),
+        }
+    }
+
+    /// See [`StreamControl::volume`].
+    pub fn volume(&self) -> Option<Volume> {
+        self.control.as_ref().and_then(|c| c.volume())
+    }
+
+    /// See [`StreamControl::set_volume`].
+    pub fn set_volume(&self, volume: &Volume) {
+        if let Some(c) = &self.control {
+            c.set_volume(volume);
         }
     }
 }

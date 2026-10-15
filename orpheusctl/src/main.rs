@@ -134,6 +134,16 @@ enum Command {
         /// `routes`).
         route: String,
     },
+    /// List the sources the receivers remember: where each plays and how
+    /// loud.
+    Sources,
+    /// Forget where a source plays and how loud; if it plays now, it goes
+    /// to the default output at full volume.
+    ForgetSource {
+        /// The source: its name, or its ID or the start of it (see
+        /// `sources`).
+        source: String,
+    },
 }
 
 #[derive(Clone, Deserialize)]
@@ -221,6 +231,9 @@ struct Receiver {
     output: Option<String>,
     /// Description of the output it plays on.
     plays_on: Option<String>,
+    /// Plays nowhere: the default output is another node's sink.
+    #[serde(default)]
+    held: bool,
 }
 
 /// A running receiver's stream.
@@ -594,6 +607,31 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             reply(agent().delete(&url).call()?)
                 .with_context(|| format!("forgetting {route} via {url}"))?;
         }
+        Command::Sources => {
+            let url = format!("{base}/x-orpheus/v1/sources");
+            let raw = get(&url)?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let sources: Vec<SourceEntry> = serde_json::from_str(&raw)
+                    .with_context(|| format!("reading sources from {url}"))?;
+                // Only to show their names.
+                let outputs: Vec<Output> = get(&format!("{base}/x-orpheus/v1/outputs"))
+                    .ok()
+                    .and_then(|raw| serde_json::from_str(&raw).ok())
+                    .unwrap_or_default();
+                print!(
+                    "{}",
+                    render_sources(&sources, &outputs, Paint::detect(), unix_now())
+                );
+            }
+        }
+        Command::ForgetSource { source } => {
+            let id = find_source(base, &source)?;
+            let url = format!("{base}/x-orpheus/v1/sources/{id}");
+            reply(agent().delete(&url).call()?)
+                .with_context(|| format!("forgetting {source} via {url}"))?;
+        }
     }
     Ok(())
 }
@@ -614,15 +652,33 @@ fn find_route(base: &str, query: &str) -> Result<String> {
     let routes: Vec<RouteEntry> =
         serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/routes"))?)
             .context("reading the routes")?;
-    let q = query.to_lowercase();
-    let by_name: Vec<&RouteEntry> = routes
+    let ids: Vec<(&str, &str)> = routes
         .iter()
-        .filter(|r| r.name.to_lowercase() == q)
+        .map(|r| (r.name.as_str(), r.id.as_str()))
         .collect();
+    pick(&ids, query, "route", "routes")
+}
+
+/// The ID of the source `query` names: by ID, the start of an ID, or name.
+fn find_source(base: &str, query: &str) -> Result<String> {
+    let sources: Vec<SourceEntry> =
+        serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/sources"))?)
+            .context("reading the sources")?;
+    let ids: Vec<(&str, &str)> = sources
+        .iter()
+        .map(|s| (s.name.as_str(), s.id.as_str()))
+        .collect();
+    pick(&ids, query, "source", "sources")
+}
+
+/// The ID of the one of `items` (name, ID) that `query` names: by name,
+/// else by ID or the start of one, read as the daemon reads IDs: any
+/// case, `O` as 0, `I` and `L` as 1, hyphens ignored.
+fn pick(items: &[(&str, &str)], query: &str, what: &str, list: &str) -> Result<String> {
+    let q = query.to_lowercase();
+    let by_name: Vec<&(&str, &str)> = items.iter().filter(|i| i.0.to_lowercase() == q).collect();
     let found = match by_name[..] {
         [] => {
-            // Read as the daemon reads IDs: any case, `O` as 0, `I` and `L`
-            // as 1, hyphens ignored.
             let id: String = query
                 .chars()
                 .filter(|&c| c != '-')
@@ -632,22 +688,88 @@ fn find_route(base: &str, query: &str) -> Result<String> {
                     c => c,
                 })
                 .collect();
-            routes.iter().filter(|r| r.id.starts_with(&id)).collect()
+            items.iter().filter(|i| i.1.starts_with(&id)).collect()
         }
         _ => by_name,
     };
     match found[..] {
-        [r] => Ok(r.id.clone()),
-        [] => anyhow::bail!("no route {query:?}; see `orpheusctl routes`"),
+        [i] => Ok(i.1.to_owned()),
+        [] => anyhow::bail!("no {what} {query:?}; see `orpheusctl {list}`"),
         _ => anyhow::bail!(
-            "{query:?} matches routes {}; give the ID",
-            found
-                .iter()
-                .map(|r| r.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+            "{query:?} matches {list} {}; give the ID",
+            found.iter().map(|i| i.1).collect::<Vec<_>>().join(", ")
         ),
     }
+}
+
+/// A source, as `/x-orpheus/v1/sources` lists it.
+#[derive(Deserialize)]
+struct SourceEntry {
+    id: String,
+    name: String,
+    output: Option<String>,
+    volume: Option<Volume>,
+    receiver: Option<u32>,
+    last_used: u64,
+}
+
+#[derive(Deserialize)]
+struct Volume {
+    channels: Vec<f32>,
+    mute: bool,
+}
+
+impl Volume {
+    /// As mixers show it: the loudest channel, on a cubic scale.
+    fn percent(&self) -> String {
+        if self.mute {
+            return "muted".into();
+        }
+        let max = self.channels.iter().copied().fold(0.0f32, f32::max);
+        format!("{:.0}%", max.cbrt() * 100.0)
+    }
+}
+
+/// The sources a node's receivers remember; `outputs` names the outputs.
+fn render_sources(sources: &[SourceEntry], outputs: &[Output], p: Paint, now: u64) -> String {
+    let mut o = String::new();
+    if sources.is_empty() {
+        let _ = writeln!(o, "{}", p.mark(Level::Off, "no sources"));
+        return o;
+    }
+    let rows: Vec<[String; 5]> = sources
+        .iter()
+        .map(|s| {
+            let output = match &s.output {
+                Some(name) => outputs
+                    .iter()
+                    .find(|o| o.name == *name)
+                    .map_or(name.clone(), |o| o.description.clone()),
+                None => "default".into(),
+            };
+            let state = match s.receiver {
+                Some(r) => p.mark(Level::Good, &format!("playing on receiver {r}")),
+                None => {
+                    let ago = match now.saturating_sub(s.last_used) / 86_400 {
+                        0 => "today".to_owned(),
+                        1 => "yesterday".to_owned(),
+                        d => format!("{d} days ago"),
+                    };
+                    p.mark(Level::Off, &format!("last played {ago}"))
+                }
+            };
+            [
+                s.name.clone(),
+                s.id.clone(),
+                output,
+                s.volume.as_ref().map_or("100%".into(), Volume::percent),
+                state,
+            ]
+        })
+        .collect();
+    let header = ["NAME", "ID", "OUTPUT", "VOLUME", "STATE"];
+    table(&mut o, p, header, [false, false, false, true, false], &rows);
+    o
 }
 
 /// Seconds since the Unix epoch.
@@ -1407,7 +1529,10 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
     };
     heading(o, p, &title, Some(mark));
     row(o, p, "listen", &st.listen);
-    if let Some(output) = &r.output {
+    if r.held {
+        let why = "none: the default output is another node's sink";
+        row(o, p, "output", &p.mark(Level::Bad, why));
+    } else if let Some(output) = &r.output {
         let output = match &r.plays_on {
             Some(on) => format!("{output} ({on})"),
             None => output.clone(),
@@ -1740,6 +1865,30 @@ Routes
             "  NAME     ID        PEER               PRIORITY  STATE\n  \
              Kitchen  K7QM3XRA  192.168.1.20:5004  normal    ● connected\n  \
              Kitchen  9F2D4C71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n"
+        );
+    }
+
+    #[test]
+    fn renders_sources() {
+        let sources: Vec<SourceEntry> = serde_json::from_str(
+            r#"[{"id": "6S0AGTEC", "name": "Desk", "key": "orpheus.source.x",
+                 "output": "test.two", "volume": {"channels": [0.125, 0.1], "mute": false},
+                 "receiver": 0, "last_used": 1000},
+                {"id": "V1MVRAV7", "name": "Phone", "key": "orpheus.from.192.168.1.30",
+                 "volume": {"channels": [1.0], "mute": true}, "last_used": 1000}]"#,
+        )
+        .unwrap();
+        let outputs: Vec<Output> = serde_json::from_str(
+            r#"[{"name": "test.two", "description": "Test two", "type": "hifi",
+                 "override": null, "default": false}]"#,
+        )
+        .unwrap();
+        let out = render_sources(&sources, &outputs, Paint(false), 1000 + 86_400);
+        assert_eq!(
+            out,
+            "  NAME   ID        OUTPUT    VOLUME  STATE\n  \
+             Desk   6S0AGTEC  Test two     50%  ● playing on receiver 0\n  \
+             Phone  V1MVRAV7  default    muted  ○ last played yesterday\n"
         );
     }
 

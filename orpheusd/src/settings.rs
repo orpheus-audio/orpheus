@@ -61,6 +61,9 @@ pub struct ReceiverSettings {
     pub duck_db: f32,
     /// Playout delay after the sender's timestamp.
     pub link_offset_ms: u32,
+    /// Where streams play that have no output remembered; `null` for the
+    /// audio system's default output.
+    pub default_output: Option<String>,
 }
 
 /// The clock's configuration for these settings.
@@ -113,6 +116,7 @@ impl Settings {
                 policy: r.policy,
                 duck_db: r.duck_db,
                 link_offset_ms: r.link_offset_ms,
+                default_output: r.default_output.clone(),
             },
         }
     }
@@ -125,6 +129,9 @@ impl Settings {
         }
         if p.step_threshold_us == 0 || p.settle_threshold_us == 0 {
             return Err("[ptp] step_threshold_us and settle_threshold_us must be above 0".into());
+        }
+        if r.default_output.as_deref() == Some("") {
+            return Err("[receiver] default_output must not be empty".into());
         }
         if !(0.0..=96.0).contains(&r.duck_db) {
             return Err("[receiver] duck_db must be 0 to 96".into());

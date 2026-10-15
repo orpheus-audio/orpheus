@@ -1,9 +1,10 @@
 //! Persistent short identifiers.
 //!
-//! A [`DeviceId`] or [`RouteId`] is 40 random bits, written as 8 characters of
+//! A [`DeviceId`], [`RouteId`] or [`SourceId`] is 40 random bits, written as 8 characters of
 //! Crockford Base32 (`0-9`, `A-Z` without `I`, `L`, `O`, `U`), e.g. `K7QM3XRA`.
 //! A device generates its ID once on first boot and keeps it for its lifetime;
-//! a route gets one when it is first connected and keeps it until forgotten.
+//! a route gets one when it is first connected, and a source when a receiver
+//! first plays it; both keep theirs until forgotten.
 //!
 //! Parsing is lenient as the Crockford spec suggests: lowercase is accepted,
 //! `I`/`L` read as `1`, `O` reads as `0`, and hyphens are ignored (`K7QM-3XRA`).
@@ -164,6 +165,12 @@ short_id! {
 short_id! {
     /// A random 40-bit route identifier, unique among the routes of one device.
     RouteId
+}
+
+short_id! {
+    /// A random 40-bit identifier of a source as one device's receivers
+    /// remember it, unique among the sources that device remembers.
+    SourceId
 }
 
 #[cfg(test)]

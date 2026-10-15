@@ -21,6 +21,7 @@ pub struct Config {
     pub audio: AudioConfig,
     pub receiver: ReceiverConfig,
     pub routes: RoutesConfig,
+    pub sources: SourcesConfig,
     pub ptp: PtpConfig,
     pub loopback: LoopbackConfig,
     /// Icon names for other nodes' outputs, by output type, replacing the
@@ -146,6 +147,9 @@ pub struct ReceiverConfig {
     /// How far normal streams are turned down while a high-priority one
     /// plays.
     pub duck_db: f32,
+    /// Where streams play that have no output remembered, by machine name;
+    /// `None` for the audio system's default output.
+    pub default_output: Option<String>,
 }
 
 impl Default for ReceiverConfig {
@@ -158,6 +162,7 @@ impl Default for ReceiverConfig {
             accept: Accept::default(),
             policy: Policy::default(),
             duck_db: 20.0,
+            default_output: None,
         }
     }
 }
@@ -244,6 +249,26 @@ pub struct RoutesConfig {
 }
 
 impl Default for RoutesConfig {
+    fn default() -> Self {
+        Self {
+            max_age_days: 365,
+            max_entries: 100,
+        }
+    }
+}
+
+/// How long the receivers remember a source's output and volume after it
+/// last played. Sources from pinned nodes are kept anyway.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SourcesConfig {
+    /// Forgets a source this many days after it last played.
+    pub max_age_days: u32,
+    /// Forgets the oldest sources beyond this many.
+    pub max_entries: u32,
+}
+
+impl Default for SourcesConfig {
     fn default() -> Self {
         Self {
             max_age_days: 365,

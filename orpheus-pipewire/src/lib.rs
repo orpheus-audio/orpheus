@@ -15,8 +15,8 @@ use std::thread::{self, JoinHandle};
 
 use orpheus_core::{AudioFormat, OutputType};
 use orpheus_engine::{
-    AudioBackend, BackendError, CapturePort, Output, PlaybackPort, StreamControl, StreamHandle,
-    StreamSpec,
+    AudioBackend, BackendError, CapturePort, Output, Placement, PlaybackPort, StreamControl,
+    StreamHandle, StreamSpec, Volume,
 };
 use pipewire::{self as pw, properties::properties, spa};
 use spa::param::audio::{AudioFormat as SpaFormat, AudioInfoRaw, MAX_CHANNELS};
@@ -107,8 +107,12 @@ enum Command {
     Describe(u64, String),
     /// Changes the kind of output a sink leads to: its icon name and type.
     SetRemote(u64, Option<String>, OutputType),
-    /// Moves a playback stream to an output, or back to the default one.
+    /// Moves a playback stream to an output, or back to the default one,
+    /// for the user.
     Move(u64, Option<String>, mpsc::SyncSender<Result<(), String>>),
+    /// Plays a playback stream where Orpheus wants it.
+    Place(u64, Placement, mpsc::SyncSender<Result<(), String>>),
+    SetVolume(u64, Volume),
     Quit,
 }
 
@@ -220,6 +224,37 @@ impl StreamControl for Control {
             .map_err(|_| "PipeWire thread is gone")?;
         Ok(result.recv().map_err(|_| "PipeWire thread is gone")??)
     }
+
+    fn chosen_output(&self) -> Option<Option<String>> {
+        self.graph
+            .lock()
+            .unwrap()
+            .playback
+            .get(&self.id)?
+            .chosen
+            .clone()
+    }
+
+    fn place(&self, placement: &Placement) -> Result<(), BackendError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.tx
+            .send(Command::Place(self.id, placement.clone(), reply))
+            .map_err(|_| "PipeWire thread is gone")?;
+        Ok(result.recv().map_err(|_| "PipeWire thread is gone")??)
+    }
+
+    fn volume(&self) -> Option<Volume> {
+        let graph = self.graph.lock().unwrap();
+        let p = graph.playback.get(&self.id)?;
+        Some(Volume {
+            channels: p.channels.clone()?,
+            mute: p.mute,
+        })
+    }
+
+    fn set_volume(&self, volume: &Volume) {
+        let _ = self.tx.send(Command::SetVolume(self.id, volume.clone()));
+    }
 }
 
 impl AudioBackend for PipeWireBackend {
@@ -260,6 +295,17 @@ struct Live {
     stream: pw::stream::StreamRc,
     /// Set for a group's triggered playback stream.
     group: Option<String>,
+    /// For a playback stream: how to connect it again.
+    playback: Option<Reconnect>,
+}
+
+/// What a playback stream needs to connect again, linked or not.
+struct Reconnect {
+    flags: pw::stream::StreamFlags,
+    format: Vec<u8>,
+    /// Connected without autoconnect, so the session manager leaves it
+    /// unlinked.
+    held: Cell<bool>,
 }
 
 impl Drop for Live {
@@ -348,87 +394,218 @@ fn run(
 
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
-    let _receiver =
-        rx.attach(mainloop.loop_(), {
-            let mainloop = mainloop.clone();
-            let streams = streams.clone();
-            let groups = groups.clone();
-            move |cmd| match cmd {
-                Command::Create {
-                    id,
-                    spec,
-                    icon,
+    let _receiver = rx.attach(mainloop.loop_(), {
+        let mainloop = mainloop.clone();
+        let streams = streams.clone();
+        let groups = groups.clone();
+        move |cmd| match cmd {
+            Command::Create {
+                id,
+                spec,
+                icon,
+                kind,
+                reply,
+            } => {
+                let result = create_stream(
+                    &core,
+                    &spec,
+                    icon.as_deref(),
                     kind,
-                    reply,
-                } => {
-                    let result = create_stream(
-                        &core,
-                        &spec,
-                        icon.as_deref(),
-                        kind,
-                        &mut groups.borrow_mut(),
-                        (id, graph.clone()),
-                    );
-                    let _ = reply.send(result.map(|live| {
-                        streams.borrow_mut().insert(id, live);
-                    }));
-                }
-                Command::Destroy(id) => {
-                    graph.lock().unwrap().streams.remove(&id);
-                    let live = streams.borrow_mut().remove(&id);
-                    if let Some(group) = live.as_ref().and_then(|l| l.group.as_ref()) {
-                        groups.borrow_mut().remove(group);
-                    }
-                }
-                Command::Describe(id, description) => {
-                    if let Some(live) = streams.borrow().get(&id) {
-                        let d = Some(description.as_str());
-                        update_properties(
-                            &live.stream,
-                            &[(*pw::keys::NODE_DESCRIPTION, d), (*pw::keys::MEDIA_NAME, d)],
-                        );
-                    }
-                }
-                Command::SetRemote(id, icon, remote) => {
-                    if let Some(live) = streams.borrow().get(&id) {
-                        update_properties(
-                            &live.stream,
-                            &[
-                                (*pw::keys::DEVICE_ICON_NAME, icon.as_deref()),
-                                (*pw::keys::DEVICE_FORM_FACTOR, form_factor(remote)),
-                            ],
-                        );
-                    }
-                }
-                Command::Move(id, name, reply) => {
-                    let result = graph.lock().unwrap().target(id, name.as_deref()).and_then(
-                        |(node, serial)| {
-                            let metadata = metadata.borrow();
-                            let (_, metadata) = metadata
-                                .as_ref()
-                                .ok_or("no session manager to move streams")?;
-                            // As pulseaudio clients do; the session manager links
-                            // the stream there and remembers it.
-                            metadata.set_property(node, "target.node", None, None);
-                            metadata.set_property(
-                                node,
-                                "target.object",
-                                serial.is_some().then_some("Spa:Id"),
-                                serial.as_deref(),
-                            );
-                            Ok(())
-                        },
-                    );
-                    let _ = reply.send(result);
-                }
-                Command::Quit => mainloop.quit(),
+                    &mut groups.borrow_mut(),
+                    (id, graph.clone()),
+                );
+                let _ = reply.send(result.map(|live| {
+                    streams.borrow_mut().insert(id, live);
+                }));
             }
-        });
+            Command::Destroy(id) => {
+                let mut g = graph.lock().unwrap();
+                g.streams.remove(&id);
+                g.playback.remove(&id);
+                drop(g);
+                let live = streams.borrow_mut().remove(&id);
+                if let Some(group) = live.as_ref().and_then(|l| l.group.as_ref()) {
+                    groups.borrow_mut().remove(group);
+                }
+            }
+            Command::Describe(id, description) => {
+                if let Some(live) = streams.borrow().get(&id) {
+                    let d = Some(description.as_str());
+                    update_properties(
+                        &live.stream,
+                        &[(*pw::keys::NODE_DESCRIPTION, d), (*pw::keys::MEDIA_NAME, d)],
+                    );
+                }
+            }
+            Command::SetRemote(id, icon, remote) => {
+                if let Some(live) = streams.borrow().get(&id) {
+                    update_properties(
+                        &live.stream,
+                        &[
+                            (*pw::keys::DEVICE_ICON_NAME, icon.as_deref()),
+                            (*pw::keys::DEVICE_FORM_FACTOR, form_factor(remote)),
+                        ],
+                    );
+                }
+            }
+            Command::Move(id, name, reply) => {
+                let streams = streams.borrow();
+                let result = match streams.get(&id) {
+                    // Linked again, there.
+                    Some(live) if live.playback.as_ref().is_some_and(|p| p.held.get()) => {
+                        let placement = name.clone().map_or(Placement::Default, Placement::Output);
+                        place(live, id, &graph, &metadata, &placement).map(|()| {
+                            graph.lock().unwrap().playback.entry(id).or_default().chosen =
+                                Some(name);
+                        })
+                    }
+                    _ => move_stream(&graph, &metadata, id, name.as_deref()).map(|()| {
+                        graph.lock().unwrap().playback.entry(id).or_default().chosen = Some(name);
+                    }),
+                };
+                let _ = reply.send(result);
+            }
+            Command::Place(id, placement, reply) => {
+                let streams = streams.borrow();
+                let result = match streams.get(&id) {
+                    Some(live) => place(live, id, &graph, &metadata, &placement),
+                    None => Err("no such stream".into()),
+                };
+                let _ = reply.send(result);
+            }
+            Command::SetVolume(id, volume) => {
+                if let Some(live) = streams.borrow().get(&id) {
+                    let mut g = graph.lock().unwrap();
+                    let p = g.playback.entry(id).or_default();
+                    let pending = p.pending.is_some();
+                    p.restore(&volume);
+                    if !pending {
+                        p.pending = None;
+                        drop(g);
+                        set_volume(&live.stream, &volume);
+                    }
+                }
+            }
+            Command::Quit => mainloop.quit(),
+        }
+    });
 
     let _ = ready.send(Ok(()));
     mainloop.run();
     streams.borrow_mut().clear();
     groups.borrow_mut().clear();
+}
+
+/// Moves playback stream `id` to output `name`, or with `None` to the
+/// default one, through the session manager's metadata, as pulseaudio
+/// clients do. `-1` names no target, which also overrides one in the
+/// stream's properties. The change coming back is not taken for the
+/// user's; the caller says whose it is.
+fn move_stream(
+    graph: &Mutex<Graph>,
+    metadata: &RefCell<Option<(u32, pw::metadata::Metadata)>>,
+    id: u64,
+    name: Option<&str>,
+) -> Result<(), String> {
+    let mut g = graph.lock().unwrap();
+    let (node, serial) = g.target(id, name)?;
+    let metadata = metadata.borrow();
+    let (_, metadata) = metadata
+        .as_ref()
+        .ok_or("no session manager to move streams")?;
+    let p = g.playback.entry(id).or_default();
+    p.chosen = None;
+    p.ours.push(serial.clone());
+    drop(g);
+    metadata.set_property(node, "target.node", None, None);
+    metadata.set_property(
+        node,
+        "target.object",
+        Some("Spa:Id"),
+        Some(serial.as_deref().unwrap_or("-1")),
+    );
+    Ok(())
+}
+
+/// Plays playback stream `id` where `placement` says: holding it connects
+/// it again without autoconnect, so it stays unlinked; letting it go
+/// connects it again with the output as its target.
+fn place(
+    live: &Live,
+    id: u64,
+    graph: &Mutex<Graph>,
+    metadata: &RefCell<Option<(u32, pw::metadata::Metadata)>>,
+    placement: &Placement,
+) -> Result<(), String> {
+    let re = live.playback.as_ref().ok_or("not a playback stream")?;
+    let held = *placement == Placement::Held;
+    if !held && !re.held.get() {
+        let name = match placement {
+            Placement::Output(name) => Some(name.as_str()),
+            _ => None,
+        };
+        return move_stream(graph, metadata, id, name);
+    }
+    if held == re.held.get() {
+        return Ok(());
+    }
+    let target = match placement {
+        Placement::Output(name) => Some(name.as_str()),
+        _ => None,
+    };
+    update_properties(
+        &live.stream,
+        &[
+            ("target.object", target),
+            (
+                *pw::keys::NODE_AUTOCONNECT,
+                Some(if held { "false" } else { "true" }),
+            ),
+        ],
+    );
+    let flags = if held {
+        re.flags - pw::stream::StreamFlags::AUTOCONNECT
+    } else {
+        re.flags | pw::stream::StreamFlags::AUTOCONNECT
+    };
+    live.stream.disconnect().map_err(|e| e.to_string())?;
+    let mut params = [Pod::from_bytes(&re.format).ok_or("invalid format pod")?];
+    live.stream
+        .connect(spa::utils::Direction::Output, None, flags, &mut params)
+        .map_err(|e| e.to_string())?;
+    re.held.set(held);
+    let volume = {
+        let mut g = graph.lock().unwrap();
+        let p = g.playback.entry(id).or_default();
+        p.chosen = None;
+        p.ours.clear();
+        p.channels.clone().map(|channels| Volume {
+            channels,
+            mute: p.mute,
+        })
+    };
+    // A new node starts at full volume.
+    if let Some(v) = volume {
+        graph
+            .lock()
+            .unwrap()
+            .playback
+            .entry(id)
+            .or_default()
+            .restore(&v);
+    }
+    Ok(())
+}
+
+/// Sets a stream's volume where its node applies it.
+fn set_volume(stream: &pw::stream::Stream, volume: &Volume) {
+    if let Err(e) = stream.set_control(spa_sys::SPA_PROP_channelVolumes, &volume.channels) {
+        tracing::warn!(error = %e, "setting the stream's volume");
+    }
+    let mute = if volume.mute { 1.0 } else { 0.0 };
+    if let Err(e) = stream.set_control(spa_sys::SPA_PROP_mute, &[mute]) {
+        tracing::warn!(error = %e, "muting the stream");
+    }
 }
 
 /// Creates a stream. A playback stream in a group is not scheduled on its own
@@ -469,6 +646,11 @@ fn create_stream(
             if let Some(form_factor) = spec.remote.and_then(form_factor) {
                 props.insert(*pw::keys::DEVICE_FORM_FACTOR, form_factor);
             }
+            // Orpheus keeps the volume of sinks to other nodes with their
+            // route, which the session manager would keep past it.
+            if spec.remote.is_some() {
+                props.insert("state.restore-props", "false");
+            }
             // Never become the default output; that would loop playback back
             // into ourselves.
             props.insert(*pw::keys::PRIORITY_SESSION, "0");
@@ -483,14 +665,27 @@ fn create_stream(
             props.insert(*pw::keys::MEDIA_NAME, spec.description.as_str());
             props.insert(*pw::keys::MEDIA_CATEGORY, "Playback");
             props.insert(*pw::keys::MEDIA_ROLE, "Music");
-            // The session manager keys what it restores on this first.
-            if let Some(key) = &spec.restore_key {
+            // For the session manager's rules.
+            if let Some(key) = &spec.key {
                 props.insert("application.id", key.as_str());
+            }
+            // Orpheus keeps the output and volume of streams from other
+            // nodes itself, by source; the session manager would by
+            // stream, and remember them past what Orpheus forgets.
+            if spec.remote.is_some() {
+                props.insert("state.restore-props", "false");
+                props.insert("state.restore-target", "false");
+            }
+            if let Placement::Output(name) = &spec.placement {
+                props.insert("target.object", name.as_str());
             }
             if let Some(icon) = icon {
                 props.insert(*pw::keys::MEDIA_ICON_NAME, icon);
             }
-            let mut flags = pw::stream::StreamFlags::AUTOCONNECT;
+            let mut flags = pw::stream::StreamFlags::empty();
+            if spec.placement != Placement::Held {
+                flags |= pw::stream::StreamFlags::AUTOCONNECT;
+            }
             if spec.group.is_some() {
                 flags |= pw::stream::StreamFlags::TRIGGER;
             }
@@ -511,7 +706,11 @@ fn create_stream(
                     port,
                     trigger: group.map(|g| g.playback.clone()),
                 })
-                .state_changed(on_state(name, id, graph))
+                .state_changed(on_state(name, id, graph.clone()))
+                .control_info({
+                    let graph = graph.clone();
+                    move |stream, _, control, info| on_control(stream, &graph, id, control, info)
+                })
                 .process(process_sink)
                 .register()
                 .map_err(|e| e.to_string())?,
@@ -519,7 +718,11 @@ fn create_stream(
         Kind::Playback(port) => Box::new(
             stream
                 .add_local_listener_with_user_data(port)
-                .state_changed(on_state(name, id, graph))
+                .state_changed(on_state(name, id, graph.clone()))
+                .control_info({
+                    let graph = graph.clone();
+                    move |stream, _, control, info| on_control(stream, &graph, id, control, info)
+                })
                 .param_changed({
                     let link = latency_link.clone();
                     move |_, _, id, param| {
@@ -551,6 +754,23 @@ fn create_stream(
     stream
         .connect(direction, None, flags, &mut params)
         .map_err(|e| e.to_string())?;
+    // Without the session manager's restore, nobody else gives the node
+    // its channel volumes, and mixers would have none to set.
+    let volume = spec.volume.clone().or_else(|| {
+        spec.remote.map(|_| Volume {
+            channels: vec![1.0; spec.format.channels as usize],
+            mute: false,
+        })
+    });
+    if let Some(v) = &volume {
+        graph
+            .lock()
+            .unwrap()
+            .playback
+            .entry(id)
+            .or_default()
+            .restore(v);
+    }
     if let Some(g) = group
         && direction == spa::utils::Direction::Input
     {
@@ -571,11 +791,55 @@ fn create_stream(
         }
         _ => None,
     };
+    let playback = (direction == spa::utils::Direction::Output).then(|| Reconnect {
+        flags: flags - pw::stream::StreamFlags::AUTOCONNECT,
+        format,
+        held: Cell::new(spec.placement == Placement::Held),
+    });
     Ok(Live {
         _listener: listener,
         stream,
         group,
+        playback,
     })
+}
+
+/// Notes a playback stream's volume and mute as its node reports them,
+/// or, the first time, sets the volume to restore.
+fn on_control(
+    stream: &pw::stream::Stream,
+    graph: &Mutex<Graph>,
+    id: u64,
+    control: u32,
+    info: *const pw::sys::pw_stream_control,
+) {
+    // SAFETY: PipeWire passes a valid control for the duration of the
+    // call, whose values hold `n_values` floats.
+    let values = unsafe {
+        let Some(info) = info.as_ref() else {
+            return;
+        };
+        if info.values.is_null() {
+            return;
+        }
+        std::slice::from_raw_parts(info.values, info.n_values as usize).to_vec()
+    };
+    let mut g = graph.lock().unwrap();
+    let p = g.playback.entry(id).or_default();
+    if p.pending.is_some() {
+        // Its controls exist now; the next report has these values.
+        if control == spa_sys::SPA_PROP_channelVolumes {
+            let v = p.pending.take().expect("pending");
+            drop(g);
+            set_volume(stream, &v);
+        }
+        return;
+    }
+    match control {
+        spa_sys::SPA_PROP_channelVolumes if !values.is_empty() => p.channels = Some(values),
+        spa_sys::SPA_PROP_mute => p.mute = values.first().is_some_and(|&m| m >= 0.5),
+        _ => {}
+    }
 }
 
 /// Sets or, for `None`, removes properties of a running stream.
@@ -622,6 +886,32 @@ struct Graph {
     links: HashMap<u32, (u32, u32)>,
     /// Node IDs of our streams, by stream ID.
     streams: HashMap<u64, u32>,
+    /// The volume of our streams and where the user moved playback
+    /// streams, by stream ID.
+    playback: HashMap<u64, StreamState>,
+}
+
+#[derive(Default)]
+struct StreamState {
+    /// Volume per channel, once the node has said.
+    channels: Option<Vec<f32>>,
+    mute: bool,
+    /// The output the user last moved the stream to, `Some(None)` for the
+    /// default one.
+    chosen: Option<Option<String>>,
+    /// `target.object` values Orpheus wrote and hasn't seen come back.
+    ours: Vec<Option<String>>,
+    /// The volume to set once the node has its controls.
+    pending: Option<Volume>,
+}
+
+impl StreamState {
+    /// Sets `volume` once the node can take it, and reports it meanwhile.
+    fn restore(&mut self, volume: &Volume) {
+        self.channels = Some(volume.channels.clone());
+        self.mute = volume.mute;
+        self.pending = Some(volume.clone());
+    }
 }
 
 #[derive(Default)]
@@ -658,6 +948,42 @@ impl Graph {
             .filter(|(out, _)| out == node)
             .find_map(|(_, input)| self.sinks.get(input))
             .map(|s| s.name.clone())
+    }
+
+    /// Notes a metadata change of `key` for node `subject`: if it moves
+    /// one of our playback streams and Orpheus didn't, the user chose
+    /// that output.
+    fn moved(&mut self, subject: u32, key: &str, value: Option<&str>) {
+        let Some(id) = self
+            .streams
+            .iter()
+            .find_map(|(&id, &node)| (node == subject).then_some(id))
+        else {
+            return;
+        };
+        let value = value.filter(|v| *v != "-1");
+        let sink = match (key, value) {
+            ("target.object", None) => None,
+            ("target.object", Some(v)) => match self.sinks.values().find(|s| s.serial == v) {
+                Some(s) => Some(s.name.clone()),
+                None => return,
+            },
+            // Cleared along with every move.
+            ("target.node", None) => return,
+            ("target.node", Some(v)) => match v.parse().ok().and_then(|n| self.sinks.get(&n)) {
+                Some(s) => Some(s.name.clone()),
+                None => return,
+            },
+            _ => return,
+        };
+        let p = self.playback.entry(id).or_default();
+        if key == "target.object"
+            && let Some(i) = p.ours.iter().position(|o| o.as_deref() == value)
+        {
+            p.ours.remove(i);
+            return;
+        }
+        p.chosen = Some(sink);
     }
 
     /// The node ID of stream `id` and the serial of output `name`, for
@@ -757,10 +1083,12 @@ fn watch_graph(
                             .property({
                                 let graph = graph.clone();
                                 move |subject, key, _, value| {
+                                    let mut graph = graph.lock().unwrap();
                                     if subject == 0 && key.is_none_or(|k| k == "default.audio.sink")
                                     {
-                                        graph.lock().unwrap().default =
-                                            value.and_then(default_name);
+                                        graph.default = value.and_then(default_name);
+                                    } else if let Some(key) = key {
+                                        graph.moved(subject, key, value);
                                     }
                                     0
                                 }

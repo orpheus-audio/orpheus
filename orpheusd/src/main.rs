@@ -13,6 +13,7 @@ mod peer;
 mod peers;
 mod policy;
 mod settings;
+mod sources;
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -108,6 +109,10 @@ async fn main() -> Result<()> {
         health: Mutex::default(),
         mixer: Mutex::default(),
         peers: Mutex::new(peers::Peers::load(home.state_dir().join("peers.json"))),
+        sources: Mutex::new(sources::Sources::load(
+            home.state_dir().join("sources.json"),
+            config.sources,
+        )),
         events: events::Events::default(),
     });
     connection::restore(&node);
@@ -117,6 +122,7 @@ async fn main() -> Result<()> {
     let health = tokio::spawn(health::watch(node.clone()));
     let mixer = tokio::spawn(policy::run(node.clone()));
     let events = tokio::spawn(events::watch(node.clone()));
+    let streams = tokio::spawn(sources::run(node.clone()));
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -128,10 +134,12 @@ async fn main() -> Result<()> {
     health.abort();
     events.abort();
     mixer.abort();
+    streams.abort();
     let _ = refresh.await;
     let _ = peers.await;
     let _ = health.await;
     let _ = mixer.await;
+    let _ = streams.await;
     drop(node);
     tracing::info!("stopped");
     Ok(())
