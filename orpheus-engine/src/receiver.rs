@@ -8,11 +8,12 @@
 //! sender plays at the same time everywhere; the link offset must cover
 //! packetization, network delay and the error between the nodes' clocks.
 //!
-//! Before the resampler, the audio passes a gain, which fades over
-//! [`RAMP_MS`] to the target set with [`Receiver::set_gain`], and a meter,
-//! which notes when the stream last carried sound (above
-//! [`SOUND_THRESHOLD`]), so that the node can decide which of its receivers
-//! to hear.
+//! Before the resampler, the audio passes a [`ChannelMap`], which picks
+//! the stream's channel for each output channel and crossfades over
+//! [`RAMP_MS`] when it changes; a meter, which notes when the stream last
+//! carried sound (above [`SOUND_THRESHOLD`]), so that the node can decide
+//! which of its receivers to hear; and a gain, which fades over [`RAMP_MS`]
+//! to the target set with [`Receiver::set_gain`].
 //!
 //! The receiver follows one stream (SSRC) at a time and switches to another
 //! once the current one has been quiet for [`SWITCH_AFTER_MS`]. A [`Filter`]
@@ -27,10 +28,11 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use orpheus_clock::Clock;
+use orpheus_core::channels::MAX_CHANNELS;
 use orpheus_core::jitter::{Insert, JitterBuffer};
 use orpheus_core::rtp::{self, Encoding, SequenceStats};
 use orpheus_core::timebase::{MediaClock, extend};
-use orpheus_core::{AudioFormat, OutputType};
+use orpheus_core::{AudioFormat, ChannelMap, OutputType};
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::asrc::{Asrc, Fixed};
@@ -44,7 +46,8 @@ const BUFFER_MS: u32 = 4;
 
 pub const SWITCH_AFTER_MS: u64 = 1000;
 
-/// How long a gain change takes from silence to full volume.
+/// How long a gain change takes from silence to full volume, and a
+/// channel map change from the old map to the new one.
 pub const RAMP_MS: u32 = 30;
 
 /// The peak level that counts as sound, -60 dBFS.
@@ -68,6 +71,8 @@ pub struct ReceiverConfig {
     pub block_frames: Option<u32>,
     /// The gain to start with, 0 to 1.
     pub gain: f32,
+    /// The channel map to start with, of `format.channels` channels.
+    pub map: ChannelMap,
     /// See [`StreamSpec::key`].
     pub key: Option<String>,
     /// See [`StreamSpec::placement`].
@@ -200,14 +205,17 @@ pub struct ReceiverStatus {
     pub asrc_ppm: f64,
     /// The buffer between the RX thread and the playback stream.
     pub buffer: StatsSnapshot,
-    /// Peak level over the last second, before the gain, in dBFS; `None`
-    /// for digital silence.
+    /// Peak level over the last second, after the channel map and before
+    /// the gain, in dBFS; `None` for digital silence.
     pub peak_dbfs: Option<f32>,
     /// Time since the stream last carried sound, in milliseconds; `None`
     /// if it never did.
     pub silent_ms: Option<u64>,
     /// The gain the receiver fades to, 0 to 1.
     pub gain: f32,
+    /// Which channel of the stream plays on each output channel.
+    #[cfg_attr(feature = "openapi", schema(value_type = Vec<Option<u8>>, example = json!([1, 0])))]
+    pub map: ChannelMap,
 }
 
 /// Binds the receive socket. `[::]` also accepts IPv4 (as IPv4-mapped
@@ -239,6 +247,9 @@ pub(crate) struct Receiver {
     buffer: Arc<PortStats>,
     /// Target gain, `f32` bits.
     gain: Arc<AtomicU32>,
+    /// The channel map, [`ChannelMap::to_bits`].
+    map: Arc<AtomicU64>,
+    channels: usize,
     clock: Arc<dyn Clock>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -288,6 +299,13 @@ impl Receiver {
             sound_ns: AtomicU64::new(0),
         });
         let gain = Arc::new(AtomicU32::new(cfg.gain.to_bits()));
+        let channels = format.channels as usize;
+        let start_map = if cfg.map.len() == channels {
+            cfg.map
+        } else {
+            ChannelMap::identity(channels)
+        };
+        let map = Arc::new(AtomicU64::new(start_map.to_bits()));
         let stop = Arc::new(AtomicBool::new(false));
         let filter = Arc::new(SharedFilter::default());
         let offset = format.frames_in_ms(cfg.link_offset_ms) as u64;
@@ -324,6 +342,8 @@ impl Receiver {
             gain: cfg.gain,
             gain_step: 1.0 / format.frames_in_ms(RAMP_MS) as f32,
             peak: 0.0,
+            shared_map: map.clone(),
+            mapper: Mapper::new(start_map, format.frames_in_ms(RAMP_MS)),
         };
         let thread = thread::Builder::new().name("orpheus-rx".into()).spawn({
             let stop = stop.clone();
@@ -339,6 +359,8 @@ impl Receiver {
             counters,
             buffer,
             gain,
+            map,
+            channels,
             clock,
             stop,
             thread: Some(thread),
@@ -384,6 +406,20 @@ impl Receiver {
     /// Fades to `gain` (0 to 1) over up to [`RAMP_MS`].
     pub fn set_gain(&self, gain: f32) {
         self.gain.store(gain.clamp(0.0, 1.0).to_bits(), Relaxed);
+    }
+
+    /// Crossfades to channel map `map` over [`RAMP_MS`]; `false` if it
+    /// doesn't have the stream's number of channels.
+    pub fn set_map(&self, map: ChannelMap) -> bool {
+        if map.len() != self.channels {
+            return false;
+        }
+        self.map.store(map.to_bits(), Relaxed);
+        true
+    }
+
+    pub fn map(&self) -> ChannelMap {
+        ChannelMap::from_bits(self.channels, self.map.load(Relaxed))
     }
 
     /// The output the playback stream plays on, if known.
@@ -453,6 +489,7 @@ impl Receiver {
             peak_dbfs: (peak > 0.0).then(|| 20.0 * peak.log10()),
             silent_ms: self.silent_ms(),
             gain: f32::from_bits(self.gain.load(Relaxed)),
+            map: self.map(),
         }
     }
 }
@@ -501,6 +538,64 @@ struct Rx {
     gain_step: f32,
     /// Peak over the current one-second window.
     peak: f32,
+    shared_map: Arc<AtomicU64>,
+    mapper: Mapper,
+}
+
+/// Applies a channel map to blocks of frames, crossfading frame by frame
+/// when the map changes.
+struct Mapper {
+    /// The map applied to the last frame, or faded to.
+    map: ChannelMap,
+    /// The map faded from.
+    from: ChannelMap,
+    /// Frames left in the crossfade.
+    left: usize,
+    len: usize,
+}
+
+impl Mapper {
+    /// Starts with `map`; changes fade over `len` frames.
+    fn new(map: ChannelMap, len: usize) -> Self {
+        Self {
+            map,
+            from: map,
+            left: 0,
+            len: len.max(1),
+        }
+    }
+
+    /// Maps the interleaved frames of `block` with `wanted`, fading from
+    /// the map before if it changed. A change during a crossfade starts a
+    /// new one from the map faded to.
+    fn process(&mut self, wanted: ChannelMap, block: &mut [f32]) {
+        if wanted != self.map {
+            self.from = self.map;
+            self.map = wanted;
+            self.left = self.len;
+        }
+        if self.left == 0 && self.map.is_identity() {
+            return;
+        }
+        let ch = self.map.len();
+        let mut input = [0.0f32; MAX_CHANNELS];
+        for frame in block.chunks_exact_mut(ch) {
+            input[..ch].copy_from_slice(frame);
+            let input = &input[..ch];
+            if self.left == 0 {
+                for (out, s) in frame.iter_mut().enumerate() {
+                    *s = self.map.sample(input, out);
+                }
+                continue;
+            }
+            let t = 1.0 - self.left as f32 / self.len as f32;
+            for (out, s) in frame.iter_mut().enumerate() {
+                let old = self.from.sample(input, out);
+                *s = old + (self.map.sample(input, out) - old) * t;
+            }
+            self.left -= 1;
+        }
+    }
 }
 
 impl Rx {
@@ -531,6 +626,7 @@ impl Rx {
             }
             let ts = grid.next().wrapping_sub(self.offset) as u32;
             self.jitter.read(ts, &mut block);
+            self.apply_map(&mut block);
             self.meter(&block, now);
             self.apply_gain(&mut block);
             let n = self.asrc.process(&block, &mut resampled);
@@ -652,6 +748,13 @@ impl Rx {
         }
     }
 
+    /// Applies the channel map the receiver was given last.
+    fn apply_map(&mut self, block: &mut [f32]) {
+        let ch = self.format.channels as usize;
+        let wanted = ChannelMap::from_bits(ch, self.shared_map.load(Relaxed));
+        self.mapper.process(wanted, block);
+    }
+
     /// Applies the gain, moving it towards the target frame by frame.
     fn apply_gain(&mut self, block: &mut [f32]) {
         let target = f32::from_bits(self.target_gain.load(Relaxed));
@@ -711,5 +814,27 @@ mod tests {
             let mut buf = [0; 8];
             assert_eq!(socket.recv(&mut buf).unwrap(), 3, "via {to}");
         }
+    }
+
+    #[test]
+    fn map_changes_crossfade() {
+        let swap = ChannelMap::new(&[Some(1), Some(0)]).unwrap();
+        let mut m = Mapper::new(ChannelMap::identity(2), 4);
+        // Left 1, right 0, five frames.
+        let mut block = [1.0, 0.0].repeat(5);
+        m.process(swap, &mut block);
+        let left: Vec<f32> = block.iter().step_by(2).copied().collect();
+        let right: Vec<f32> = block.iter().skip(1).step_by(2).copied().collect();
+        assert_eq!(left, [1.0, 0.75, 0.5, 0.25, 0.0]);
+        assert_eq!(right, [0.0, 0.25, 0.5, 0.75, 1.0]);
+        // Then swapped without fading.
+        let mut block = [1.0, 0.0];
+        m.process(swap, &mut block);
+        assert_eq!(block, [0.0, 1.0]);
+        // The identity map leaves the audio as it is.
+        let mut m = Mapper::new(ChannelMap::identity(2), 4);
+        let mut block = [0.5, -0.5];
+        m.process(ChannelMap::identity(2), &mut block);
+        assert_eq!(block, [0.5, -0.5]);
     }
 }

@@ -19,6 +19,6 @@ utoipa = { version = "6", optional = true }
 
 [features]
 # `Serialize` for the status types.
-serde = ["dep:serde"]
+serde = ["dep:serde", "orpheus-core/serde"]
 # OpenAPI schemas for the status types.
 openapi = ["serde", "dep:utoipa"]

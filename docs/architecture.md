@@ -40,7 +40,7 @@ Linux.
 |---|---|
 | `orpheus-core` | Platform-independent types shared by all nodes, including the planned ESP32 firmware: device ID, audio format, RTP packets, jitter buffer, media-clock arithmetic. |
 | `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of statime. |
-| `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their gains and level meters, ASRC, the `AudioBackend` trait. |
+| `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their channel maps, level meters and gains, ASRC, the `AudioBackend` trait. |
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
 | `orpheusd` | The node daemon: config, home directory, HTTP API, NMOS APIs, connecting to other nodes. |
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
@@ -77,8 +77,10 @@ media-clock time of its first frame.
 by RTP timestamp. Out-of-order, duplicate and late packets are handled there;
 missing audio becomes silence. On the media-clock grid, the thread takes out
 the audio whose timestamp is the current time minus the link offset,
-passes it through a gain, which fades over 30 ms to the volume the
-[policy](#receiver-pool-and-policy) sets, and a level meter, resamples it
+passes it through a channel map, which picks the stream's channel for each
+output channel (swapped, one on both sides, muted) and crossfades over 30 ms
+when it changes, a level meter, and a gain, which fades over 30 ms to the
+volume the [policy](#receiver-pool-and-policy) sets, resamples it
 to the sound card's clock and hands it to the receiver's own playback
 stream through a port. PipeWire mixes the playback streams.
 
@@ -111,7 +113,7 @@ time instead of catching up ("realign").
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
 | `orpheus-ptp` | PTP: sockets, timers, statime |
 | TX, one per sender | Pacing, ASRC, RTP send |
-| RX, one per running receiver | RTP receive, jitter buffer, gain and level meter, ASRC |
+| RX, one per running receiver | RTP receive, jitter buffer, channel map, level meter and gain, ASRC |
 | mDNS | mdns-sd's daemon, plus `mdns-monitor` (renames on name conflicts) and `mdns-browse` (the node list) |
 
 The TX, RX and PTP threads run at normal priority for now.

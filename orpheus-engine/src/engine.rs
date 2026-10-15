@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use orpheus_clock::Clock;
-use orpheus_core::{AudioFormat, OutputType};
+use orpheus_core::{AudioFormat, ChannelMap, OutputType};
 
 use crate::backend::{
     AudioBackend, BackendError, Output, Placement, StreamHandle, StreamSpec, Volume,
@@ -247,6 +247,12 @@ impl Engine {
     /// Fades a receiver to `gain` (0 to 1); returns whether it exists.
     pub fn set_receiver_gain(&mut self, id: ReceiverId, gain: f32) -> bool {
         self.receivers.get(&id).map(|r| r.set_gain(gain)).is_some()
+    }
+
+    /// Crossfades a receiver to channel map `map`; `false` if the receiver
+    /// isn't running or the map has another number of channels.
+    pub fn set_receiver_map(&self, id: ReceiverId, map: ChannelMap) -> bool {
+        self.receivers.get(&id).is_some_and(|r| r.set_map(map))
     }
 
     /// How long each running receiver's stream has been silent, in

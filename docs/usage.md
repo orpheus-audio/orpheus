@@ -511,7 +511,8 @@ The NMOS APIs also use `423` (IS-05: an activation is scheduled) and `501`
   settings](configuration.md#receiver).
 - `receivers`: one per connection and the free one. `sender` names the
   connected sender (its node's alias or name, else its address); `stream`
-  is there while the receiver runs; `state` is what the
+  is there while the receiver runs, with `map`, the stream's channel on
+  each output channel (`[0, 1]` unless changed); `state` is what the
   [policy](#several-streams) does to it: `silent`, `playing`, `muted` or
   `ducked`.
 - `routes`: the routes that run. `playing` says whether applications play
