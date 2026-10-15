@@ -103,6 +103,13 @@ enum Command {
         /// `default` goes back to the default output.
         output: String,
     },
+    /// Make an output the default one: applications play there, and so
+    /// do received streams that have no output of their own. Another
+    /// node's sink is fine too. For nodes without a desktop.
+    Default {
+        /// The output: its name or description, or a unique part of either.
+        output: String,
+    },
     /// Show the settings that can change while the node runs, and where
     /// each comes from: the default, config.toml, or `set`.
     Settings,
@@ -527,6 +534,15 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     .send_json(serde_json::json!({ "output": o.name }))?;
                 reply(r).with_context(|| format!("moving via {url}"))?;
             }
+        }
+        Command::Default { output } => {
+            let outputs: Vec<Output> =
+                serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
+                    .context("reading the outputs")?;
+            let o = find_output(&outputs, &output)?;
+            let url = format!("{base}/x-orpheus/v1/outputs/{}/default", encode(&o.name));
+            let r = agent().put(&url).send_empty()?;
+            reply(r).with_context(|| format!("setting the default via {url}"))?;
         }
         Command::Alias {
             node,

@@ -263,6 +263,12 @@ impl Engine {
         self.backend.outputs()
     }
 
+    /// Makes output `name` the default one; see
+    /// [`AudioBackend::set_default_output`].
+    pub fn set_default_output(&self, name: &str) -> Result<(), BackendError> {
+        self.backend.set_default_output(name)
+    }
+
     /// The output a receiver plays on, if its stream is linked to one.
     pub fn receiver_output(&self, id: ReceiverId) -> Option<String> {
         self.receivers.get(&id).and_then(Receiver::output)

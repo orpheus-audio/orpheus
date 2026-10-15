@@ -107,7 +107,7 @@ time instead of catching up ("realign").
 | Thread | Work |
 |---|---|
 | main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
-| PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type. The engine talks to it through a channel. |
+| PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type and can set the default output, as the desktop does. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
 | `orpheus-ptp` | PTP: sockets, timers, statime |
 | TX, one per sender | Pacing, ASRC, RTP send |

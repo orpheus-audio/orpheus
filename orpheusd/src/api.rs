@@ -339,6 +339,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(change_node))
         .routes(routes!(outputs))
         .routes(routes!(set_output_type, clear_output_type))
+        .routes(routes!(set_default_output))
         .routes(routes!(set_receiver_output, clear_receiver_output))
         .routes(routes!(list_sources))
         .routes(routes!(forget_source))
@@ -1082,6 +1083,45 @@ async fn clear_output_type(
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
+/// Makes an output the default one, where applications play and
+/// receivers' streams go unless moved, as the desktop's sound settings
+/// do. A sink to another node is fine: what plays here then goes there.
+/// The audio system keeps it across restarts.
+#[utoipa::path(
+    put,
+    path = "/x-orpheus/v1/outputs/{name}/default",
+    tag = "outputs",
+    params(("name" = String, Path, description = "Machine name of the output")),
+    responses(
+        (status = NO_CONTENT, description = "Now the default"),
+        (status = NOT_FOUND, description = "No such output", body = String, content_type = "text/plain"),
+        (status = CONFLICT, description = "The audio system cannot change the default", body = String, content_type = "text/plain"),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = String, content_type = "text/plain"),
+    ),
+)]
+async fn set_default_output(
+    State(node): State<Arc<Node>>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    tokio::task::spawn_blocking(move || {
+        let Some(engine) = &node.engine else {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
+        };
+        if crate::outputs::View::of(&node).find(&name).is_none() {
+            return Err((StatusCode::NOT_FOUND, format!("no output {name}")));
+        }
+        engine
+            .lock()
+            .unwrap()
+            .set_default_output(&name)
+            .map_err(|e| (StatusCode::CONFLICT, e.to_string()))?;
+        tracing::info!(output = %name, "default output");
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
 /// Plays a receiver's stream on an output. The audio system remembers the
 /// output for the sending node, as it does when the user moves the stream,
 /// and plays its streams there again later, on any receiver.
@@ -1248,6 +1288,7 @@ mod tests {
                 "/x-orpheus/v1/nodes/{id}",
                 "/x-orpheus/v1/outputs",
                 "/x-orpheus/v1/outputs/{name}",
+                "/x-orpheus/v1/outputs/{name}/default",
                 "/x-orpheus/v1/receivers/{id}/output",
                 "/x-orpheus/v1/routes",
                 "/x-orpheus/v1/routes/{id}",

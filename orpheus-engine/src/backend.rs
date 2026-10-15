@@ -64,6 +64,13 @@ pub trait AudioBackend: Send {
     fn outputs(&self) -> Vec<Output> {
         Vec::new()
     }
+
+    /// Makes output `name` the default one, where streams go unless
+    /// moved, as the user would in the desktop's sound settings. The
+    /// audio system keeps it across restarts.
+    fn set_default_output(&self, _name: &str) -> Result<(), BackendError> {
+        Err("this audio system cannot change the default output".into())
+    }
 }
 
 /// An output of the audio system, such as a sound card or another node's

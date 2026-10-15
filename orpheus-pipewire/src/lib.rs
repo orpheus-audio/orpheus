@@ -113,6 +113,8 @@ enum Command {
     /// Plays a playback stream where Orpheus wants it.
     Place(u64, Placement, mpsc::SyncSender<Result<(), String>>),
     SetVolume(u64, Volume),
+    /// Makes an output the default one, for the user.
+    SetDefault(String, mpsc::SyncSender<Result<(), String>>),
     Quit,
 }
 
@@ -276,6 +278,14 @@ impl AudioBackend for PipeWireBackend {
 
     fn outputs(&self) -> Vec<Output> {
         self.graph.lock().unwrap().outputs()
+    }
+
+    fn set_default_output(&self, name: &str) -> Result<(), BackendError> {
+        let (reply, result) = mpsc::sync_channel(1);
+        self.tx
+            .send(Command::SetDefault(name.to_owned(), reply))
+            .map_err(|_| "PipeWire thread is gone")?;
+        Ok(result.recv().map_err(|_| "PipeWire thread is gone")??)
     }
 }
 
@@ -486,6 +496,9 @@ fn run(
                     }
                 }
             }
+            Command::SetDefault(name, reply) => {
+                let _ = reply.send(set_default(&graph, &metadata, &name));
+            }
             Command::Quit => mainloop.quit(),
         }
     });
@@ -523,6 +536,32 @@ fn move_stream(
         "target.object",
         Some("Spa:Id"),
         Some(serial.as_deref().unwrap_or("-1")),
+    );
+    Ok(())
+}
+
+/// Makes output `name` the default one the way the desktop's sound
+/// settings and `wpctl set-default` do: as the configured default in the
+/// session manager's metadata, which the session manager keeps across
+/// restarts and follows with the default it uses.
+fn set_default(
+    graph: &Mutex<Graph>,
+    metadata: &RefCell<Option<(u32, pw::metadata::Metadata)>>,
+    name: &str,
+) -> Result<(), String> {
+    if !graph.lock().unwrap().sinks.values().any(|s| s.name == name) {
+        return Err(format!("no output {name}"));
+    }
+    let metadata = metadata.borrow();
+    let (_, metadata) = metadata
+        .as_ref()
+        .ok_or("no session manager to change the default output")?;
+    let value = default_json(name);
+    metadata.set_property(
+        0,
+        "default.configured.audio.sink",
+        Some("Spa:String:JSON"),
+        Some(&value),
     );
     Ok(())
 }
@@ -1119,6 +1158,12 @@ fn watch_graph(
     Ok(Box::new((registry, listener, proxies)))
 }
 
+/// Output `name` → `{"name":"…"}`, as the default is kept in metadata.
+fn default_json(name: &str) -> String {
+    let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{{\"name\":\"{escaped}\"}}")
+}
+
 /// `{"name":"alsa_output.pci-0000_00_1f.3.analog-stereo"}` → the name.
 fn default_name(json: &str) -> Option<String> {
     let rest = json
@@ -1359,5 +1404,8 @@ mod tests {
             Some("alsa_output.pci-0000_00_1f.3.analog-stereo")
         );
         assert_eq!(default_name("{}"), None);
+        let name = "orpheus.send.0123456789";
+        assert_eq!(default_name(&default_json(name)).as_deref(), Some(name));
+        assert_eq!(default_json(r#"a"b\c"#), r#"{"name":"a\"b\\c"}"#);
     }
 }

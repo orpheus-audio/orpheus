@@ -130,8 +130,8 @@ affected.
 2. If packets arrive but count as `late` or `early`, the clocks disagree. See
    the next section.
 3. Check that the sender's sink actually gets audio: the application must play
-   into the sink named after the peer, for example chosen in `pavucontrol` or with
-   `wpctl set-default`.
+   into the sink named after the peer, for example chosen in `pavucontrol`, with
+   `wpctl set-default` or with `orpheusctl default`.
 4. Check where the receiver plays and how loud: `orpheusctl sources` shows
    the output and volume remembered for each source, and `orpheusctl
    status` the receiver's output, `none` if its stream waits for one (see

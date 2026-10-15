@@ -26,6 +26,7 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `pin NODE`, `unpin NODE` | Keeps another node listed while it is offline, also after a restart, or stops doing so. |
 | `outputs` | Lists the node's outputs with their [types](#output-types), and which receivers play on each. |
 | `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
+| `default OUTPUT` | Makes `OUTPUT` (as for `set-type`) the default output, where applications play and received streams without an output of their own go; a route's sink works too, so that the node's audio goes to the peer. The same as choosing it in the desktop's sound settings, for nodes without a desktop. The audio system keeps it across restarts. |
 | `sources` | Lists the [sources](#outputs-and-volume) the receivers remember: where each plays, how loud, and whether it plays now. |
 | `forget-source SOURCE` | Forgets where a source plays and how loud; one that plays now goes to the default output at full volume. `SOURCE` is its name, or its ID or the start of it, as `sources` shows. |
 | `set-type OUTPUT TYPE` | Sets what kind of device an output is; `auto` goes back to the detected type. `OUTPUT` is the name or description from `outputs`, or a part of either that only one output has. |
@@ -244,7 +245,8 @@ else their address. Each source gets an ID of 8 characters, like a node.
   such a sink (the default output is one, as on a desktop that sends its
   audio elsewhere), the stream waits unlinked: `orpheusctl status` shows
   the receiver's output as `none` and the node warns (`held`). Choose an
-  output with `orpheusctl play`, or set `default_output`.
+  output with `orpheusctl play`, make a local output the default with
+  `orpheusctl default`, or set `default_output`.
 - **Forgetting:** `orpheusctl forget-source` drops a source's output and
   volume. Unused sources are forgotten after the [`[sources]`
   limits](configuration.md#sources); those from pinned nodes are kept.
@@ -252,6 +254,7 @@ else their address. Each source gets an ID of 8 characters, like a node.
 ```sh
 orpheusctl sources
 orpheusctl play 0 "Built-in Audio"
+orpheusctl default "Built-in Audio"
 orpheusctl set receiver.default_output=alsa_output.pci-0000_00_1f.3.analog-stereo
 orpheusctl forget-source Desk
 ```
@@ -450,6 +453,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `GET /x-orpheus/v1/outputs` | The outputs: `name`, `description`, `type`, `detected`, `override` (if set), `default`, and `receivers`: the IDs of the receivers that play there. |
 | `PUT /x-orpheus/v1/outputs/{name}` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
+| `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `409` if the audio system can't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |
 | `PATCH /x-orpheus/v1/nodes/{id}` | Sets a node's [alias or pin](#aliases-and-pins), by its node ID. Body: `{"alias": "Kitchen"}`, `{"alias": null}` to remove it, `{"pinned": true}`, or both keys. Returns `204`; `400` for an empty alias or a malformed ID, `404` if the node was never seen, `409` if another node has the alias. |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
