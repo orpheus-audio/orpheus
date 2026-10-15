@@ -161,8 +161,25 @@ network delay, and no jitter or loss. Expected problems on real networks:
   minutes. Plan: detect it (no announce from the grandmaster for a while) and
   warn; it is described in [troubleshooting](troubleshooting.md).
 - **Host firewalls.** firewalld and ufw block UDP 319, 320 and 5004 and TCP
-  7480 by default. Plan: detect it, for example when a peer sends but nothing
-  arrives.
+  7480 by default, while mDNS often gets through, so peers show up but PTP
+  and routes stay silent (seen in the first two-box test). The node can't
+  read the rules without root. Plan:
+  - Detect the symptoms: as grandmaster, followers but no delay requests;
+    as follower, syncs but no delay responses; a peer that discovery lists
+    whose API times out; a route whose peer receiver reports no packets.
+  - A probe to tell which side blocks: a node asks a peer over the API to
+    send one UDP packet to its port 319 or 5004; if the API works but the
+    packet doesn't arrive, this node's inbound UDP is filtered.
+  - Name the firewall without root (`/etc/ufw/ufw.conf` is world-readable,
+    firewalld answers over D-Bus) and warn (`firewall`) with the exact
+    command for it and the local network filled in.
+  - The UI offers to fix it with the system's password dialog: `pkexec ufw
+    …`, or firewalld's D-Bus API through polkit. The daemon never changes
+    the firewall itself.
+  - Packages ship a ufw application profile and a firewalld service file,
+    so the fix is `ufw allow orpheus` or `--add-service=orpheus`. On
+    Windows and macOS the system asks when a program first listens, and a
+    Windows installer can add the rule.
 - **VPNs.** The default route can lead through a VPN (for example a
   full-tunnel WireGuard interface). It has no MAC address, so PTP fails and
   the node falls back to the system clock. Plan: prefer interfaces with a

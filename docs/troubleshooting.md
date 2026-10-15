@@ -58,7 +58,13 @@ and it follows the grandmaster again within seconds, without a restart.
   ```
 
   With ufw: `sudo ufw allow 319:320/udp`, `sudo ufw allow 5004:5018/udp`,
-  `sudo ufw allow 5353/udp`, `sudo ufw allow 7480/tcp`.
+  `sudo ufw allow 5353/udp`, `sudo ufw allow 7480/tcp`. To open them to the
+  home network only, name it, as in
+  `sudo ufw allow from 192.168.0.0/16 to any port 319:320 proto udp`.
+
+  mDNS often gets through where the other ports don't, so `orpheusctl
+  nodes` lists the peer all the same. If a follower's `delay` stays `-`
+  and `steps` rises, the grandmaster's firewall drops its delay requests.
 - **Every node is master.** If each node reports `master` and itself as
   grandmaster, they don't hear each other's announce messages. Check the
   firewall, the `domain`, and that all nodes use the same transport (the
