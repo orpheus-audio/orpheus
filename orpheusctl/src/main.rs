@@ -103,8 +103,9 @@ enum Command {
         #[arg(name = "TYPE")]
         kind: String,
     },
-    /// Play a receiver's stream on another output. The node remembers it
-    /// for what is sent, and plays it there again later.
+    /// Play a receiver's stream on another output, in place of any wires
+    /// of its source; also one that is parked. The node remembers it for
+    /// what is sent, and plays it there again later.
     Play {
         /// Receiver ID, as shown by `status`.
         receiver: u32,
@@ -180,7 +181,7 @@ enum Command {
         channels: Vec<String>,
     },
     /// Remove a wire, or some of its channels. A source left without
-    /// wires plays on its output again.
+    /// wires is parked until played with `play` or wired again.
     Unwire {
         /// The source or input, as for `wire`.
         from: String,
@@ -292,6 +293,8 @@ struct Receiver {
     /// Plays on wires, not on an output of its own.
     #[serde(default)]
     wired: bool,
+    /// Plays nowhere until its output is back or it is played elsewhere.
+    parked: Option<Parked>,
     /// What the stream's channels carry.
     layout: Option<Layout>,
     /// The channels of the output it plays on.
@@ -299,6 +302,15 @@ struct Receiver {
     /// How the audio system mixes the stream onto the output: `downmix`,
     /// `upmix` or `remix`; absent where the channels match.
     mix: Option<String>,
+}
+
+/// Why a stream plays nowhere.
+#[derive(Clone, Deserialize)]
+struct Parked {
+    /// `lost` or `unwired`.
+    why: String,
+    /// The output that went, as it was called.
+    description: Option<String>,
 }
 
 /// A running receiver's stream.
@@ -2114,7 +2126,14 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
     if let Some(layout) = &r.layout {
         row(o, p, "channels", &channels(layout));
     }
-    if r.held {
+    if let Some(parked) = &r.parked {
+        let why = match (parked.why.as_str(), &parked.description) {
+            ("lost", Some(output)) => format!("parked: {output} is gone"),
+            ("unwired", _) => "parked: its last wire was removed".to_owned(),
+            _ => "parked".to_owned(),
+        };
+        row(o, p, "output", &p.mark(Level::Off, &why));
+    } else if r.held {
         let why = "none: the default output is another node's sink";
         row(o, p, "output", &p.mark(Level::Bad, why));
     } else if r.wired {
@@ -2692,6 +2711,16 @@ Routes
         let out = render(&s, Paint(false), Counts::Total);
         assert!(out.contains("  mix          upmix ST → 51\n"), "{out}");
         s.receivers[0].mix = None;
+        s.receivers[0].parked = Some(Parked {
+            why: "lost".into(),
+            description: Some("Kitchen speaker".into()),
+        });
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("  output       ○ parked: Kitchen speaker is gone\n"),
+            "{out}"
+        );
+        s.receivers[0].parked = None;
         let r = s.receivers[0].stream.as_mut().unwrap();
         r.ssrc = None;
         r.peak_dbfs = None;

@@ -160,6 +160,8 @@ an output; see [several streams](usage.md#several-streams).
 | `policy` | `"last"` | Which streams are heard when several play at once: `"last"` the one that started most recently, `"first"` the one that started first, `"mix"` all. See [several streams](usage.md#several-streams). |
 | `duck_db` | `20` | How far the other streams are turned down while a high-priority stream plays, in dB: 0 to 96. |
 | `default_output` | unset | Machine name of the output (see `orpheusctl outputs --json`) for streams whose source has no output [remembered](usage.md#outputs-and-volume). Unset: the audio system's default output, unless that is a sink to another node. |
+| `when_lost` | `"pause"` | What happens to a stream whose output goes away; see [lost outputs](usage.md#lost-outputs). `"pause"` will pause the player on the sending node, and parks for now; `"park"` keeps it silent until its output is back or it is played elsewhere; `"default"` plays it where streams without an output play. |
+| `lost_after_ms` | `2000` | How long an output may be gone before it counts as lost, 0 to 60000: a stream keeps its place over shorter gaps. |
 
 Orpheus connects both ends of a stream: `orpheusctl connect` connects the
 peer's receiver to the new sender through [IS-05](usage.md#connections-is-05),
@@ -169,7 +171,8 @@ for example from `orpheusctl connect --send-only` or an AES67 device sending
 to it. Such a receiver follows one stream at a time: a second sender is
 ignored until the first has been quiet for a second.
 
-Receivers play on the default output, or on `default_output`. To play a
+Receivers play on the default output, or on `default_output`, and never
+move to another output because theirs went (see `when_lost`). To play a
 stream on another one, move it (named after the sending node, else
 "Orpheus") in `pavucontrol`, with `wpctl` or with `orpheusctl play`; the
 node remembers the output and the volume per
@@ -289,7 +292,7 @@ set over the API stays until it is reset.
 | Section | Keys | When it takes effect |
 |---|---|---|
 | `ptp` | `interface`, `transport`, `domain`, `priority1`, `priority2`, `slave_only`, `step_threshold_us`, `settle_threshold_us` | PTP restarts at once; the clock keeps running without a jump. If PTP can't start with the new values, nothing changes. |
-| `receiver` | `accept`, `policy`, `duck_db`, `default_output` | at once |
+| `receiver` | `accept`, `policy`, `duck_db`, `default_output`, `when_lost`, `lost_after_ms` | at once |
 | `receiver` | `link_offset_ms` | at once; streams that play restart, with a short gap |
 | `sender` | `claim`, `release_after_s`, `fade_in_ms` | at once |
 

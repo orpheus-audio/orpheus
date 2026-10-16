@@ -288,6 +288,10 @@ impl AudioBackend for PipeWireBackend {
         self.graph.lock().unwrap().outputs()
     }
 
+    fn chosen_default(&self) -> Option<String> {
+        self.graph.lock().unwrap().configured.clone()
+    }
+
     fn inputs(&self) -> Vec<Input> {
         self.graph.lock().unwrap().inputs()
     }
@@ -903,6 +907,10 @@ fn create_stream(
             if let Placement::Output(name) = &spec.placement {
                 props.insert("target.object", name.as_str());
             }
+            // Played nowhere else when its output goes, nor destroyed: the
+            // stream waits, unlinked, until Orpheus places it again.
+            props.insert("node.dont-fallback", "true");
+            props.insert("node.linger", "true");
             if let Some(icon) = icon {
                 props.insert(*pw::keys::MEDIA_ICON_NAME, icon);
             }
@@ -1108,6 +1116,9 @@ struct Graph {
     sources: HashMap<u32, Sink>,
     /// The default sink's node name.
     default: Option<String>,
+    /// The sink the user made the default, by node name, also while it is
+    /// missing.
+    configured: Option<String>,
     /// Links by ID.
     links: HashMap<u32, LinkInfo>,
     /// Audio ports by ID.
@@ -1339,14 +1350,19 @@ impl Graph {
         p.chosen = Some(sink);
     }
 
-    /// The node ID of stream `id` and the serial of output `name`, for
-    /// moving the one to the other; no serial for the default output.
+    /// The node ID of stream `id` and the serial of output `name`, else of
+    /// the default output, for moving the one to the other; no serial
+    /// while there is no default output.
+    ///
+    /// Our streams don't fall back (see `node.dont-fallback`), so following
+    /// the default (`-1`) would leave them unlinked; Orpheus follows it
+    /// itself.
     fn target(&self, id: u64, name: Option<&str>) -> Result<(u32, Option<String>), String> {
         let node = *self
             .streams
             .get(&id)
             .ok_or("the stream is not in the audio system yet")?;
-        let Some(name) = name else {
+        let Some(name) = name.or(self.default.as_deref()) else {
             return Ok((node, None));
         };
         let sink = self
@@ -1495,9 +1511,15 @@ fn watch_graph(
                                 let graph = graph.clone();
                                 move |subject, key, _, value| {
                                     let mut graph = graph.lock().unwrap();
-                                    if subject == 0 && key.is_none_or(|k| k == "default.audio.sink")
-                                    {
+                                    if subject == 0 && key.is_none() {
+                                        graph.default = None;
+                                        graph.configured = None;
+                                    } else if subject == 0 && key == Some("default.audio.sink") {
                                         graph.default = value.and_then(default_name);
+                                    } else if subject == 0
+                                        && key == Some("default.configured.audio.sink")
+                                    {
+                                        graph.configured = value.and_then(default_name);
                                     } else if let Some(key) = key {
                                         graph.moved(subject, key, value);
                                     }

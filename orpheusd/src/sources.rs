@@ -16,18 +16,24 @@
 //! that is a sink to another node. A stream from another node is never
 //! passed on to one by default; it waits, unlinked, for an output. A
 //! source with wires (see [`wires`](crate::wires)) plays only on them.
+//!
+//! A stream never moves to another output because its own went: it is
+//! lost, and waits there, unlinked, until the output is back, the user
+//! plays it elsewhere, or (with `[receiver] when_lost = "default"`)
+//! `lost_after_ms` passed. Losing its output for longer than that, or its
+//! last wire, parks it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use orpheus_core::{Layout, SourceId};
 use orpheus_engine::{Output, Placement, ReceiverId, Volume};
 use serde::{Deserialize, Serialize};
 
 use crate::api::Node;
-use crate::config::SourcesConfig;
+use crate::config::{SourcesConfig, WhenLost};
 use crate::outputs::sink_sender;
 
 /// How often the streams are checked.
@@ -54,6 +60,9 @@ pub struct Source {
     /// says: for senders that say nothing, or say it wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<Layout>,
+    /// Plays nowhere until played again: the user removed its last wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub parked: bool,
     /// When it last played, in seconds since the Unix epoch.
     pub used: u64,
 }
@@ -67,8 +76,34 @@ pub struct Sources {
     placed: BTreeMap<ReceiverId, Placement>,
     /// The running receivers whose sources have wires.
     wired: BTreeSet<ReceiverId>,
+    /// The running receivers whose sources are parked.
+    unwired: BTreeSet<ReceiverId>,
     /// The keys playing at the last tick.
     playing: BTreeSet<String>,
+    /// The running receivers whose output went, and since when.
+    lost: BTreeMap<ReceiverId, Lost>,
+    /// The running receivers not linked to the output they are placed on,
+    /// which is there, and since when: it went and came back between two
+    /// ticks.
+    unlinked: BTreeMap<ReceiverId, Instant>,
+    /// What each output seen is called, by machine name: to name lost ones.
+    seen: BTreeMap<String, String>,
+}
+
+/// An output a stream lost.
+struct Lost {
+    /// Its machine name.
+    output: String,
+    since: Instant,
+}
+
+/// Why a stream plays nowhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Parked {
+    /// Its output went, by machine name and as it was called.
+    Lost { output: String, description: String },
+    /// The user removed its last wire.
+    Unwired,
 }
 
 impl Sources {
@@ -87,7 +122,11 @@ impl Sources {
             list,
             placed: BTreeMap::new(),
             wired: BTreeSet::new(),
+            unwired: BTreeSet::new(),
             playing: BTreeSet::new(),
+            lost: BTreeMap::new(),
+            unlinked: BTreeMap::new(),
+            seen: BTreeMap::new(),
         }
     }
 
@@ -132,6 +171,7 @@ impl Sources {
                     output: None,
                     volume: None,
                     layout: None,
+                    parked: false,
                     used: now,
                 });
                 self.list.len() - 1
@@ -152,9 +192,46 @@ impl Sources {
     }
 
     /// Whether receiver `id`'s stream waits, unlinked, for an output;
-    /// not if it plays on wires.
+    /// not if it plays on wires or is parked.
     pub fn held(&self, id: ReceiverId) -> bool {
-        self.placed.get(&id) == Some(&Placement::Held) && !self.wired.contains(&id)
+        self.placed.get(&id) == Some(&Placement::Held)
+            && !self.wired.contains(&id)
+            && !self.unwired.contains(&id)
+    }
+
+    /// Why receiver `id`'s stream plays nowhere, if it was parked: its
+    /// output gone for `lost_after` or more, or its last wire removed.
+    pub fn parked(&self, id: ReceiverId, lost_after: Duration) -> Option<Parked> {
+        if self.unwired.contains(&id) {
+            return Some(Parked::Unwired);
+        }
+        let lost = self
+            .lost
+            .get(&id)
+            .filter(|l| l.since.elapsed() >= lost_after)?;
+        Some(Parked::Lost {
+            output: lost.output.clone(),
+            description: self.seen.get(&lost.output).unwrap_or(&lost.output).clone(),
+        })
+    }
+
+    /// Parks source `id` until played again, or lets it play; returns
+    /// whether it changed.
+    pub fn park(&mut self, id: SourceId, parked: bool) -> bool {
+        let Some(s) = self.list.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        if s.parked == parked {
+            return false;
+        }
+        s.parked = parked;
+        self.save();
+        true
+    }
+
+    /// Whether receiver `id`'s stream lost its output, parked or not yet.
+    pub fn lost(&self, id: ReceiverId) -> bool {
+        self.lost.contains_key(&id)
     }
 
     /// Whether receiver `id`'s stream plays on wires.
@@ -172,6 +249,7 @@ impl Sources {
             s.output = None;
             s.volume = None;
             s.layout = None;
+            s.parked = false;
             old
         } else {
             self.list.remove(i)
@@ -193,12 +271,14 @@ impl Sources {
         true
     }
 
-    /// Notes that the user chose `output` for `key` (`None`: the default).
+    /// Notes that the user chose `output` for `key` (`None`: the default);
+    /// a parked source plays again.
     pub fn choose(&mut self, key: &str, output: Option<&str>) {
         if let Some(s) = self.get_mut(key)
-            && s.output.as_deref() != output
+            && (s.output.as_deref() != output || s.parked)
         {
             s.output = output.map(str::to_owned);
+            s.parked = false;
             self.save();
         }
     }
@@ -231,7 +311,11 @@ impl Sources {
 /// Forgets source `id`'s output, volume, layout and wires; a stream playing it goes where
 /// streams play by default, at full volume. Returns whether there was one.
 pub fn forget(node: &Node, id: SourceId) -> bool {
-    let default_output = node.settings().receiver.default_output;
+    let settings = node.settings().receiver;
+    let (default_output, keep) = (
+        settings.default_output,
+        settings.when_lost != WhenLost::Default,
+    );
     let engine = node.engine.as_ref().map(|e| e.lock().unwrap());
     let mut sources = node.sources.lock().unwrap();
     let Some(source) = sources.forget(id) else {
@@ -249,7 +333,13 @@ pub fn forget(node: &Node, id: SourceId) -> bool {
         .map(|&(r, _)| r)
         .find(|&r| engine.receiver_key(r).flatten() == Some(source.key.as_str()));
     if let Some(r) = playing {
-        let want = resolve(None, default_output.as_deref(), &engine.outputs());
+        let want = resolve(
+            None,
+            default_output.as_deref(),
+            engine.chosen_default().as_deref(),
+            &engine.outputs(),
+            keep,
+        );
         if let Err(e) = engine.place_receiver(r, &want) {
             tracing::warn!(id = r, error = %e, "placing the stream");
         }
@@ -268,25 +358,36 @@ pub fn forget(node: &Node, id: SourceId) -> bool {
 }
 
 /// Where a stream plays whose source remembers `remembered`: there, else on
-/// `default_output`, else on the audio system's default, unless that is a
-/// sink to another node (or there is none of these): then nowhere.
+/// `default_output`, else on the default output the user chose
+/// (`chosen_default`) or the audio system's, unless that is a sink to
+/// another node: then nowhere. With `keep`, a missing output counts: the
+/// stream waits for it rather than play elsewhere.
 pub fn resolve(
     remembered: Option<&str>,
     default_output: Option<&str>,
+    chosen_default: Option<&str>,
     outputs: &[Output],
+    keep: bool,
 ) -> Placement {
     let present = |name: &str| outputs.iter().any(|o| o.name == name);
     if let Some(name) = remembered
         .into_iter()
         .chain(default_output)
-        .find(|n| present(n))
+        .find(|n| keep || present(n))
     {
         return Placement::Output(name.to_owned());
     }
-    match outputs.iter().find(|o| o.default) {
-        Some(o) if sink_sender(&o.name).is_some() => Placement::Held,
+    // Orpheus follows the default itself, as the user chose it: when it
+    // goes, the audio system picks another, which the stream doesn't
+    // follow.
+    let default = chosen_default
+        .filter(|n| keep || present(n))
+        .or_else(|| outputs.iter().find(|o| o.default).map(|o| o.name.as_str()));
+    match default {
+        Some(name) if sink_sender(name).is_some() => Placement::Held,
+        Some(name) => Placement::Output(name.to_owned()),
         // Before the audio system has said, it decides.
-        _ => Placement::Default,
+        None => Placement::Default,
     }
 }
 
@@ -313,7 +414,10 @@ pub fn follow(node: &Node) {
     let Some(engine) = &node.engine else {
         return;
     };
-    let default_output = node.settings().receiver.default_output;
+    let settings = node.settings().receiver;
+    let default_output = settings.default_output;
+    let keep = settings.when_lost != WhenLost::Default;
+    let lost_after = Duration::from_millis(settings.lost_after_ms.into());
     let pinned: BTreeSet<String> = {
         let peers = node.peers.lock().unwrap();
         let sources = node.sources.lock().unwrap();
@@ -324,9 +428,12 @@ pub fn follow(node: &Node) {
             .filter(|n| peers.pinned(n))
             .collect()
     };
-    let wired = node.wires.lock().unwrap().sources();
+    let wire_outputs = node.wires.lock().unwrap().outputs();
+    let wired: BTreeSet<SourceId> = wire_outputs.keys().copied().collect();
     let engine = engine.lock().unwrap();
     let outputs = engine.outputs();
+    let chosen_default = engine.chosen_default();
+    let present = |name: &str| outputs.iter().any(|o| o.name == name);
     let running: Vec<(ReceiverId, Option<String>)> = engine
         .status()
         .receivers
@@ -335,15 +442,20 @@ pub fn follow(node: &Node) {
         .collect();
     let mut sources = node.sources.lock().unwrap();
     let mut changed = false;
+    for o in &outputs {
+        sources.seen.insert(o.name.clone(), o.description.clone());
+    }
     sources.wired.clear();
+    sources.unwired.clear();
     for (id, key) in &running {
         let chosen = engine.receiver_chosen_output(*id);
         if let Some(source) = key.as_deref().and_then(|k| sources.get_mut(k)) {
             if let Some(output) = &chosen
-                && source.output != *output
+                && (source.output != *output || source.parked)
             {
                 tracing::info!(source = %source.id, output = ?output, "output chosen");
                 source.output = output.clone();
+                source.parked = false;
                 changed = true;
             }
             if let Some(v) = engine.receiver_volume(*id)
@@ -353,27 +465,93 @@ pub fn follow(node: &Node) {
                 changed = true;
             }
         }
-        let remembered = key
-            .as_deref()
-            .and_then(|k| sources.get(k))
+        let source = key.as_deref().and_then(|k| sources.get(k)).cloned();
+        let remembered = source
+            .as_ref()
             .and_then(|s| s.output.clone())
             .or_else(|| chosen.clone().flatten());
-        let on_wires = key
-            .as_deref()
-            .and_then(|k| sources.get(k))
-            .is_some_and(|s| wired.contains(&s.id));
-        let want = if on_wires {
+        let wire_outputs = source.as_ref().and_then(|s| wire_outputs.get(&s.id));
+        let want = if let Some(on) = wire_outputs {
             sources.wired.insert(*id);
+            // Lost when none of its wires' outputs is there.
+            if on.iter().any(|o| present(o)) {
+                sources.lost.remove(id);
+            } else {
+                sources.lost.entry(*id).or_insert_with(|| Lost {
+                    output: on[0].clone(),
+                    since: Instant::now(),
+                });
+            }
+            Placement::Held
+        } else if source.as_ref().is_some_and(|s| s.parked) {
+            sources.unwired.insert(*id);
+            sources.lost.remove(id);
             Placement::Held
         } else {
-            resolve(remembered.as_deref(), default_output.as_deref(), &outputs)
+            resolve(
+                remembered.as_deref(),
+                default_output.as_deref(),
+                chosen_default.as_deref(),
+                &outputs,
+                keep,
+            )
         };
-        if sources.placed.get(id) == Some(&want) {
+        let placed = sources.placed.get(id).cloned();
+        // Its output went: it waits there, unlinked, unless the user moved
+        // it or chose another place for it since, or it may play elsewhere
+        // and waited long enough.
+        let gone = match &placed {
+            Some(Placement::Output(name)) if !present(name) && want != Placement::Held => {
+                Some(name.clone())
+            }
+            _ => None,
+        };
+        if let Some(name) = gone {
+            // A choice from before stays with the output.
+            let moved = chosen
+                .as_ref()
+                .is_some_and(|c| c.as_deref() != Some(name.as_str()));
+            let lost = sources.lost.entry(*id).or_insert_with(|| {
+                tracing::info!(id, output = %name, "output lost");
+                Lost {
+                    output: name,
+                    since: Instant::now(),
+                }
+            });
+            let waits = if keep {
+                placed.as_ref() == Some(&want)
+            } else {
+                lost.since.elapsed() < lost_after
+            };
+            if !moved && waits {
+                continue;
+            }
+        }
+        // Not linked although its output is there: it went and came back
+        // between two ticks. Given a moment to link after placing.
+        let relink = match &placed {
+            Some(Placement::Output(name)) if engine.receiver_output(*id).as_ref() != Some(name) => {
+                let since = *sources.unlinked.entry(*id).or_insert_with(Instant::now);
+                since.elapsed() >= TICK
+            }
+            _ => {
+                sources.unlinked.remove(id);
+                false
+            }
+        };
+        // Back: linked again, as the audio system won't.
+        let back = wire_outputs.is_none()
+            && (sources.lost.remove(id).is_some() || relink)
+            && placed.as_ref() == Some(&want);
+        if back {
+            sources.unlinked.remove(id);
+        }
+        if placed.as_ref() == Some(&want) && !back {
             continue;
         }
         // Where the user just put it.
         let by_user = match (&want, &chosen) {
-            (Placement::Output(name), Some(Some(c))) => name == c,
+            (Placement::Output(name), Some(Some(c))) => name == c && !back,
             _ => false,
         };
         if by_user {
@@ -391,6 +569,12 @@ pub fn follow(node: &Node) {
     drop(engine);
     sources
         .placed
+        .retain(|id, _| running.iter().any(|(r, _)| r == id));
+    sources
+        .lost
+        .retain(|id, _| running.iter().any(|(r, _)| r == id));
+    sources
+        .unlinked
         .retain(|id, _| running.iter().any(|(r, _)| r == id));
     let playing: BTreeSet<String> = running.into_iter().filter_map(|(_, k)| k).collect();
     if playing != sources.playing {
@@ -440,13 +624,41 @@ mod tests {
             output("orpheus.send.K7QM3XRA", true),
         ];
         let at = |n: &str| Placement::Output(n.into());
-        assert_eq!(resolve(Some("usb"), Some("hifi"), &outputs), at("usb"));
-        assert_eq!(resolve(Some("gone"), Some("hifi"), &outputs), at("hifi"));
-        assert_eq!(resolve(Some("gone"), None, &outputs), Placement::Held);
-        assert_eq!(resolve(None, Some("gone"), &outputs), Placement::Held);
+        let r = |remembered, default_output, chosen, outputs: &[Output], keep| {
+            resolve(remembered, default_output, chosen, outputs, keep)
+        };
+        assert_eq!(
+            r(Some("usb"), Some("hifi"), None, &outputs, false),
+            at("usb")
+        );
+        assert_eq!(
+            r(Some("gone"), Some("hifi"), None, &outputs, false),
+            at("hifi")
+        );
+        assert_eq!(
+            r(Some("gone"), None, None, &outputs, false),
+            Placement::Held
+        );
+        assert_eq!(
+            r(None, Some("gone"), None, &outputs, false),
+            Placement::Held
+        );
+        assert_eq!(r(None, None, Some("usb"), &outputs, false), at("usb"));
+        assert_eq!(
+            r(None, None, Some("gone"), &outputs, false),
+            Placement::Held
+        );
+        // Kept: it waits for its output rather than play elsewhere.
+        assert_eq!(
+            r(Some("gone"), Some("hifi"), None, &outputs, true),
+            at("gone")
+        );
+        assert_eq!(r(None, Some("gone"), None, &outputs, true), at("gone"));
+        assert_eq!(r(None, None, Some("gone"), &outputs, true), at("gone"));
+        assert_eq!(r(None, None, None, &outputs, true), Placement::Held);
         let outputs = [output("hifi", true)];
-        assert_eq!(resolve(None, None, &outputs), Placement::Default);
-        assert_eq!(resolve(None, None, &[]), Placement::Default);
+        assert_eq!(r(None, None, None, &outputs, true), at("hifi"));
+        assert_eq!(r(None, None, None, &[], true), Placement::Default);
     }
 
     #[test]
@@ -476,6 +688,7 @@ mod tests {
                 output: None,
                 volume: None,
                 layout: None,
+                parked: false,
                 used,
             });
         }

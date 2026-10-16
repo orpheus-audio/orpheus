@@ -29,7 +29,7 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `output create NAME DEVICE CHANNEL… [--layout LAYOUT]` | Creates an output that plays on chosen channels of another, for example channels 3 and 4 of an audio interface (see [inputs and outputs](#inputs-and-outputs)). Kept across restarts. |
 | `output remove OUTPUT` | Removes a created output. |
 | `wire FROM OUTPUT [OUT=IN…]` | Plays channels of a source or an input on an output (see [wires](#wires)): `L=R R=L` plays the input's right channel on the output's left and the other way round; without pairs, all channels go where they belong. A source with wires plays only on them. Kept across restarts. |
-| `unwire FROM OUTPUT [OUT=IN…]` | Removes a wire, or some of its channel pairs. A source left without wires plays on its output again. |
+| `unwire FROM OUTPUT [OUT=IN…]` | Removes a wire, or some of its channel pairs. A source left without wires is [parked](#lost-outputs) until played or wired again. |
 | `patch` | Shows the wires as a patch bay: for each output channel, everything that plays on it. |
 | `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
 | `default OUTPUT` | Makes `OUTPUT` (as for `set-type`) the default output, where applications play and received streams without an output of their own go; a route's sink works too, so that the node's audio goes to the peer. The same as choosing it in the desktop's sound settings, for nodes without a desktop. The audio system keeps it across restarts. |
@@ -252,8 +252,11 @@ else their address. Each source gets an ID of 8 characters, like a node.
   [state directory](configuration.md#files).
 - **Playing:** when a source plays again, its stream starts on the
   remembered output at the remembered volume. If that output is missing,
-  it plays on `[receiver] default_output`, else on the audio system's
-  default output, and moves back when the output returns.
+  the stream waits for it; see [lost outputs](#lost-outputs). Without one
+  remembered it plays on `[receiver] default_output`, else on the audio
+  system's default output, and follows that default when you change it.
+- **Moving:** `orpheusctl play` puts the stream on the output in place of
+  any [wires](#wires) of its source, in one step.
 - **Not passed on:** a stream from another node is never played into a
   sink to another node unless you choose that. If the only output left is
   such a sink (the default output is one, as on a desktop that sends its
@@ -275,6 +278,35 @@ orpheusctl forget-source Desk
 
 WirePlumber restores nothing for these streams: they carry
 `state.restore-props` and `state.restore-target` set to `false`.
+
+### Lost outputs
+
+A stream never moves to another room by itself. When the output it plays
+on goes away (a speaker switched off, a USB or Bluetooth device gone, the
+default output removed), the stream waits there, unlinked, and plays
+again as soon as the output is back:
+
+- **Hiccups:** an output back within `[receiver] lost_after_ms` (2 s) is
+  not lost; the stream just carries on.
+- **Lost:** after that the stream is parked. `orpheusctl status` shows
+  `parked: Kitchen speaker is gone`, the API the receiver's `parked`.
+  Play it elsewhere with `orpheusctl play`, or bring the output back.
+- **Last wire removed:** removing a source's last [wire](#wires) is a
+  stop, not a move back to its output: the source is parked until played
+  with `orpheusctl play` or wired again, also when it starts again later.
+- **`when_lost`:** `pause` (the default) is meant to pause the player on
+  the sending node; not yet, for now it parks. `park` parks. `default`
+  plays a lost stream where streams without an output play, after
+  `lost_after_ms`, and moves it back when its output returns; removing
+  the last wire then plays the source on its output again.
+
+```sh
+orpheusctl set receiver.when_lost=default
+orpheusctl set receiver.lost_after_ms=5000
+```
+
+GNOME's sound settings may go on showing a stream as playing on the
+output it lost; `orpheusctl status` is right.
 
 **Two volumes for one route.** The sink on the sending node ("Kitchen")
 and the stream on the receiving node both scale the same audio, and they

@@ -350,11 +350,23 @@ creates a playback stream, and reports the volume (`channelVolumes` and
 `mute` controls) and the output the user chose: a `target.object` or
 `target.node` in the default metadata that Orpheus did not write. Every
 second `sources.rs` records both and places each stream: the remembered
-output, else `default_output`, else the system default, or `Held` if that
-is a sink to another node. Moves go through the metadata (`-1` for the
-default, which also overrides a target in the stream's properties);
-holding connects the stream again without autoconnect, so WirePlumber
-leaves it unlinked. A new node's volume is set once it reports its
+output, else `default_output`, else the default the user chose
+(`default.configured.audio.sink`, which WirePlumber doesn't change when
+that output goes; else `default.audio.sink`) by name, or `Held` if that is
+a sink to another node. Moves go through the metadata, by the output's
+serial (the default's too: Orpheus follows the default itself); holding connects the stream again without autoconnect, so
+WirePlumber leaves it unlinked.
+
+The streams carry `node.dont-fallback` and `node.linger`: when their
+target goes, WirePlumber neither moves them to the default nor destroys
+them, they wait unlinked. A returning output has a new serial, which the
+metadata target doesn't match, so `sources.rs` places the stream again:
+when an output it noted as lost is back, or when a stream is not linked
+to an output that is there for a tick (it went and came back between two
+ticks). An output gone for `lost_after_ms` parks the stream (status
+`parked`); with `when_lost = "default"` the stream is placed as if it had
+no output remembered. A source whose last wire was removed is parked in
+`sources.json` (`parked`) and `Held` until played or wired again. A new node's volume is set once it reports its
 controls; without one remembered it starts at full volume on every
 channel, which WirePlumber's restore would otherwise have set, and
 without which mixers find no channels to set. Sinks to other nodes work

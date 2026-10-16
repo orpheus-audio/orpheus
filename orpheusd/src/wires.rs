@@ -16,7 +16,7 @@
 //! receivers and the inputs and outputs there are, and the engine keeps
 //! their links.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -187,15 +187,15 @@ impl Wires {
         }
     }
 
-    /// The sources that have wires.
-    pub fn sources(&self) -> BTreeSet<SourceId> {
-        self.list
-            .iter()
-            .filter_map(|w| match w.from {
-                Origin::Source(id) => Some(id),
-                Origin::Input(_) => None,
-            })
-            .collect()
+    /// The outputs each source with wires has them to.
+    pub fn outputs(&self) -> BTreeMap<SourceId, Vec<String>> {
+        let mut outputs: BTreeMap<SourceId, Vec<String>> = BTreeMap::new();
+        for w in &self.list {
+            if let Origin::Source(id) = w.from {
+                outputs.entry(id).or_default().push(w.output.clone());
+            }
+        }
+        outputs
     }
 }
 

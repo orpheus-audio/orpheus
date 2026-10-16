@@ -68,6 +68,13 @@ pub trait AudioBackend: Send {
         Vec::new()
     }
 
+    /// The output the user made the default, by machine name, also while
+    /// it is missing; unlike the default in [`outputs`](Self::outputs),
+    /// which the audio system changes by itself when that one goes.
+    fn chosen_default(&self) -> Option<String> {
+        None
+    }
+
     /// The audio system's inputs: microphones, line-ins.
     fn inputs(&self) -> Vec<Input> {
         Vec::new()
@@ -163,8 +170,9 @@ pub enum Placement {
     /// Wherever the audio system plays streams that name no output.
     #[default]
     Default,
-    /// On this output, by its machine name; on the default one while it
-    /// is missing.
+    /// On this output, by its machine name. While it is missing the
+    /// stream plays nowhere, also after it went; placing it again links it
+    /// to the output when back.
     Output(String),
     /// Nowhere: the stream is not linked to any output.
     Held,

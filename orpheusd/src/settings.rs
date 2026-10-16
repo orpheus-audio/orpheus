@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
 
-use crate::config::{Accept, Claim, Config, Policy};
+use crate::config::{Accept, Claim, Config, Policy, WhenLost};
 
 /// The settings in effect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -65,6 +65,11 @@ pub struct ReceiverSettings {
     /// Where streams play that have no output remembered; `null` for the
     /// audio system's default output.
     pub default_output: Option<String>,
+    /// What happens to a stream whose output goes away: `pause`, `park`
+    /// or `default`.
+    pub when_lost: WhenLost,
+    /// How long an output may be gone before it counts as lost.
+    pub lost_after_ms: u32,
 }
 
 /// The routes this node sends.
@@ -109,6 +114,9 @@ pub enum Source {
     Api,
 }
 
+/// The longest an output may be gone before it counts as lost.
+const MAX_LOST_AFTER_MS: u32 = 60_000;
+
 /// The longest link offset; the jitter buffer holds twice as much.
 const MAX_LINK_OFFSET_MS: u32 = 1000;
 
@@ -135,6 +143,8 @@ impl Settings {
                 duck_db: r.duck_db,
                 link_offset_ms: r.link_offset_ms,
                 default_output: r.default_output.clone(),
+                when_lost: r.when_lost,
+                lost_after_ms: r.lost_after_ms,
             },
             sender: SenderSettings {
                 claim: config.sender.claim,
@@ -162,6 +172,11 @@ impl Settings {
         if !(1..=MAX_LINK_OFFSET_MS).contains(&r.link_offset_ms) {
             return Err(format!(
                 "[receiver] link_offset_ms must be 1 to {MAX_LINK_OFFSET_MS}"
+            ));
+        }
+        if r.lost_after_ms > MAX_LOST_AFTER_MS {
+            return Err(format!(
+                "[receiver] lost_after_ms must be 0 to {MAX_LOST_AFTER_MS}"
             ));
         }
         if self.sender.release_after_s == 0 {
@@ -393,6 +408,14 @@ mod tests {
                 .is_err()
         );
         assert!(s.patch(&json!({"sender": {"release_after_s": 0}})).is_err());
+        assert!(
+            s.patch(&json!({"receiver": {"when_lost": "move"}}))
+                .is_err()
+        );
+        assert!(
+            s.patch(&json!({"receiver": {"lost_after_ms": 600_000}}))
+                .is_err()
+        );
         assert!(s.patch(&json!({"sender": {"claim": "never"}})).is_err());
         assert!(s.patch(&json!([])).is_err());
     }

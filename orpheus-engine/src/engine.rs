@@ -274,6 +274,11 @@ impl Engine {
         self.backend.outputs()
     }
 
+    /// See [`AudioBackend::chosen_default`].
+    pub fn chosen_default(&self) -> Option<String> {
+        self.backend.chosen_default()
+    }
+
     /// The audio system's inputs.
     pub fn inputs(&self) -> Vec<Input> {
         self.backend.inputs()

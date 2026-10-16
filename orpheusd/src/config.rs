@@ -151,6 +151,12 @@ pub struct ReceiverConfig {
     /// Where streams play that have no output remembered, by machine name;
     /// `None` for the audio system's default output.
     pub default_output: Option<String>,
+    /// What happens to a stream whose output goes away.
+    pub when_lost: WhenLost,
+    /// How long an output may be gone before it counts as lost: a stream
+    /// keeps its place over shorter gaps, such as a Bluetooth speaker
+    /// reconnecting.
+    pub lost_after_ms: u32,
 }
 
 impl Default for ReceiverConfig {
@@ -164,6 +170,8 @@ impl Default for ReceiverConfig {
             policy: Policy::default(),
             duck_db: 20.0,
             default_output: None,
+            when_lost: WhenLost::default(),
+            lost_after_ms: 2000,
         }
     }
 }
@@ -193,6 +201,23 @@ pub enum Policy {
     First,
     /// All of them.
     Mix,
+}
+
+/// What happens to a stream whose output goes away (switched off,
+/// unplugged, gone with its node). It never plays somewhere else by itself,
+/// unless told to with `default`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WhenLost {
+    /// Pauses the player on the sending node where it can tell which one
+    /// plays the stream; else parks it. Not yet: it parks.
+    #[default]
+    Pause,
+    /// Parks it: it plays nowhere until its output is back or it is played
+    /// elsewhere.
+    Park,
+    /// Plays it where streams without an output play.
+    Default,
 }
 
 /// The routes this node sends: when they hold a receiver on the peer.

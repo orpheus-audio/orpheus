@@ -14,7 +14,7 @@
 | M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes (through WirePlumber) | done, except the two-box test |
 | — | Route identity: stable route and source IDs, output and volume remembered per source, claiming the peer's receiver on play, default output | done |
 | M6 | Configurability: settings over the API (clock, receivers, senders), PTP that retries and holds over, WebSocket state stream, output selection, BCP-004, IS-08 per receiver (removed again in M7, replaced by wires) | done, except the two-box test |
-| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display done |
+| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking) done |
 
 After M7 the API should be stable enough for the web UI.
 
@@ -35,6 +35,16 @@ and Bluetooth inputs.
   set per source instead.
 - Wires have no gain: channels folded or summed onto one output channel
   are not turned down and can clip. Gain per wire comes later, with AES70.
+- A stream whose output goes is parked, not paused: `when_lost = "pause"`
+  doesn't pause the player on the sending node yet. The sending node's
+  sink doesn't show that the far side lost its output.
+- GNOME's sound settings keep showing a parked stream on the output it
+  lost, and a stream on the default output may show as playing on the
+  default for up to 2 s after its own went.
+- A stream on the default output follows the default the user chose
+  (`default.configured.audio.sink`). Where nobody ever chose one, it
+  follows WirePlumber's, which changes by itself when that device goes,
+  and the stream moves along.
 - At most `[receiver] max` (8, up to 32) streams per node; the next
   `connect` needs `--force`.
 - The policy decides by sound, not by what a stream is: a stream of near

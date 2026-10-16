@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request, State};
@@ -287,7 +288,7 @@ struct ReceiverEntry {
     #[schema(value_type = String, example = "speaker")]
     output: OutputType,
     /// The output it plays on: the one its stream is linked to, else the
-    /// default.
+    /// default; absent while its own output is gone.
     #[serde(skip_serializing_if = "Option::is_none")]
     plays_on: Option<String>,
     /// The stream plays nowhere: the default output is a sink to another
@@ -299,6 +300,10 @@ struct ReceiverEntry {
     /// output of its own.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     wired: bool,
+    /// The stream plays nowhere until its output is back or it is played
+    /// elsewhere; absent while it plays.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parked: Option<ParkedEntry>,
     /// The channels of the output it plays on.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<LayoutChannel>>)]
@@ -307,6 +312,49 @@ struct ReceiverEntry {
     /// absent where they match.
     #[serde(skip_serializing_if = "Option::is_none")]
     mix: Option<crate::mix::Mix>,
+}
+
+/// Why a stream plays nowhere.
+#[derive(Serialize, ToSchema)]
+struct ParkedEntry {
+    why: ParkedWhy,
+    /// The output that went, by machine name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    /// What it was called.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+enum ParkedWhy {
+    /// Its output (or every output its wires go to) is gone for
+    /// `[receiver] lost_after_ms` or more.
+    Lost,
+    /// The user removed its last wire.
+    Unwired,
+}
+
+impl From<crate::sources::Parked> for ParkedEntry {
+    fn from(p: crate::sources::Parked) -> Self {
+        use crate::sources::Parked;
+        match p {
+            Parked::Lost {
+                output,
+                description,
+            } => Self {
+                why: ParkedWhy::Lost,
+                output: Some(output),
+                description: Some(description),
+            },
+            Parked::Unwired => Self {
+                why: ParkedWhy::Unwired,
+                output: None,
+                description: None,
+            },
+        }
+    }
 }
 
 /// An output of the audio system.
@@ -672,12 +720,17 @@ fn status_of(node: &Node) -> Status {
     let mut engine = engine;
     let view = crate::outputs::View::of(node);
     let mixer = node.mixer.lock().unwrap();
-    let (held, wired): (Vec<ReceiverId>, Vec<ReceiverId>) = {
+    let lost_after = Duration::from_millis(node.settings().receiver.lost_after_ms.into());
+    let (held, wired, lost, mut parked) = {
         let sources = node.sources.lock().unwrap();
         let ids = || ports.iter().map(|p| p.0);
         (
-            ids().filter(|&id| sources.held(id)).collect(),
-            ids().filter(|&id| sources.on_wires(id)).collect(),
+            ids().filter(|&id| sources.held(id)).collect::<Vec<_>>(),
+            ids().filter(|&id| sources.on_wires(id)).collect::<Vec<_>>(),
+            ids().filter(|&id| sources.lost(id)).collect::<Vec<_>>(),
+            ids()
+                .filter_map(|id| Some((id, sources.parked(id, lost_after)?)))
+                .collect::<BTreeMap<_, _>>(),
         )
     };
     let receivers = ports
@@ -688,9 +741,11 @@ fn status_of(node: &Node) -> Status {
                 .iter()
                 .position(|(r, _)| *r == id)
                 .map(|i| engine.receivers.remove(i).1);
+            let parked = parked.remove(&id);
+            // Not on the default while it waits for its own.
             let on = view
                 .receiver(id)
-                .filter(|_| !held.contains(&id) && !wired.contains(&id));
+                .filter(|_| !held.contains(&id) && !wired.contains(&id) && !lost.contains(&id));
             let layout = layouts.remove(&id);
             let mix = layout
                 .as_ref()
@@ -709,6 +764,7 @@ fn status_of(node: &Node) -> Status {
                 plays_on: on.map(|o| o.description.clone()),
                 held: held.contains(&id),
                 wired: wired.contains(&id),
+                parked: parked.map(Into::into),
                 output_channels: on.map(|o| o.channels.clone()),
                 mix,
             }
@@ -1766,6 +1822,9 @@ async fn set_wire(
             }
         }
         node.wires.lock().unwrap().set(wire.clone());
+        if let Origin::Source(id) = wire.from {
+            node.sources.lock().unwrap().park(id, false);
+        }
         tracing::info!(from = %from_name, output = %wire.output, "wired");
         crate::sources::follow(&node);
         crate::wires::follow(&node);
@@ -1775,7 +1834,9 @@ async fn set_wire(
 }
 
 /// Removes the wire between a source or an input and an output. A source
-/// left without wires plays on its output again.
+/// left without wires is parked: it plays nowhere until played on an output
+/// or wired again; with `[receiver] when_lost = "default"` it plays on its
+/// output again.
 #[utoipa::path(
     delete,
     path = "/x-orpheus/v1/wires",
@@ -1803,10 +1864,22 @@ async fn remove_wire(
         }
     };
     blocking(move || {
-        if !node.wires.lock().unwrap().remove(&from, &q.output) {
-            return Err((StatusCode::NOT_FOUND, "no such wire".into()));
-        }
+        let left = {
+            let mut wires = node.wires.lock().unwrap();
+            if !wires.remove(&from, &q.output) {
+                return Err((StatusCode::NOT_FOUND, "no such wire".into()));
+            }
+            wires.outputs()
+        };
         tracing::info!(from = ?from, output = %q.output, "unwired");
+        // Its last wire: stopped on purpose, not moved to its output.
+        if let Origin::Source(id) = from
+            && !left.contains_key(&id)
+            && node.settings().receiver.when_lost != crate::config::WhenLost::Default
+            && node.sources.lock().unwrap().park(id, true)
+        {
+            tracing::info!(%id, "source parked");
+        }
         crate::sources::follow(&node);
         crate::wires::follow(&node);
         Ok(StatusCode::NO_CONTENT)
@@ -2009,7 +2082,7 @@ async fn clear_receiver_output(
 }
 
 /// Moves receiver `id`'s stream to `output`, or with `None` to the
-/// default output.
+/// default output, in place of any wires of its source.
 fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCode, Fail> {
     let Some(engine) = &node.engine else {
         return Err((StatusCode::SERVICE_UNAVAILABLE, "no audio system".into()));
@@ -2032,9 +2105,16 @@ fn play_on(node: &Node, id: ReceiverId, output: Option<&str>) -> Result<StatusCo
     match engine.set_receiver_output(id, output) {
         Ok(true) => {
             if let Some(key) = engine.receiver_key(id).flatten() {
-                node.sources.lock().unwrap().choose(key, output);
+                let mut sources = node.sources.lock().unwrap();
+                sources.choose(key, output);
+                if let Some(s) = sources.get(key) {
+                    node.wires.lock().unwrap().remove_source(s.id);
+                }
             }
+            drop(engine);
             tracing::info!(id, output = output.unwrap_or("default"), "receiver output");
+            crate::sources::follow(node);
+            crate::wires::follow(node);
             Ok(StatusCode::NO_CONTENT)
         }
         Ok(false) => Err((

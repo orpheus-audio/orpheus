@@ -40,7 +40,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use orpheus_core::{Layout, OutputType};
 use orpheus_engine::{
-    Engine, Filter, Group, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId, Volume,
+    Engine, Filter, Group, Placement, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId,
+    Volume,
 };
 use orpheus_nmos::is04::Version;
 use orpheus_nmos::is05::{
@@ -1715,11 +1716,17 @@ fn apply_receiver(
             node.sources.lock().unwrap().played(k, &shown, from)
         });
         let output = remembered.as_ref().and_then(|s| s.output.as_deref());
-        let placement = crate::sources::resolve(
-            output,
-            settings.default_output.as_deref(),
-            &engine.outputs(),
-        );
+        let placement = if remembered.as_ref().is_some_and(|s| s.parked) {
+            Placement::Held
+        } else {
+            crate::sources::resolve(
+                output,
+                settings.default_output.as_deref(),
+                engine.chosen_default().as_deref(),
+                &engine.outputs(),
+                settings.when_lost != crate::config::WhenLost::Default,
+            )
+        };
         engine
             .start_receiver(
                 id,
