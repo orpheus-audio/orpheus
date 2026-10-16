@@ -342,20 +342,38 @@ pub struct Playing {
     pub jitter: bool,
     /// Whether its policy mutes or ducks the stream.
     pub held: Option<State>,
+    /// Why it plays the stream nowhere, if it parked it.
+    pub parked: Option<Parked>,
+}
+
+/// Why a peer's receiver plays its stream nowhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Parked {
+    /// The output it played on went: switched off, unplugged, out of reach.
+    Lost,
+    /// Its user removed the stream's last wire.
+    Unwired,
 }
 
 /// Asks a peer's receiver what it plays and on what.
 pub fn playing(of: &PeerReceiver) -> Result<Playing, Fail> {
     let r = get(&of.api, &format!("/x-nmos/node/v1.3/receivers/{}", of.id))?;
+    let state = r["tags"][TAG_STATE][0].as_str();
     Ok(Playing {
         output: form_factor(&r),
         sender: holder(&r),
         jitter: r["tags"][TAG_WARNINGS]
             .as_array()
             .is_some_and(|w| w.iter().any(|w| w == "jitter")),
-        held: match r["tags"][TAG_STATE][0].as_str() {
+        held: match state {
             Some("muted") => Some(State::Muted),
             Some("ducked") => Some(State::Ducked),
+            _ => None,
+        },
+        parked: match state {
+            Some("lost") => Some(Parked::Lost),
+            Some("parked") => Some(Parked::Unwired),
             _ => None,
         },
     })

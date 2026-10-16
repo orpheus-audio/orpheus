@@ -416,6 +416,9 @@ struct Sender {
     priority: Option<String>,
     /// The peer's receiver connected to it; absent if it only sends.
     receiver: Option<PeerLink>,
+    /// The sink is gone for now, while the peer can't play the stream.
+    #[serde(default)]
+    hidden: bool,
 }
 
 #[derive(Clone, Deserialize)]
@@ -423,6 +426,8 @@ struct PeerLink {
     state: String,
     /// `muted` or `ducked` by the peer's policy.
     policy: Option<String>,
+    /// `lost` or `unwired`: the peer plays the stream nowhere.
+    parked: Option<String>,
 }
 
 /// Another node, as found over mDNS.
@@ -1402,7 +1407,7 @@ fn route_state(p: Paint, state: Option<&str>) -> String {
         Some("idle") => p.mark(Level::Off, "idle, claims a receiver when audio plays"),
         Some("busy") => p.mark(Level::Warn, "waiting for a free receiver"),
         Some("incompatible") => p.mark(Level::Warn, "peer can't play this stream"),
-        Some("offline") => p.mark(Level::Off, "peer offline, sink hidden"),
+        Some("offline") => p.mark(Level::Off, "peer offline"),
         Some("unreachable") => p.mark(Level::Warn, "peer unreachable"),
         Some("disconnected") => p.mark(Level::Warn, "disconnected, paused"),
         Some(s) => p.mark(Level::Off, s),
@@ -2252,10 +2257,19 @@ fn peer_column(t: &Sender) -> String {
         Some("disconnected") => notes.push("disconnected, paused".to_owned()),
         Some("busy") => notes.push("waiting for a free receiver".to_owned()),
         Some("incompatible") => notes.push("peer can't play this stream".to_owned()),
-        Some("offline") => notes.push("peer offline, sink hidden".to_owned()),
+        Some("offline") => notes.push("peer offline".to_owned()),
         Some(s @ ("unreachable" | "connecting" | "idle")) => notes.push(s.to_owned()),
-        _ if !t.enabled => notes.push("off".into()),
+        _ if !t.enabled && !t.hidden => notes.push("off".into()),
         _ => {}
+    }
+    match t.receiver.as_ref().and_then(|r| r.parked.as_deref()) {
+        Some("lost") => notes.push("its output there is gone".into()),
+        Some("unwired") => notes.push("unwired there".into()),
+        Some(why) => notes.push(why.to_owned()),
+        None => {}
+    }
+    if t.hidden {
+        notes.push("sink hidden".into());
     }
     match t.receiver.as_ref().and_then(|r| r.policy.as_deref()) {
         Some("muted") => notes.push("muted by policy".into()),
@@ -2652,10 +2666,37 @@ Routes
         s.routes[0].receiver = Some(PeerLink {
             state: "disconnected".into(),
             policy: None,
+            parked: None,
         });
         let out = render(&s, Paint(false), Counts::Total);
         assert!(
             out.contains("  Kitchen  192.168.1.20:5004 (disconnected, paused)  "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn shows_why_the_peer_plays_nowhere() {
+        let mut s: Status = serde_json::from_str(STATUS).unwrap();
+        s.routes[0].receiver = Some(PeerLink {
+            state: "connected".into(),
+            policy: None,
+            parked: Some("lost".into()),
+        });
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("  Kitchen  192.168.1.20:5004 (its output there is gone)  "),
+            "{out}"
+        );
+        s.routes[0].receiver = Some(PeerLink {
+            state: "offline".into(),
+            policy: None,
+            parked: None,
+        });
+        s.routes[0].hidden = true;
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(
+            out.contains("  Kitchen  192.168.1.20:5004 (peer offline, sink hidden)  "),
             "{out}"
         );
     }
@@ -2670,6 +2711,7 @@ Routes
         s.routes[0].receiver = Some(PeerLink {
             state: "connected".into(),
             policy: Some("muted".into()),
+            parked: None,
         });
         s.routes[0].priority = Some("high".into());
         let out = render(&s, Paint(false), Counts::Total);

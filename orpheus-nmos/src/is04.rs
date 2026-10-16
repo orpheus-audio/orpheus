@@ -20,8 +20,10 @@ pub const TAG_FORM_FACTOR: &str = "urn:x-orpheus:form-factor";
 /// What a receiver warns its senders about: `jitter` if their packets
 /// arrive with a wide spread.
 pub const TAG_WARNINGS: &str = "urn:x-orpheus:warnings";
-/// What the receiving node's policy does to a receiver's stream: `muted`
-/// while another plays, or `ducked` under a high-priority one.
+/// What the receiving node does to a receiver's stream: `lost` while it
+/// plays nowhere because its output went, `parked` after its last wire was
+/// removed; else what the policy does: `muted` while another plays, or
+/// `ducked` under a high-priority one.
 pub const TAG_STATE: &str = "urn:x-orpheus:state";
 
 pub type Tags = BTreeMap<String, Vec<String>>;

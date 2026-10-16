@@ -238,6 +238,11 @@ pub trait StreamControl: Send {
     }
     /// For a playback stream: sets its volume.
     fn set_volume(&self, _volume: &Volume) {}
+    /// For a sink: whether anything plays into it; `None` if the backend
+    /// can't tell.
+    fn fed(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// Keeps a backend stream alive; dropping it removes the stream.
@@ -272,6 +277,11 @@ impl StreamHandle {
         if let Some(c) = &self.control {
             c.set_remote(remote);
         }
+    }
+
+    /// Whether anything plays into a sink, where the backend can tell.
+    pub fn fed(&self) -> Option<bool> {
+        self.control.as_ref().and_then(|c| c.fed())
     }
 
     /// The output a playback stream plays on, where the backend knows.

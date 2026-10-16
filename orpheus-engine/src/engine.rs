@@ -52,6 +52,7 @@ struct Hidden {
     cfg: SenderConfig,
     route: Route,
     paused: bool,
+    note: Option<String>,
 }
 
 pub struct Engine {
@@ -174,6 +175,7 @@ impl Engine {
             cfg: sender.config(),
             route: sender.route(),
             paused: sender.paused(),
+            note: sender.note().map(str::to_owned),
         };
         drop(sender);
         self.hidden.insert(id, hidden);
@@ -185,7 +187,7 @@ impl Engine {
         let Some(h) = self.hidden.remove(&id) else {
             return Ok(false);
         };
-        let sender = match Sender::start(self.backend.as_mut(), self.clock.clone(), &h.cfg) {
+        let mut sender = match Sender::start(self.backend.as_mut(), self.clock.clone(), &h.cfg) {
             Ok(s) => s,
             Err(e) => {
                 self.hidden.insert(id, h);
@@ -193,6 +195,7 @@ impl Engine {
             }
         };
         sender.pause(h.paused);
+        sender.set_note(h.note.as_deref());
         let routed = sender.set_route(h.route);
         self.senders.insert(id, sender);
         routed.map(|()| true).map_err(Into::into)
@@ -393,6 +396,25 @@ impl Engine {
             return true;
         }
         self.senders.get_mut(&id).map(|s| s.rename(name)).is_some()
+    }
+
+    /// Shows `note` after a sender's sink's name, in brackets, or nothing
+    /// after it; the name itself stays. Returns whether the sender exists.
+    pub fn set_sender_note(&mut self, id: SenderId, note: Option<&str>) -> bool {
+        if let Some(h) = self.hidden.get_mut(&id) {
+            h.note = note.map(str::to_owned);
+            return true;
+        }
+        self.senders
+            .get_mut(&id)
+            .map(|s| s.set_note(note))
+            .is_some()
+    }
+
+    /// Whether anything plays into a sender's sink: `None` if it is hidden
+    /// or the audio system can't tell.
+    pub fn sender_fed(&self, id: SenderId) -> Option<bool> {
+        self.senders.get(&id)?.sink().fed()
     }
 
     /// Holds a sender's packets back, or lets them go again, whatever its

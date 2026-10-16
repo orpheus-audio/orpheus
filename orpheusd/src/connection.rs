@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::api::Node;
-use crate::config::{Accept, Claim, RTP_PORT, RoutesConfig};
+use crate::config::{Accept, Claim, RTP_PORT, RoutesConfig, WhenLost};
 use crate::nmos::FORMAT;
 use crate::nmos::{self, error};
 use crate::outputs;
@@ -243,6 +243,9 @@ struct Link {
     /// What the peer's policy does to the stream, if it holds it back.
     #[serde(skip)]
     held: Option<PolicyState>,
+    /// Why the peer's receiver plays the stream nowhere, if it parked it.
+    #[serde(skip)]
+    parked: Option<peer::Parked>,
     /// Another sender took the peer's receiver, and this one has not
     /// played since: it moves to a free receiver as soon as there is one.
     #[serde(skip)]
@@ -299,9 +302,9 @@ pub enum PeerState {
     /// capabilities don't fit). It pauses and tries again when the peer's
     /// receivers change.
     Incompatible,
-    /// The peer has been unreachable for a while and isn't pinned: the
-    /// sink is gone until the peer is back, so that applications play
-    /// elsewhere meanwhile.
+    /// The peer has been unreachable for a minute. The sink is hidden
+    /// once nothing plays into it, unless the peer is pinned (see
+    /// [`tend_sinks`]).
     Offline,
 }
 
@@ -328,6 +331,11 @@ pub struct PeerLink {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, example = "muted")]
     pub policy: Option<PolicyState>,
+    /// Why the peer's receiver plays the stream nowhere: `lost` while the
+    /// output it played on is gone, `unwired` after its user removed the
+    /// stream's last wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parked: Option<peer::Parked>,
     /// The receiver warns that the packets arrive with a wide spread.
     #[serde(skip)]
     pub jitter: bool,
@@ -386,6 +394,7 @@ impl Connections {
                         id: r.id,
                         state: l.state,
                         policy: l.held,
+                        parked: l.parked,
                         jitter: l.jitter,
                     },
                 ))
@@ -694,6 +703,7 @@ pub fn connect(
         state: PeerState::Connecting,
         jitter: false,
         held: None,
+        parked: None,
         displaced: false,
         output: target.output,
         receiver: Some(to.clone()),
@@ -801,6 +811,7 @@ fn retarget(
         link.state = PeerState::Connecting;
         link.jitter = false;
         link.held = None;
+        link.parked = None;
         link.unreachable_since = None;
     }
     conns.save(Some(&engine));
@@ -1068,6 +1079,7 @@ fn check_peers(node: &Node, watch: &mut Watch) {
             claim::release(node, id, &to);
         }
     }
+    tend_sinks(node);
 }
 
 /// The name a node is shown by here: the alias, else its announced name.
@@ -1262,9 +1274,50 @@ fn free_receiver(node: &Node, id: ReceiverId, sender: Uuid) {
     }
 }
 
-/// How long a peer may be unreachable before the sink to it goes, unless
-/// the peer is pinned.
+/// How long a peer may be unreachable before it counts as offline.
 const OFFLINE_AFTER: Duration = Duration::from_secs(60);
+
+/// Shown after the name of a sink whose peer can't play the stream.
+const UNAVAILABLE: &str = "unavailable";
+
+/// Shows each sender's sink as unavailable while its peer can't play the
+/// stream: unreachable for `lost_after_ms`, or its receiver parked the
+/// stream. Such a sink is hidden once nothing plays into it, unless the
+/// peer is pinned, so that the audio system moves no app elsewhere; it
+/// comes back with the peer. With `receiver.when_lost = "default"`, a
+/// sink is hidden once its peer is offline instead, and apps move on.
+fn tend_sinks(node: &Node) {
+    let Some(engine) = &node.engine else {
+        return;
+    };
+    let receiver = node.settings().receiver;
+    let lost_after = Duration::from_millis(receiver.lost_after_ms.into());
+    let move_on = receiver.when_lost == WhenLost::Default;
+    let conns = node.connections.lock().unwrap();
+    let mut engine = engine.lock().unwrap();
+    for (&id, link) in &conns.links {
+        let unreachable = link
+            .unreachable_since
+            .is_some_and(|t| t.elapsed() >= lost_after);
+        let unavailable = unreachable || link.parked.is_some();
+        engine.set_sender_note(id, unavailable.then_some(UNAVAILABLE));
+        let pinned = link
+            .receiver
+            .as_ref()
+            .and_then(|r| r.node.as_deref())
+            .is_some_and(|n| node.peers.lock().unwrap().pinned(n));
+        let gone =
+            !pinned && (link.state == PeerState::Offline || !move_on && link.parked.is_some());
+        let hidden = engine.sender_hidden(id);
+        if hidden && !gone {
+            tracing::info!(%id, "the peer can play the stream again; restoring its sink");
+            show(&mut engine, id);
+        } else if !hidden && gone && (move_on || engine.sender_fed(id) == Some(false)) {
+            tracing::info!(%id, "nothing plays into the unavailable sink; hiding it");
+            engine.hide_sender(id);
+        }
+    }
+}
 
 /// Takes in what a peer's receiver said at `asked`, or that it couldn't be
 /// asked. True if the receiver still plays the sender although it is idle,
@@ -1302,27 +1355,25 @@ fn update_link(
             }
             link.jitter = false;
             link.held = None;
+            link.parked = None;
             let since = *link.unreachable_since.get_or_insert(asked);
-            let pinned = to
-                .node
-                .as_deref()
-                .is_some_and(|n| node.peers.lock().unwrap().pinned(n));
-            if link.state == PeerState::Unreachable && !pinned && since.elapsed() >= OFFLINE_AFTER {
-                tracing::info!(%id, "peer offline; removing its sink until it is back");
-                engine.hide_sender(id);
+            if link.state == PeerState::Unreachable && since.elapsed() >= OFFLINE_AFTER {
+                tracing::info!(%id, "peer offline");
                 link.state = PeerState::Offline;
-            } else if link.state == PeerState::Offline && pinned {
-                show(&mut engine, id);
-                link.state = PeerState::Unreachable;
             }
         }
         Ok(p) => {
             link.unreachable_since = None;
-            if engine.sender_hidden(id) {
-                tracing::info!(%id, "peer back; restoring its sink");
-                show(&mut engine, id);
-            }
             link.jitter = p.jitter;
+            if p.parked != link.parked {
+                match p.parked {
+                    Some(why) => {
+                        tracing::info!(%id, ?why, "the peer's receiver plays the stream nowhere")
+                    }
+                    None => tracing::info!(%id, "the peer's receiver plays the stream again"),
+                }
+                link.parked = p.parked;
+            }
             if p.held != link.held {
                 tracing::info!(%id, held = ?p.held, "the peer's policy changed what it does to the stream");
                 link.held = p.held;

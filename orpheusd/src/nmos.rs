@@ -27,6 +27,7 @@ use orpheus_nmos::sdp::{self, RefClock};
 use orpheus_nmos::{Snapshot, Uuid, resource_id};
 
 use crate::api::{ClockSource, Node};
+use crate::sources::Parked;
 
 const CLOCK: &str = "clk0";
 /// What every sender sends and the receiver plays.
@@ -265,6 +266,7 @@ fn snapshot(node: &Node) -> Snapshot {
     };
 
     let view = crate::outputs::View::of(node);
+    let lost_after = Duration::from_millis(node.settings().receiver.lost_after_ms.into());
     for (id, active) in receivers {
         let mut base = Base {
             description: format!("receiver {id}"),
@@ -277,7 +279,14 @@ fn snapshot(node: &Node) -> Snapshot {
         if node.health.lock().unwrap().receiver_jitter(id) {
             base.tags.insert(TAG_WARNINGS.into(), vec!["jitter".into()]);
         }
-        if let Some(tag) = node.mixer.lock().unwrap().state(id).and_then(|s| s.tag()) {
+        // A parked stream plays nowhere, whatever the policy does to it.
+        let parked = node.sources.lock().unwrap().parked(id, lost_after);
+        let tag = match parked {
+            Some(Parked::Lost { .. }) => Some("lost"),
+            Some(Parked::Unwired) => Some("parked"),
+            None => node.mixer.lock().unwrap().state(id).and_then(|s| s.tag()),
+        };
+        if let Some(tag) = tag {
             base.tags.insert(TAG_STATE.into(), vec![tag.into()]);
         }
         snap.receivers.push(Receiver {

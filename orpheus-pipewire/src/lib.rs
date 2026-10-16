@@ -227,6 +227,12 @@ impl StreamControl for Control {
         self.graph.lock().unwrap().linked_sink(self.id)
     }
 
+    fn fed(&self) -> Option<bool> {
+        let g = self.graph.lock().unwrap();
+        let node = g.streams.get(&self.id)?;
+        Some(g.links.values().any(|l| l.input_node == *node))
+    }
+
     fn set_output(&self, name: Option<&str>) -> Result<(), BackendError> {
         let (reply, result) = mpsc::sync_channel(1);
         self.tx

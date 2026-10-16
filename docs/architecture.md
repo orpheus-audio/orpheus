@@ -245,11 +245,22 @@ if discovery doesn't see the peer. The peer
 watch ignores what a peer said before the last claim or release, and lets
 go of a receiver still connected to an idle route.
 
-A route whose peer has been unreachable for a minute, and isn't pinned,
-loses its sink (`offline`): the engine drops the sender and keeps its
-configuration, route and sink volume, and starts it again when the peer
-answers, so that applications play elsewhere meanwhile and find the same
-sink afterwards.
+A receiving node says in its receivers' state tag when it plays one's
+stream nowhere: `lost` while its output is gone (see below), `parked`
+after its last wire was removed; these win over the policy's `muted` and
+`ducked`. The tag changes the receiver's version and so the announced
+`ver_rcv`, on which the sending node asks again at once. While the peer can't play the stream (parked
+there, or unreachable for `lost_after_ms`), `tend_sinks` in
+`connection.rs` shows the sink with the note `unavailable`, which the
+engine puts after the name without changing it. It hides the sink once
+nothing is linked into it: links, not audio, so that a paused player's
+sink stays and the player moves nowhere when it resumes. Hiding drops
+the sender and keeps its configuration, route, note and sink volume;
+the engine starts it again when the peer can play the stream, so that
+applications find the same sink. Sinks to pinned peers stay; with
+`when_lost = "default"`, a sink is hidden once the peer has been
+unreachable for a minute (`offline`), linked or not, as WirePlumber then
+moves its applications on.
 
 `routes.json` in the state directory keeps, for each running route, its
 ID, name, last destination, the peer's output type and receiver; the

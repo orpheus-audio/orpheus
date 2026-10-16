@@ -110,11 +110,11 @@ arrive within a few seconds:
   play](#claiming-a-receiver-on-play) goes `idle` instead, and claims a
   receiver again the next time audio plays.
 - While the peer is offline or doesn't answer, `status` shows the sender as
-  `unreachable`. It keeps sending, so the audio is back when the peer is.
-  After a minute, unless the peer is [pinned](#aliases-and-pins), the sink
-  goes (`peer offline, sink hidden`), so that applications play on another
-  output meanwhile. It comes back with the peer, under the same name; if
-  it was the default output, it is the default again.
+  `unreachable`, after a minute `peer offline`. It keeps sending, so the
+  audio is back when the peer is. The sink shows that the peer can't play
+  the stream, and goes once nothing plays into it; see [lost
+  outputs](#lost-outputs). It comes back with the peer, under the same
+  name; if it was the default output, it is the default again.
 - When the peer's [policy](#several-streams) mutes or ducks the stream,
   `status` shows `muted by policy` or `ducked`. The sender keeps sending,
   so the peer can bring the stream back at once.
@@ -294,11 +294,22 @@ again as soon as the output is back:
 - **Last wire removed:** removing a source's last [wire](#wires) is a
   stop, not a move back to its output: the source is parked until played
   with `orpheusctl play` or wired again, also when it starts again later.
+- **On the sending node:** while the peer can't play the stream (its
+  output lost, its last wire removed, or the peer unreachable for
+  `lost_after_ms`), the route's sink is called `TV (unavailable)`, and
+  `status` shows `its output there is gone`, `unwired there` or
+  `unreachable`. The sink stays while an application plays into it, so
+  that the application moves nowhere else; a paused one counts too. Once
+  none does, the sink is hidden (`sink hidden`) until the peer can play
+  the stream again. Sinks to [pinned](#aliases-and-pins) nodes stay.
 - **`when_lost`:** `pause` (the default) is meant to pause the player on
   the sending node; not yet, for now it parks. `park` parks. `default`
   plays a lost stream where streams without an output play, after
   `lost_after_ms`, and moves it back when its output returns; removing
-  the last wire then plays the source on its output again.
+  the last wire then plays the source on its output again. On the
+  sending node, `default` hides a route's sink once the peer has been
+  offline for a minute, whatever plays into it, so that applications
+  move on to another output.
 
 ```sh
 orpheusctl set receiver.when_lost=default
@@ -306,7 +317,8 @@ orpheusctl set receiver.lost_after_ms=5000
 ```
 
 GNOME's sound settings may go on showing a stream as playing on the
-output it lost; `orpheusctl status` is right.
+output it lost, and show a sink by the name it had when it appeared,
+without `(unavailable)`; `orpheusctl status` is right.
 
 **Two volumes for one route.** The sink on the sending node ("Kitchen")
 and the stream on the receiving node both scale the same audio, and they
@@ -612,8 +624,12 @@ the sender's state:
   nothing is sent until audio plays.
 - `(unreachable)`: the peer is offline or doesn't answer. The sender keeps
   sending.
-- `(peer offline, sink hidden)`: the peer has been unreachable for a
-  minute; the sink is gone until the peer is back.
+- `(peer offline)`: the peer has been unreachable for a minute.
+- `(its output there is gone)`, `(unwired there)`: the peer plays the
+  stream nowhere (see [lost outputs](#lost-outputs)). The sender keeps
+  sending.
+- `(sink hidden)`: the peer can't play the stream and nothing played into
+  the sink, so it is gone until the peer can again.
 - `(connecting)`: `connect` is still setting up the peer's receiver.
 - `(muted by policy)`, `(ducked)`: the peer's [policy](#several-streams)
   holds the stream back. The sender keeps sending.
@@ -758,14 +774,17 @@ websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
   [wires](#wires).
 - `routes`: the routes that run. `playing` says whether applications play
   into the sink, `silent_ms` how long ago it last carried sound, and
-  `hidden` whether the sink is gone while the peer is offline.
+  `hidden` whether the sink is gone while the peer can't play the
+  stream.
   `routes[].receiver`: the peer's receiver, absent with `send_only`.
   `state` is `connecting`, `connected`, `disconnected`, `unreachable`,
   `idle` (let go after silence, see [claiming on
   play](#claiming-a-receiver-on-play)), `busy` (waiting for a free
   receiver), `incompatible` (no receiver of the peer can play the stream)
-  or `offline` (the sink hidden);
-  `policy` is `muted` or `ducked` while the peer holds the stream back.
+  or `offline` (unreachable for a minute);
+  `policy` is `muted` or `ducked` while the peer holds the stream back;
+  `parked` is `lost` or `unwired` while the peer plays it nowhere (see
+  [lost outputs](#lost-outputs)).
 - `warnings`: a list of `{kind, on, sender, message}`, see
   [warnings](#warnings).
 

@@ -194,7 +194,7 @@ pub struct SenderStatus {
     /// Time since the sink last carried sound (above −60 dBFS), in
     /// milliseconds; `None` if it never did.
     pub silent_ms: Option<u64>,
-    /// The sink is gone for now, while the peer is offline.
+    /// The sink is gone for now, while the peer can't play the stream.
     pub hidden: bool,
 }
 
@@ -211,6 +211,8 @@ pub(crate) struct Sender {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     sink: StreamHandle,
+    /// Shown after the sink's name, in brackets.
+    note: Option<String>,
 }
 
 impl Sender {
@@ -226,8 +228,28 @@ impl Sender {
 
     /// Shows the sink under another name.
     pub fn rename(&mut self, name: &str) {
-        self.sink.describe(name);
         self.cfg.description = name.to_owned();
+        self.sink.describe(&self.label());
+    }
+
+    /// Shows `note` after the sink's name, or nothing after it again.
+    pub fn set_note(&mut self, note: Option<&str>) {
+        if self.note.as_deref() != note {
+            self.note = note.map(str::to_owned);
+            self.sink.describe(&self.label());
+        }
+    }
+
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref()
+    }
+
+    /// The name the sink is shown by, with the note.
+    fn label(&self) -> String {
+        match &self.note {
+            Some(note) => format!("{} ({note})", self.cfg.description),
+            None => self.cfg.description.clone(),
+        }
     }
 
     /// Stops or resumes sending, whatever the route says.
@@ -323,6 +345,7 @@ impl Sender {
             stop,
             thread: Some(thread),
             sink,
+            note: None,
         })
     }
 
