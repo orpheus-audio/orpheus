@@ -306,6 +306,19 @@ places the channels accordingly: `L` and `R` on the front left and right,
 undefined ones as numbered AUX channels, which PipeWire passes on in
 order.
 
+Where the output has other channels than the stream, PipeWire mixes the
+stream onto them by position: 5.1 onto stereo is a downmix, stereo onto
+5.1 an upmix (PipeWire's own, which makes centre and rear channels up),
+and as many channels but other ones, such as dual mono onto stereo, a
+remix. `status` says so, so that no mix goes unnoticed:
+
+```
+Receiver 0     ● receiving from Laptop
+  channels     Left (L), Right (R)
+  output       speaker (Kitchen 5.1)
+  mix          upmix ST → 51
+```
+
 For a sender that says nothing or says it wrong, set the layout of its
 [source](#outputs-and-volume); a stream playing it restarts with it, and
 it is kept with the source:
@@ -389,13 +402,20 @@ mono onto every channel; the LFE is left out. Channels with no symbols in
 common go by number. Folded channels are summed as they are, not turned
 down, and can clip.
 
+`wire` and `patch` mark each channel that plays on another one as part of
+a mix with `⤵`, and say what the wire does: a downmix where it sums
+channels onto one or leaves some out (`downmix 51 → ST, LFE left out`), an
+upmix where it spreads one onto several. Stereo onto 5.1 plays on the
+front left and right only, which is no mix.
+
 What several wires bring into one output channel is summed, too.
 `patch` shows it as it is, every input on each output channel:
 
 ```
 Kitchen (orpheus.output.kitchen)
-  L  ← TV: R, USB mic: M1
-  R  ← TV: L, USB mic: M1
+  L  ← TV: R, USB mic: M1⤵
+  R  ← TV: L, USB mic: M1⤵
+  ⤵ USB mic: upmix M → ST
 
 Waiting
   Radio → Kitchen (all): Radio plays nowhere
@@ -602,7 +622,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `PUT /x-orpheus/v1/outputs/{name}/type` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}/type` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
 | `GET /x-orpheus/v1/inputs` | The [inputs](#inputs-and-outputs): `name`, `description`, `kind` (`receiver` or `device`), `receiver` (its ID, for a receiver) and `channels`. |
-| `GET /x-orpheus/v1/wires` | The [wires](#wires): `source` (ID) or `input` (machine name), `from_name`, `output`, `output_name`, `channels` (the pairs as set, absent for all), `links` (what it links now: `from` and `to` channel, counted from 1, and whether the audio system has made the link) and, while known, `from_channels` and `output_channels` as [layouts](#channel-layouts). |
+| `GET /x-orpheus/v1/wires` | The [wires](#wires): `source` (ID) or `input` (machine name), `from_name`, `output`, `output_name`, `channels` (the pairs as set, absent for all), `links` (what it links now: `from` and `to` channel, counted from 1, whether the audio system has made the link, and `folded` for a channel played on another one as part of a mix), `mix` (`downmix` or `upmix`, absent where each channel plays on its own), `dropped` (the channels a wire of all channels leaves out, such as the LFE) and, while known, `from_channels` and `output_channels` as [layouts](#channel-layouts). |
 | `PUT /x-orpheus/v1/wires` | Sets the wire between a source or input and an output, replacing one there. Body: `{"source": "<id>", "output": "<name>"}` or `{"input": "<name>", …}`, optionally with `"channels": [{"to": "L", "from": "R"}, {"to": 3, "from": 1}]`. Returns `200` with the wire as listed; `400` for a malformed request or no pairs, `422` if there is no such source, input or output, or no such channel, `503` without an audio system. |
 | `DELETE /x-orpheus/v1/wires?source=<id>&output=<name>` | Removes a wire; `input=<name>` instead of `source` for an input. Returns `204`; `400` without either, `404` if there is no such wire. |
 | `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
@@ -698,8 +718,11 @@ websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
   stream's channels carry, `symbol` and `label` per channel (see
   [channel layouts](#channel-layouts)); `state` is what the
   [policy](#several-streams) does to it: `silent`, `playing`, `muted` or
-  `ducked`. `plays_on` names the output it plays on; `held` says it
-  plays nowhere (see [warnings](#warnings)), `wired` that it plays on
+  `ducked`. `plays_on` names the output it plays on and
+  `output_channels` its channels; `mix` is how the audio system mixes the
+  stream onto them, `downmix`, `upmix` or `remix`, absent where they
+  match (see [channel layouts](#channel-layouts)). `held` says it plays
+  nowhere (see [warnings](#warnings)), `wired` that it plays on
   [wires](#wires).
 - `routes`: the routes that run. `playing` says whether applications play
   into the sink, `silent_ms` how long ago it last carried sound, and

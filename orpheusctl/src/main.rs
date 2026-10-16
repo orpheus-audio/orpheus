@@ -294,6 +294,11 @@ struct Receiver {
     wired: bool,
     /// What the stream's channels carry.
     layout: Option<Layout>,
+    /// The channels of the output it plays on.
+    output_channels: Option<Layout>,
+    /// How the audio system mixes the stream onto the output: `downmix`,
+    /// `upmix` or `remix`; absent where the channels match.
+    mix: Option<String>,
 }
 
 /// A running receiver's stream.
@@ -1061,6 +1066,11 @@ struct WireEntry {
     /// `{"to": …, "from": …}` as set; `None` for all channels.
     channels: Option<Vec<serde_json::Value>>,
     links: Vec<WireLink>,
+    /// `downmix` or `upmix`; absent where each channel plays on its own.
+    mix: Option<String>,
+    /// Input channels left out, from 1.
+    #[serde(default)]
+    dropped: Vec<usize>,
     from_channels: Option<Layout>,
     output_channels: Option<Layout>,
 }
@@ -1070,6 +1080,37 @@ struct WireLink {
     from: usize,
     to: usize,
     linked: bool,
+    /// Plays the channel on another one as part of a mix.
+    #[serde(default)]
+    folded: bool,
+}
+
+/// Marks a channel played on another one as part of a mix.
+const FOLDED: &str = "⤵";
+
+/// A mix in words, `downmix 51 → ST`, with what a wire leaves out.
+fn mix_text(mix: &str, from: Option<&Layout>, to: Option<&Layout>, dropped: &[usize]) -> String {
+    let mut text = match (from, to) {
+        (Some(f), Some(t)) => format!("{mix} {} → {}", short(f), short(t)),
+        _ => mix.to_owned(),
+    };
+    if !dropped.is_empty() {
+        let names: Vec<String> = dropped.iter().map(|&c| channel_name(from, c)).collect();
+        let _ = write!(text, ", {} left out", names.join(" "));
+    }
+    text
+}
+
+impl WireEntry {
+    fn mix_text(&self) -> Option<String> {
+        let mix = self.mix.as_deref()?;
+        Some(mix_text(
+            mix,
+            self.from_channels.as_ref(),
+            self.output_channels.as_ref(),
+            &self.dropped,
+        ))
+    }
 }
 
 /// Channel `n` (from 1) of `layout`: its symbol, with its label if it has
@@ -1115,13 +1156,19 @@ fn render_wire_set(w: &WireEntry, p: Paint) -> String {
         .iter()
         .map(|l| {
             format!(
-                "{}={}",
+                "{}={}{}",
                 channel_name(w.output_channels.as_ref(), l.to),
-                channel_name(w.from_channels.as_ref(), l.from)
+                channel_name(w.from_channels.as_ref(), l.from),
+                if l.folded { FOLDED } else { "" }
             )
         })
         .collect();
-    let _ = writeln!(o, ": {}", pairs.join(" "));
+    let _ = write!(o, ": {}", pairs.join(" "));
+    match w.mix_text() {
+        Some(mix) => writeln!(o, " ({mix})"),
+        None => writeln!(o),
+    }
+    .ok();
     o
 }
 
@@ -1160,9 +1207,10 @@ fn render_patch(wires: &[WireEntry], p: Paint) -> String {
                 .flat_map(|w| {
                     w.links.iter().filter(|l| l.to == *c).map(move |l| {
                         let text = format!(
-                            "{}: {}",
+                            "{}: {}{}",
                             w.from_name,
-                            channel_name(w.from_channels.as_ref(), l.from)
+                            channel_name(w.from_channels.as_ref(), l.from),
+                            if l.folded { FOLDED } else { "" }
                         );
                         if l.linked {
                             text
@@ -1173,6 +1221,11 @@ fn render_patch(wires: &[WireEntry], p: Paint) -> String {
                 })
                 .collect();
             let _ = writeln!(o, "  {label:<width$}  ← {}", feeds.join(", "));
+        }
+        for w in on.iter().filter(|w| !w.links.is_empty()) {
+            if let Some(mix) = w.mix_text() {
+                let _ = writeln!(o, "  {FOLDED} {}: {mix}", w.from_name);
+            }
         }
     }
     let idle: Vec<&WireEntry> = wires.iter().filter(|w| w.links.is_empty()).collect();
@@ -2072,6 +2125,10 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
             None => output.clone(),
         };
         row(o, p, "output", &output);
+        if let Some(mix) = &r.mix {
+            let text = mix_text(mix, r.layout.as_ref(), r.output_channels.as_ref(), &[]);
+            row(o, p, "mix", &text);
+        }
     }
     if r.priority.as_deref() == Some("high") {
         row(o, p, "priority", "high");
@@ -2493,6 +2550,42 @@ Routes
     }
 
     #[test]
+    fn patch_shows_mixes() {
+        let st = r#"[{"symbol": "L"}, {"symbol": "R"}]"#;
+        let six = r#"[{"symbol": "L"}, {"symbol": "R"}, {"symbol": "C"},
+                      {"symbol": "LFE"}, {"symbol": "Ls"}, {"symbol": "Rs"}]"#;
+        let link = |from: usize, to: usize, folded: bool| {
+            format!(r#"{{"from": {from}, "to": {to}, "linked": true, "folded": {folded}}}"#)
+        };
+        let links = [
+            link(1, 1, false),
+            link(2, 2, false),
+            link(3, 1, true),
+            link(3, 2, true),
+            link(5, 1, true),
+            link(6, 2, true),
+        ]
+        .join(",");
+        let wires: Vec<WireEntry> = serde_json::from_str(&format!(
+            r#"[{{"source": "6S0AGTEC", "from_name": "Film", "output": "tv",
+                  "output_name": "TV", "links": [{links}], "mix": "downmix",
+                  "dropped": [4], "from_channels": {six}, "output_channels": {st}}}]"#
+        ))
+        .unwrap();
+        assert_eq!(
+            render_patch(&wires, Paint(false)),
+            "TV (tv)\n  \
+             L  ← Film: L, Film: C⤵, Film: Ls⤵\n  \
+             R  ← Film: R, Film: C⤵, Film: Rs⤵\n  \
+             ⤵ Film: downmix 51 → ST, LFE left out\n"
+        );
+        assert_eq!(
+            render_wire_set(&wires[0], Paint(false)),
+            "Film → TV: L=L R=R L=C⤵ R=C⤵ L=Ls⤵ R=Rs⤵ (downmix 51 → ST, LFE left out)\n"
+        );
+    }
+
+    #[test]
     fn watch_shows_rates() {
         let prev: Status = serde_json::from_str(STATUS).unwrap();
         let mut s = prev.clone();
@@ -2594,6 +2687,11 @@ Routes
             out.contains("  output       speaker (Built-in Audio)\n"),
             "{out}"
         );
+        s.receivers[0].mix = Some("upmix".into());
+        s.receivers[0].output_channels = Some(Layout::parse("51").unwrap());
+        let out = render(&s, Paint(false), Counts::Total);
+        assert!(out.contains("  mix          upmix ST → 51\n"), "{out}");
+        s.receivers[0].mix = None;
         let r = s.receivers[0].stream.as_mut().unwrap();
         r.ssrc = None;
         r.peak_dbfs = None;

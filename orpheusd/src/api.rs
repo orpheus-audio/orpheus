@@ -299,6 +299,14 @@ struct ReceiverEntry {
     /// output of its own.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     wired: bool,
+    /// The channels of the output it plays on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Vec<LayoutChannel>>)]
+    output_channels: Option<Layout>,
+    /// How the audio system mixes the stream's channels to the output's;
+    /// absent where they match.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mix: Option<crate::mix::Mix>,
 }
 
 /// An output of the audio system.
@@ -680,22 +688,29 @@ fn status_of(node: &Node) -> Status {
                 .iter()
                 .position(|(r, _)| *r == id)
                 .map(|i| engine.receivers.remove(i).1);
+            let on = view
+                .receiver(id)
+                .filter(|_| !held.contains(&id) && !wired.contains(&id));
+            let layout = layouts.remove(&id);
+            let mix = layout
+                .as_ref()
+                .zip(on)
+                .and_then(|(l, o)| crate::mix::placed(l, &o.channels));
             ReceiverEntry {
                 id,
                 uuid: crate::connection::receiver_uuid(node, id),
                 port,
                 sender,
                 state: stream.as_ref().and(mixer.state(id)),
-                layout: layouts.remove(&id),
+                layout,
                 stream,
                 priority,
                 output: view.receiver_type(node, id),
-                plays_on: view
-                    .receiver(id)
-                    .filter(|_| !held.contains(&id) && !wired.contains(&id))
-                    .map(|o| o.description.clone()),
+                plays_on: on.map(|o| o.description.clone()),
                 held: held.contains(&id),
                 wired: wired.contains(&id),
+                output_channels: on.map(|o| o.channels.clone()),
+                mix,
             }
         })
         .collect();
@@ -1481,6 +1496,14 @@ struct WireEntry {
     /// The channels it links now; empty while the source plays nowhere
     /// or an end is missing.
     links: Vec<WireLink>,
+    /// How the links mix the channels; absent where each plays on its
+    /// own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mix: Option<crate::mix::Mix>,
+    /// The input channels a wire of all channels leaves out, such as the
+    /// LFE onto stereo, counted from 1.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    dropped: Vec<usize>,
     /// The channels of the source or input, while known.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<LayoutChannel>>)]
@@ -1500,6 +1523,10 @@ struct WireLink {
     to: usize,
     /// Whether the audio system has made the link.
     linked: bool,
+    /// It plays the channel on another one as part of a mix, such as the
+    /// centre on the left.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    folded: bool,
 }
 
 /// An output channel and the input channel played on it.
@@ -1594,13 +1621,19 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
         .enumerate()
         .map(|(i, w)| {
             let r = resolved.get(i);
+            let wired = r.and_then(|r| {
+                let (from, to) = (r.from_layout.as_ref()?, r.to_layout.as_ref()?);
+                Some(crate::mix::wired(&r.pairs, from, to, w.channels.is_none()))
+            });
             let links = r
                 .map(|r| {
                     r.links(w)
-                        .map(|l| WireLink {
+                        .enumerate()
+                        .map(|(i, l)| WireLink {
                             from: l.from_channel + 1,
                             to: l.to_channel + 1,
                             linked: made.contains(&l),
+                            folded: wired.as_ref().is_some_and(|m| m.folded[i]),
                         })
                         .collect()
                 })
@@ -1631,6 +1664,9 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
                     .map_or_else(|| w.output.clone(), |o| o.description.clone()),
                 channels: w.channels.clone(),
                 links,
+                mix: wired.as_ref().and_then(|m| m.mix),
+                dropped: wired
+                    .map_or_else(Vec::new, |m| m.dropped.into_iter().map(|c| c + 1).collect()),
                 from_channels: r.and_then(|r| r.from_layout.clone()),
                 output_channels: r.and_then(|r| r.to_layout.clone()),
             }

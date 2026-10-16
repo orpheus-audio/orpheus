@@ -6,6 +6,7 @@ mod connection;
 mod events;
 mod health;
 mod home;
+mod mix;
 mod network;
 mod nmos;
 mod outputs;
