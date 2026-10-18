@@ -6,6 +6,7 @@ mod connection;
 mod events;
 mod health;
 mod home;
+mod i18n;
 mod mix;
 mod network;
 mod nmos;

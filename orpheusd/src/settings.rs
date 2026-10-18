@@ -26,6 +26,7 @@ pub struct Settings {
     pub ptp: PtpSettings,
     pub receiver: ReceiverSettings,
     pub sender: SenderSettings,
+    pub ui: UiSettings,
 }
 
 /// Clock synchronization. A change restarts PTP; the clock keeps running.
@@ -84,6 +85,16 @@ pub struct SenderSettings {
     pub release_after_s: u32,
     /// How long sending fades in when it starts.
     pub fade_in_ms: u32,
+}
+
+/// What Orpheus shows in the audio system. A change shows from the next
+/// second on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct UiSettings {
+    /// The language of the names Orpheus gives, such as `de`; `null` for
+    /// the environment's (`LC_ALL`, `LC_MESSAGES`, `LANG`).
+    pub language: Option<String>,
 }
 
 /// The longest fade-in.
@@ -151,6 +162,9 @@ impl Settings {
                 release_after_s: config.sender.release_after_s,
                 fade_in_ms: config.sender.fade_in_ms,
             },
+            ui: UiSettings {
+                language: config.ui.language.clone(),
+            },
         }
     }
 
@@ -184,6 +198,13 @@ impl Settings {
         }
         if self.sender.fade_in_ms > MAX_FADE_IN_MS {
             return Err(format!("[sender] fade_in_ms must be 0 to {MAX_FADE_IN_MS}"));
+        }
+        if let Some(l) = &self.ui.language
+            && !crate::i18n::valid(l)
+        {
+            return Err(format!(
+                "[ui] language {l:?} is not a language tag, such as de"
+            ));
         }
         Ok(())
     }

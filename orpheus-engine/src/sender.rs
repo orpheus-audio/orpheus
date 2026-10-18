@@ -211,8 +211,8 @@ pub(crate) struct Sender {
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
     sink: StreamHandle,
-    /// Shown after the sink's name, in brackets.
-    note: Option<String>,
+    /// Shown instead of the sink's name.
+    label: Option<String>,
 }
 
 impl Sender {
@@ -226,30 +226,31 @@ impl Sender {
         self.cfg.remote = remote;
     }
 
-    /// Shows the sink under another name.
+    /// Gives the sink another name; while it has a
+    /// [label](Self::set_label), it goes on showing that.
     pub fn rename(&mut self, name: &str) {
         self.cfg.description = name.to_owned();
-        self.sink.describe(&self.label());
-    }
-
-    /// Shows `note` after the sink's name, or nothing after it again.
-    pub fn set_note(&mut self, note: Option<&str>) {
-        if self.note.as_deref() != note {
-            self.note = note.map(str::to_owned);
-            self.sink.describe(&self.label());
+        if self.label.is_none() {
+            self.sink.describe(name);
         }
     }
 
-    pub fn note(&self) -> Option<&str> {
-        self.note.as_deref()
+    /// Shows the sink under `label` instead of its name, or under its name
+    /// again.
+    pub fn set_label(&mut self, label: Option<&str>) {
+        if self.label.as_deref() != label {
+            self.label = label.map(str::to_owned);
+            self.sink.describe(label.unwrap_or(&self.cfg.description));
+        }
     }
 
-    /// The name the sink is shown by, with the note.
-    fn label(&self) -> String {
-        match &self.note {
-            Some(note) => format!("{} ({note})", self.cfg.description),
-            None => self.cfg.description.clone(),
-        }
+    /// The sink's name, without its label.
+    pub fn description(&self) -> &str {
+        &self.cfg.description
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
     }
 
     /// Stops or resumes sending, whatever the route says.
@@ -345,7 +346,7 @@ impl Sender {
             stop,
             thread: Some(thread),
             sink,
-            note: None,
+            label: None,
         })
     }
 

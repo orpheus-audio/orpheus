@@ -442,7 +442,19 @@ the PTP port in its thread, while the clock on top of the system clock
 keeps its time and rate (see [clock](clock.md#when-ptp-cant-run)); if
 the port can't start with them, the old settings stay. A new
 `link_offset_ms` restarts the running receivers; the policy, ducking,
-default output and sender settings are read where they are used.
+default output, sender and `ui` settings are read where they are used.
+
+## Languages
+
+`i18n.rs` gives the names Orpheus shows in the audio system, such as a
+sink's `TV (unavailable)`, in the user's language. The translations are
+Fluent files, `orpheusd/locales/<language>/orpheusd.ftl`, compiled in;
+English lies under every other language, so a missing translation shows
+English. The language is `[ui] language`, else the environment's (via
+`sys-locale`), negotiated against those there are (`de-AT` gets `de`).
+Each message is the whole name, so that a language can order it as it
+needs. A test checks that every language has every message. To add a
+language, add its file and its line in `LOCALES`.
 
 ## Events
 

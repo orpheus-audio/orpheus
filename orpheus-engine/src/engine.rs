@@ -52,7 +52,7 @@ struct Hidden {
     cfg: SenderConfig,
     route: Route,
     paused: bool,
-    note: Option<String>,
+    label: Option<String>,
 }
 
 pub struct Engine {
@@ -175,7 +175,7 @@ impl Engine {
             cfg: sender.config(),
             route: sender.route(),
             paused: sender.paused(),
-            note: sender.note().map(str::to_owned),
+            label: sender.label().map(str::to_owned),
         };
         drop(sender);
         self.hidden.insert(id, hidden);
@@ -195,7 +195,7 @@ impl Engine {
             }
         };
         sender.pause(h.paused);
-        sender.set_note(h.note.as_deref());
+        sender.set_label(h.label.as_deref());
         let routed = sender.set_route(h.route);
         self.senders.insert(id, sender);
         routed.map(|()| true).map_err(Into::into)
@@ -398,17 +398,26 @@ impl Engine {
         self.senders.get_mut(&id).map(|s| s.rename(name)).is_some()
     }
 
-    /// Shows `note` after a sender's sink's name, in brackets, or nothing
-    /// after it; the name itself stays. Returns whether the sender exists.
-    pub fn set_sender_note(&mut self, id: SenderId, note: Option<&str>) -> bool {
+    /// Shows a sender's sink under `label` instead of its name, or under
+    /// its name again; the name itself stays. Returns whether the sender
+    /// exists.
+    pub fn set_sender_label(&mut self, id: SenderId, label: Option<&str>) -> bool {
         if let Some(h) = self.hidden.get_mut(&id) {
-            h.note = note.map(str::to_owned);
+            h.label = label.map(str::to_owned);
             return true;
         }
         self.senders
             .get_mut(&id)
-            .map(|s| s.set_note(note))
+            .map(|s| s.set_label(label))
             .is_some()
+    }
+
+    /// The name of a sender's sink, without a label.
+    pub fn sender_name(&self, id: SenderId) -> Option<String> {
+        match self.hidden.get(&id) {
+            Some(h) => Some(h.cfg.description.clone()),
+            None => Some(self.senders.get(&id)?.description().to_owned()),
+        }
     }
 
     /// Whether anything plays into a sender's sink: `None` if it is hidden

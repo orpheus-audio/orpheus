@@ -1277,11 +1277,8 @@ fn free_receiver(node: &Node, id: ReceiverId, sender: Uuid) {
 /// How long a peer may be unreachable before it counts as offline.
 const OFFLINE_AFTER: Duration = Duration::from_secs(60);
 
-/// Shown after the name of a sink whose peer can't play the stream.
-const UNAVAILABLE: &str = "unavailable";
-
 /// Shows each sender's sink as unavailable while its peer can't play the
-/// stream: unreachable for `lost_after_ms`, or its receiver parked the
+/// stream (`TV (unavailable)`, in the [language](crate::i18n) set): unreachable for `lost_after_ms`, or its receiver parked the
 /// stream. Such a sink is hidden once nothing plays into it, unless the
 /// peer is pinned, so that the audio system moves no app elsewhere; it
 /// comes back with the peer. With `receiver.when_lost = "default"`, a
@@ -1290,7 +1287,9 @@ fn tend_sinks(node: &Node) {
     let Some(engine) = &node.engine else {
         return;
     };
-    let receiver = node.settings().receiver;
+    let settings = node.settings();
+    let texts = crate::i18n::texts(settings.ui.language.as_deref());
+    let receiver = settings.receiver;
     let lost_after = Duration::from_millis(receiver.lost_after_ms.into());
     let move_on = receiver.when_lost == WhenLost::Default;
     let conns = node.connections.lock().unwrap();
@@ -1300,7 +1299,10 @@ fn tend_sinks(node: &Node) {
             .unreachable_since
             .is_some_and(|t| t.elapsed() >= lost_after);
         let unavailable = unreachable || link.parked.is_some();
-        engine.set_sender_note(id, unavailable.then_some(UNAVAILABLE));
+        let label = unavailable
+            .then(|| Some(texts.sink_unavailable(&engine.sender_name(id)?)))
+            .flatten();
+        engine.set_sender_label(id, label.as_deref());
         let pinned = link
             .receiver
             .as_ref()

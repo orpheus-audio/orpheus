@@ -25,6 +25,7 @@ pub struct Config {
     pub sources: SourcesConfig,
     pub ptp: PtpConfig,
     pub loopback: LoopbackConfig,
+    pub ui: UiConfig,
     /// Icon names for other nodes' outputs, by output type, replacing the
     /// defaults (Linux: XDG icon names).
     pub icons: BTreeMap<OutputType, String>,
@@ -218,6 +219,15 @@ pub enum WhenLost {
     Park,
     /// Plays it where streams without an output play.
     Default,
+}
+
+/// What Orpheus shows in the audio system.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UiConfig {
+    /// The language of the names Orpheus gives, such as `de`; `None` for
+    /// the environment's.
+    pub language: Option<String>,
 }
 
 /// The routes this node sends: when they hold a receiver on the peer.

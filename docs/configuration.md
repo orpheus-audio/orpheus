@@ -46,7 +46,7 @@ restarts.
 Some keys can also be changed while the node runs, over the API or with
 `orpheusctl set` (see [settings](#settings-changed-over-the-api)): those
 of `[ptp]` except `enabled`, `[receiver]` except `enabled`, `port` and
-`max`, and all of `[sender]`.
+`max`, and all of `[sender]` and `[ui]`.
 
 ### Example
 
@@ -85,6 +85,9 @@ priority2 = 128
 slave_only = false
 step_threshold_us = 1000
 settle_threshold_us = 100
+
+[ui]
+# language = "de"
 ```
 
 ### Top level
@@ -238,6 +241,14 @@ Clock synchronization with the other nodes and with AES67 devices. See
 The PTP message rates follow the AES67 media profile and cannot be configured
 yet: sync every 125 ms, announce every 2 s, delay requests every second.
 
+### `[ui]`
+
+What Orpheus shows in the audio system's mixers.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `language` | none | The language of the names Orpheus gives, such as a sink's `TV (unavailable)`, as a language tag: `de`, `de-AT`. Without it, the environment's (`LC_ALL`, `LC_MESSAGES`, `LANG`). Orpheus speaks English and German; other languages get English. |
+
 ### `[icons]`
 
 Linux only. Icons for other nodes' outputs, by output type, as XDG icon
@@ -295,6 +306,7 @@ set over the API stays until it is reset.
 | `receiver` | `accept`, `policy`, `duck_db`, `default_output`, `when_lost`, `lost_after_ms` | at once |
 | `receiver` | `link_offset_ms` | at once; streams that play restart, with a short gap |
 | `sender` | `claim`, `release_after_s`, `fade_in_ms` | at once |
+| `ui` | `language` | within a second |
 
 The values are checked as in `config.toml`; a change with an unknown key
 or a value out of range is refused as a whole. The HTTP form is

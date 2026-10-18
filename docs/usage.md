@@ -296,7 +296,8 @@ again as soon as the output is back:
   with `orpheusctl play` or wired again, also when it starts again later.
 - **On the sending node:** while the peer can't play the stream (its
   output lost, its last wire removed, or the peer unreachable for
-  `lost_after_ms`), the route's sink is called `TV (unavailable)`, and
+  `lost_after_ms`), the route's sink is called `TV (unavailable)` (in
+  the [language](configuration.md#ui) set), and
   `status` shows `its output there is gone`, `unwired there` or
   `unreachable`. The sink stays while an application plays into it, so
   that the application moves nowhere else; a paused one counts too. Once
