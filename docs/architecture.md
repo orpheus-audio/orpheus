@@ -251,8 +251,9 @@ after its last wire was removed; these win over the policy's `muted` and
 `ducked`. The tag changes the receiver's version and so the announced
 `ver_rcv`, on which the sending node asks again at once. While the peer can't play the stream (parked
 there, or unreachable for `lost_after_ms`), `tend_sinks` in
-`connection.rs` shows the sink with the note `unavailable`, which the
-engine puts after the name without changing it. It hides the sink once
+`connection.rs` shows the sink under a label, `TV (unavailable)` (see
+[languages](#languages)), which the engine shows instead of the name
+without changing it. It hides the sink once
 nothing is linked into it: links, not audio, so that a paused player's
 sink stays and the player moves nowhere when it resumes. Hiding drops
 the sender and keeps its configuration, route, note and sink volume;
@@ -261,6 +262,20 @@ applications find the same sink. Sinks to pinned peers stay; with
 `when_lost = "default"`, a sink is hidden once the peer has been
 unreachable for a minute (`offline`), linked or not, as WirePlumber then
 moves its applications on.
+
+With `when_lost = "pause"`, a sink becoming unavailable also pauses
+players, in `players.rs`, through MPRIS on the session bus (`zbus`). The
+backend lists the streams applications play (`app_streams`: running
+`Stream/Output/Audio` nodes, the outputs they are linked to, and their
+client's `application.process.id`, kept only where `/proc` shows that
+process running the program the client names, which a process in another
+PID namespace, such as a Flatpak sandbox, fails). A player's process is
+the one its bus name belongs to (`GetConnectionUnixProcessID`), matched
+to the stream's process or its nearest parent running the same program,
+as browsers play from a helper process. A process is paused only if all
+its streams go to unavailable sinks; then each of its players that says
+`Playing` gets `Pause`. Without a session bus nothing is paused. Each
+sink pauses once, when it becomes unavailable; nothing resumes.
 
 `routes.json` in the state directory keeps, for each running route, its
 ID, name, last destination, the peer's output type and receiver; the

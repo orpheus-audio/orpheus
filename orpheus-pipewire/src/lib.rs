@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use orpheus_core::{AudioFormat, Layout, OutputType, Symbol};
 use orpheus_engine::{
-    AudioBackend, BackendError, CapturePort, Input, Link, Output, OutputSpec, Placement,
+    AppStream, AudioBackend, BackendError, CapturePort, Input, Link, Output, OutputSpec, Placement,
     PlaybackPort, StreamControl, StreamHandle, StreamSpec, Volume,
 };
 use pipewire::{self as pw, properties::properties, spa};
@@ -342,6 +342,10 @@ impl AudioBackend for PipeWireBackend {
             })
             .cloned()
             .collect()
+    }
+
+    fn app_streams(&self) -> Vec<AppStream> {
+        self.graph.lock().unwrap().app_streams()
     }
 
     fn set_default_output(&self, name: &str) -> Result<(), BackendError> {
@@ -1141,6 +1145,17 @@ struct Graph {
     /// The volume of our streams and where the user moved playback
     /// streams, by stream ID.
     playback: HashMap<u64, StreamState>,
+    /// Streams applications play, by node ID.
+    apps: HashMap<u32, AppNode>,
+    /// The process of each client, where it is sure, by client ID.
+    clients: HashMap<u32, Option<u32>>,
+}
+
+/// A stream an application plays.
+#[derive(Default)]
+struct AppNode {
+    client: Option<u32>,
+    running: bool,
 }
 
 #[derive(Default)]
@@ -1308,6 +1323,32 @@ impl Graph {
         self.links
             .values()
             .any(|l| l.output_port == output_port && l.input_port == input_port)
+    }
+
+    /// The running streams of applications, with the nodes they are
+    /// linked to.
+    fn app_streams(&self) -> Vec<AppStream> {
+        let ours: Vec<u32> = self.streams.values().copied().collect();
+        self.apps
+            .iter()
+            .filter(|(id, a)| a.running && !ours.contains(id))
+            .map(|(&id, a)| {
+                let mut outputs: Vec<String> = self
+                    .links
+                    .values()
+                    .filter(|l| l.output_node == id)
+                    .filter_map(|l| self.names.get(&l.input_node).cloned())
+                    .collect();
+                outputs.sort();
+                outputs.dedup();
+                AppStream {
+                    process: a
+                        .client
+                        .and_then(|c| self.clients.get(&c).copied().flatten()),
+                    outputs,
+                }
+            })
+            .collect()
     }
 
     /// The sink stream `id` is linked to.
@@ -1506,6 +1547,56 @@ fn watch_graph(
                         }
                         proxies.borrow_mut().insert(id, Box::new((node, listener)));
                     }
+                    pw::types::ObjectType::Node
+                        if get(*pw::keys::MEDIA_CLASS) == Some("Stream/Output/Audio") =>
+                    {
+                        let Ok(node) = registry.bind::<pw::node::Node, _>(global) else {
+                            return;
+                        };
+                        let listener = node
+                            .add_listener_local()
+                            .info({
+                                let graph = graph.clone();
+                                move |info| {
+                                    let running =
+                                        matches!(info.state(), pw::node::NodeState::Running);
+                                    if let Some(a) = graph.lock().unwrap().apps.get_mut(&id) {
+                                        a.running = running;
+                                    }
+                                }
+                            })
+                            .register();
+                        let client = get("client.id").and_then(|v| v.parse().ok());
+                        graph.lock().unwrap().apps.insert(
+                            id,
+                            AppNode {
+                                client,
+                                running: false,
+                            },
+                        );
+                        proxies.borrow_mut().insert(id, Box::new((node, listener)));
+                    }
+                    pw::types::ObjectType::Client => {
+                        let Ok(client) = registry.bind::<pw::client::Client, _>(global) else {
+                            return;
+                        };
+                        let listener = client
+                            .add_listener_local()
+                            .info({
+                                let graph = graph.clone();
+                                move |info| {
+                                    if let Some(props) = info.props() {
+                                        let process = process_of(|k| props.get(k));
+                                        graph.lock().unwrap().clients.insert(id, process);
+                                    }
+                                }
+                            })
+                            .register();
+                        graph.lock().unwrap().clients.insert(id, None);
+                        proxies
+                            .borrow_mut()
+                            .insert(id, Box::new((client, listener)));
+                    }
                     pw::types::ObjectType::Metadata if get("metadata.name") == Some("default") => {
                         let Ok(metadata) = registry.bind::<pw::metadata::Metadata, _>(global)
                         else {
@@ -1553,6 +1644,8 @@ fn watch_graph(
                 g.sinks.remove(&id);
                 g.sources.remove(&id);
                 g.names.remove(&id);
+                g.apps.remove(&id);
+                g.clients.remove(&id);
                 if g.links.remove(&id).is_some() || g.ports.remove(&id).is_some() {
                     g.changed = true;
                 }
@@ -1560,6 +1653,28 @@ fn watch_graph(
         })
         .register();
     Ok(Box::new((registry, listener, proxies)))
+}
+
+/// The process of a client, from its properties, where it is sure: the
+/// process ID it gives is checked against the program it names, which
+/// fails for one in another PID namespace (a Flatpak sandbox) or on
+/// another machine.
+fn process_of<'a>(get: impl Fn(&str) -> Option<&'a str>) -> Option<u32> {
+    let pid: u32 = get("application.process.id")?.parse().ok()?;
+    if let Some(machine) = get("application.process.machine-id")
+        && std::fs::read_to_string("/etc/machine-id").is_ok_and(|m| m.trim() != machine)
+    {
+        return None;
+    }
+    let binary = get("application.process.binary")?;
+    // Programs name either the file they run or the name they were run
+    // by (a link to it), which the kernel keeps cut to 15 bytes.
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap_or_default();
+    let comm = comm.trim_end();
+    let same = exe.is_some_and(|e| e.file_name().is_some_and(|n| n == binary))
+        || !comm.is_empty() && binary.get(..15).unwrap_or(binary) == comm;
+    same.then_some(pid)
 }
 
 /// Output `name` → `{"name":"…"}`, as the default is kept in metadata.

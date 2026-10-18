@@ -13,6 +13,7 @@ mod nmos;
 mod outputs;
 mod peer;
 mod peers;
+mod players;
 mod policy;
 mod settings;
 mod sources;

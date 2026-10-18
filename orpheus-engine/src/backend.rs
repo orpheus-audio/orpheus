@@ -107,6 +107,21 @@ pub trait AudioBackend: Send {
     fn links(&self) -> Vec<Link> {
         Vec::new()
     }
+
+    /// The streams applications play now, besides Orpheus's own.
+    fn app_streams(&self) -> Vec<AppStream> {
+        Vec::new()
+    }
+}
+
+/// A stream an application plays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppStream {
+    /// The ID of the process that plays it, where the audio system can
+    /// tell for sure.
+    pub process: Option<u32>,
+    /// The outputs it plays on, by machine name.
+    pub outputs: Vec<String>,
 }
 
 /// An output of the audio system, such as a sound card or another node's

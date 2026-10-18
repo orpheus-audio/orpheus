@@ -13,8 +13,8 @@ pub mod receiver;
 pub mod sender;
 
 pub use backend::{
-    AudioBackend, BackendError, Input, Link, Output, OutputSpec, Placement, StreamControl,
-    StreamHandle, StreamSpec, Volume,
+    AppStream, AudioBackend, BackendError, Input, Link, Output, OutputSpec, Placement,
+    StreamControl, StreamHandle, StreamSpec, Volume,
 };
 pub use engine::{Engine, EngineStatus, LoopbackConfig, ReceiverId, SenderId};
 pub use port::{CapturePort, PlaybackPort, PortStats, StatsSnapshot, port_pair};

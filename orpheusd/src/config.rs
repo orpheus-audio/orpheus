@@ -210,8 +210,9 @@ pub enum Policy {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WhenLost {
-    /// Pauses the player on the sending node where it can tell which one
-    /// plays the stream; else parks it. Not yet: it parks.
+    /// Pauses the player on the sending node where it can tell for sure
+    /// which one plays the stream and that player plays nowhere else;
+    /// else parks it.
     #[default]
     Pause,
     /// Parks it: it plays nowhere until its output is back or it is played

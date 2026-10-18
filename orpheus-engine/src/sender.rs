@@ -249,6 +249,11 @@ impl Sender {
         &self.cfg.description
     }
 
+    /// The sink's machine name.
+    pub fn sink_name(&self) -> &str {
+        &self.cfg.name
+    }
+
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
     }

@@ -303,8 +303,16 @@ again as soon as the output is back:
   that the application moves nowhere else; a paused one counts too. Once
   none does, the sink is hidden (`sink hidden`) until the peer can play
   the stream again. Sinks to [pinned](#aliases-and-pins) nodes stay.
-- **`when_lost`:** `pause` (the default) is meant to pause the player on
-  the sending node; not yet, for now it parks. `park` parks. `default`
+- **`when_lost`:** `pause` (the default) also pauses the player on the
+  sending node, as its pause button would, when the route's sink becomes
+  unavailable, so that the music doesn't run on unheard. Only where that
+  is sure: the player must be a media player the desktop can control
+  (MPRIS, like the play button in GNOME's top bar), Orpheus must be
+  able to tell that it is the one playing into the sink, and it must play
+  nowhere else; a player that also plays on another output goes on
+  playing, and its lost stream stays parked. Players in a Flatpak
+  sandbox are not paused. Resume it yourself once the output is back.
+  `park` only parks. `default`
   plays a lost stream where streams without an output play, after
   `lost_after_ms`, and moves it back when its output returns; removing
   the last wire then plays the source on its output again. On the

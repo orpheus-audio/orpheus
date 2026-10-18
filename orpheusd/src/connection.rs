@@ -26,7 +26,7 @@
 //! The parameters last activated are saved to `routes.json` in the state
 //! directory, as requested (with `auto`), and activated again at start.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1282,7 +1282,9 @@ const OFFLINE_AFTER: Duration = Duration::from_secs(60);
 /// stream. Such a sink is hidden once nothing plays into it, unless the
 /// peer is pinned, so that the audio system moves no app elsewhere; it
 /// comes back with the peer. With `receiver.when_lost = "default"`, a
-/// sink is hidden once its peer is offline instead, and apps move on.
+/// sink is hidden once its peer is offline instead, and apps move on; with
+/// `"pause"`, the [players](crate::players) playing into a sink that just
+/// became unavailable are paused where that is sure.
 fn tend_sinks(node: &Node) {
     let Some(engine) = &node.engine else {
         return;
@@ -1294,11 +1296,20 @@ fn tend_sinks(node: &Node) {
     let move_on = receiver.when_lost == WhenLost::Default;
     let conns = node.connections.lock().unwrap();
     let mut engine = engine.lock().unwrap();
+    // Sinks by machine name: unavailable now, and since this tick.
+    let mut gone_sinks = HashSet::new();
+    let mut lost_sinks = HashSet::new();
     for (&id, link) in &conns.links {
         let unreachable = link
             .unreachable_since
             .is_some_and(|t| t.elapsed() >= lost_after);
         let unavailable = unreachable || link.parked.is_some();
+        if unavailable && let Some(sink) = engine.sender_sink(id) {
+            if engine.sender_label(id).is_none() {
+                lost_sinks.insert(sink.to_owned());
+            }
+            gone_sinks.insert(sink.to_owned());
+        }
         let label = unavailable
             .then(|| Some(texts.sink_unavailable(&engine.sender_name(id)?)))
             .flatten();
@@ -1318,6 +1329,10 @@ fn tend_sinks(node: &Node) {
             tracing::info!(%id, "nothing plays into the unavailable sink; hiding it");
             engine.hide_sender(id);
         }
+    }
+    if receiver.when_lost == WhenLost::Pause && !lost_sinks.is_empty() {
+        let streams = engine.app_streams();
+        tokio::spawn(crate::players::pause(streams, lost_sinks, gone_sinks));
     }
 }
 

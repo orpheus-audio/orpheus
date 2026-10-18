@@ -7,8 +7,8 @@ use orpheus_clock::Clock;
 use orpheus_core::{AudioFormat, Layout, OutputType};
 
 use crate::backend::{
-    AudioBackend, BackendError, Input, Link, Output, OutputSpec, Placement, StreamHandle,
-    StreamSpec, Volume,
+    AppStream, AudioBackend, BackendError, Input, Link, Output, OutputSpec, Placement,
+    StreamHandle, StreamSpec, Volume,
 };
 use crate::port::{PortStats, StatsSnapshot, port_pair};
 use crate::receiver::{Filter, Receiver, ReceiverConfig, ReceiverStatus};
@@ -282,6 +282,11 @@ impl Engine {
         self.backend.chosen_default()
     }
 
+    /// The streams applications play now.
+    pub fn app_streams(&self) -> Vec<AppStream> {
+        self.backend.app_streams()
+    }
+
     /// The audio system's inputs.
     pub fn inputs(&self) -> Vec<Input> {
         self.backend.inputs()
@@ -417,6 +422,22 @@ impl Engine {
         match self.hidden.get(&id) {
             Some(h) => Some(h.cfg.description.clone()),
             None => Some(self.senders.get(&id)?.description().to_owned()),
+        }
+    }
+
+    /// A sender's label, if it has one.
+    pub fn sender_label(&self, id: SenderId) -> Option<&str> {
+        match self.hidden.get(&id) {
+            Some(h) => h.label.as_deref(),
+            None => self.senders.get(&id)?.label(),
+        }
+    }
+
+    /// The machine name of a sender's sink, also while it is hidden.
+    pub fn sender_sink(&self, id: SenderId) -> Option<&str> {
+        match self.hidden.get(&id) {
+            Some(h) => Some(&h.cfg.name),
+            None => Some(self.senders.get(&id)?.sink_name()),
         }
     }
 

@@ -33,6 +33,7 @@ fluent-bundle = "0.16"
 fluent-langneg = "0.13"
 unic-langid = { version = "0.9", features = ["macros"] }
 sys-locale = "0.3"
+zbus = { version = "6", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 fluent-syntax = "0.12"
