@@ -7,9 +7,10 @@
 //! channels, or a sink to another node. It names pairs of channels, each
 //! by number, symbol or label, or none: then the channels go where they
 //! belong, and what the output lacks is folded onto it (see
-//! [`auto_pairs`]). What several wires bring into one output channel is
-//! summed. A source with wires plays only on them, not on an output of its
-//! own.
+//! [`auto_pairs`]). A wire has a gain, and so has each pair; folded
+//! channels are turned down by [`FOLD_DB`] unless the pairs are chosen.
+//! What several wires bring into one output channel is summed. A source
+//! with wires plays only on them, not on an output of its own.
 //!
 //! The wires are kept in `wires.json` in the state directory. Every
 //! [`TICK`](crate::sources) they are resolved against the running
@@ -21,7 +22,7 @@ use std::fmt;
 use std::path::PathBuf;
 
 use orpheus_core::{Layout, SourceId, Symbol};
-use orpheus_engine::{Engine, Link};
+use orpheus_engine::{Engine, Link, gain};
 use serde::{Deserialize, Serialize};
 
 use crate::api::Node;
@@ -73,15 +74,26 @@ impl fmt::Display for Channel {
     }
 }
 
+/// How much a channel folded onto another is turned down, in dB, such as
+/// the centre onto left and right.
+pub const FOLD_DB: f32 = -3.0;
+
+pub fn is_zero(db: &f32) -> bool {
+    *db == 0.0
+}
+
 /// An output channel and the input channel played on it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pair {
     pub to: Channel,
     pub from: Channel,
+    /// Its gain in dB, on top of the wire's.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gain_db: f32,
 }
 
 /// Channels of a source or input played on an output.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(try_from = "Ends")]
 pub struct Wire {
     #[serde(flatten)]
@@ -91,6 +103,30 @@ pub struct Wire {
     /// The channels it links; `None` for all, where they belong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channels: Option<Vec<Pair>>,
+    /// Its gain in dB: 0 plays the channels as they are.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub gain_db: f32,
+    /// Silent, whatever the gain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mute: bool,
+}
+
+impl Wire {
+    /// Whether its gains are ones Orpheus takes; else what is wrong.
+    pub fn check_gains(&self) -> Result<(), String> {
+        let gains =
+            std::iter::once(self.gain_db).chain(self.channels.iter().flatten().map(|p| p.gain_db));
+        for db in gains {
+            if !gain::valid(db) {
+                return Err(format!(
+                    "a gain of {db} dB; gains go from {} to +{} dB",
+                    gain::MIN_DB,
+                    gain::MAX_DB
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A wire as written, with either end it may come from.
@@ -101,6 +137,10 @@ struct Ends {
     input: Option<String>,
     output: String,
     channels: Option<Vec<Pair>>,
+    #[serde(default)]
+    gain_db: f32,
+    #[serde(default)]
+    mute: bool,
 }
 
 impl TryFrom<Ends> for Wire {
@@ -116,6 +156,8 @@ impl TryFrom<Ends> for Wire {
             from,
             output: e.output,
             channels: e.channels,
+            gain_db: e.gain_db,
+            mute: e.mute,
         })
     }
 }
@@ -166,6 +208,29 @@ impl Wires {
         true
     }
 
+    /// Sets the gain and muting of the wire from `from` to `output`, as far
+    /// as given; `None` if there is no such wire, else the wire.
+    pub fn set_gain(
+        &mut self,
+        from: &Origin,
+        output: &str,
+        gain_db: Option<f32>,
+        mute: Option<bool>,
+    ) -> Option<Wire> {
+        let w = self
+            .list
+            .iter_mut()
+            .find(|w| w.from == *from && w.output == output)?;
+        let before = (w.gain_db, w.mute);
+        w.gain_db = gain_db.unwrap_or(w.gain_db);
+        w.mute = mute.unwrap_or(w.mute);
+        let wire = w.clone();
+        if (wire.gain_db, wire.mute) != before {
+            self.save();
+        }
+        Some(wire)
+    }
+
     /// Removes the wire from `from` to `output`; `false` if there is none.
     pub fn remove(&mut self, from: &Origin, output: &str) -> bool {
         let before = self.list.len();
@@ -200,19 +265,31 @@ impl Wires {
 }
 
 /// The channel pairs, input then output channel, that a wire with
-/// `channels` links between these layouts; pairs naming channels that
-/// aren't there are left out.
-pub fn pairs(channels: Option<&[Pair]>, from: &Layout, to: &Layout) -> Vec<(usize, usize)> {
+/// `channels` links between these layouts, and the gain of each in dB;
+/// pairs naming channels that aren't there are left out. Without chosen
+/// pairs, folded channels are turned down by [`FOLD_DB`].
+pub fn pairs(
+    channels: Option<&[Pair]>,
+    from: &Layout,
+    to: &Layout,
+) -> (Vec<(usize, usize)>, Vec<f32>) {
     let Some(channels) = channels else {
-        return auto_pairs(from, to);
+        let pairs = auto_pairs(from, to);
+        let folded = crate::mix::wired(&pairs, from, to, true).folded;
+        let gains = folded
+            .into_iter()
+            .map(|f| if f { FOLD_DB } else { 0.0 })
+            .collect();
+        return (pairs, gains);
     };
-    let mut pairs: Vec<(usize, usize)> = channels
+    let mut pairs: Vec<((usize, usize), f32)> = channels
         .iter()
-        .filter_map(|p| Some((p.from.index(from)?, p.to.index(to)?)))
+        .filter_map(|p| Some(((p.from.index(from)?, p.to.index(to)?), p.gain_db)))
         .collect();
-    pairs.sort_unstable();
-    pairs.dedup();
-    pairs
+    // The first of two naming the same channels counts.
+    pairs.sort_by_key(|(p, _)| *p);
+    pairs.dedup_by_key(|(p, _)| *p);
+    pairs.into_iter().unzip()
 }
 
 /// The channel pairs that play all of `from` on `to`. Mono plays on every
@@ -221,7 +298,7 @@ pub fn pairs(channels: Option<&[Pair]>, from: &Layout, to: &Layout) -> Vec<(usiz
 /// left and right sides onto its left and right (else its centre), centre
 /// and mono onto its centre (else left and right); the LFE and narration
 /// channels are left out. With no symbols in common, channels go by
-/// number. Folded channels are summed without being turned down.
+/// number.
 pub fn auto_pairs(from: &Layout, to: &Layout) -> Vec<(usize, usize)> {
     use Symbol::*;
     if from.len() == 1 {
@@ -271,18 +348,33 @@ pub struct Resolved {
     pub to_layout: Option<Layout>,
     /// The channel pairs it links, input then output channel.
     pub pairs: Vec<(usize, usize)>,
+    /// The gain of each pair in dB, besides the wire's.
+    pub gains: Vec<f32>,
 }
 
 impl Resolved {
+    /// The gain of pair `i` in dB, with the wire's.
+    pub fn gain_db(&self, wire: &Wire, i: usize) -> f32 {
+        wire.gain_db + self.gains.get(i).copied().unwrap_or(0.0)
+    }
+
     pub fn links<'a>(&'a self, wire: &'a Wire) -> impl Iterator<Item = Link> + 'a {
-        self.pairs.iter().filter_map(move |&(f, t)| {
-            Some(Link {
-                from: self.from_node.clone()?,
-                from_channel: f,
-                to: wire.output.clone(),
-                to_channel: t,
+        self.pairs
+            .iter()
+            .enumerate()
+            .filter_map(move |(i, &(f, t))| {
+                Some(Link {
+                    from: self.from_node.clone()?,
+                    from_channel: f,
+                    to: wire.output.clone(),
+                    to_channel: t,
+                    gain: if wire.mute {
+                        0.0
+                    } else {
+                        gain::linear(self.gain_db(wire, i))
+                    },
+                })
             })
-        })
     }
 }
 
@@ -324,15 +416,16 @@ pub fn resolve(node: &Node, engine: &Engine, wires: &[Wire]) -> Vec<Resolved> {
                 .iter()
                 .find(|o| o.name == w.output)
                 .map(|o| o.channels.clone());
-            let pairs = match (&from_layout, &to_layout) {
+            let (pairs, gains) = match (&from_layout, &to_layout) {
                 (Some(f), Some(t)) => pairs(w.channels.as_deref(), f, t),
-                _ => Vec::new(),
+                _ => Default::default(),
             };
             Resolved {
                 from_node,
                 from_layout,
                 to_layout,
                 pairs,
+                gains,
             }
         })
         .collect()
@@ -346,13 +439,11 @@ pub fn follow(node: &Node) {
     let wires = node.wires.lock().unwrap().list().to_vec();
     let engine = engine.lock().unwrap();
     let resolved = resolve(node, &engine, &wires);
-    let mut links: Vec<Link> = wires
+    let links: Vec<Link> = wires
         .iter()
         .zip(&resolved)
         .flat_map(|(w, r)| r.links(w).collect::<Vec<_>>())
         .collect();
-    links.sort_unstable();
-    links.dedup();
     if let Err(e) = engine.set_links(&links)
         && !wires.is_empty()
     {
@@ -411,17 +502,91 @@ mod tests {
             Pair {
                 to: Channel::Name("L".into()),
                 from: Channel::Name("R".into()),
+                gain_db: 0.0,
             },
             Pair {
                 to: Channel::Name("R".into()),
                 from: Channel::Name("L".into()),
+                gain_db: -6.0,
             },
             Pair {
                 to: Channel::Number(3),
                 from: Channel::Number(1),
+                gain_db: 0.0,
             },
         ];
-        assert_eq!(pairs(Some(&swap), &st, &st), [(0, 1), (1, 0)]);
+        assert_eq!(
+            pairs(Some(&swap), &st, &st),
+            (vec![(0, 1), (1, 0)], vec![-6.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn folded_channels_are_turned_down() {
+        // L R C LFE Ls Rs onto L R: C, Ls and Rs folded.
+        let (p, gains) = pairs(None, &layout("51"), &layout("ST"));
+        assert_eq!(p, [(0, 0), (1, 1), (2, 0), (2, 1), (4, 0), (5, 1)]);
+        assert_eq!(gains, [0.0, 0.0, FOLD_DB, FOLD_DB, FOLD_DB, FOLD_DB]);
+        // Mono spread onto stereo, stereo summed onto mono.
+        assert_eq!(
+            pairs(None, &layout("M"), &layout("ST")).1,
+            [FOLD_DB, FOLD_DB]
+        );
+        assert_eq!(
+            pairs(None, &layout("ST"), &layout("M")).1,
+            [FOLD_DB, FOLD_DB]
+        );
+        // Where they belong, or by number: as they are.
+        assert_eq!(pairs(None, &layout("ST"), &layout("51")).1, [0.0, 0.0]);
+        assert_eq!(pairs(None, &layout("DM"), &layout("ST")).1, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn links_play_at_the_wire_and_pair_gains() {
+        let mut wire = Wire {
+            from: Origin::Input("mic".into()),
+            output: "out".into(),
+            channels: None,
+            gain_db: -6.0,
+            mute: false,
+        };
+        let (pairs, gains) = pairs(None, &layout("M"), &layout("ST"));
+        let r = Resolved {
+            from_node: Some("mic".into()),
+            from_layout: Some(layout("M")),
+            to_layout: Some(layout("ST")),
+            pairs,
+            gains,
+        };
+        assert_eq!(r.gain_db(&wire, 0), -9.0);
+        let links: Vec<Link> = r.links(&wire).collect();
+        assert_eq!(links.len(), 2);
+        assert!((links[1].gain - gain::linear(-9.0)).abs() < 1e-6);
+        assert_eq!((links[1].from_channel, links[1].to_channel), (0, 1));
+        wire.mute = true;
+        assert!(r.links(&wire).all(|l| l.gain == 0.0));
+        assert_eq!(r.gain_db(&wire, 0), -9.0, "muting keeps the gain");
+    }
+
+    #[test]
+    fn gains_out_of_range() {
+        let mut wire = Wire {
+            from: Origin::Input("mic".into()),
+            output: "out".into(),
+            channels: Some(vec![Pair {
+                to: Channel::Number(1),
+                from: Channel::Number(1),
+                gain_db: 12.0,
+            }]),
+            gain_db: -90.0,
+            mute: false,
+        };
+        assert!(wire.check_gains().is_ok());
+        wire.gain_db = 13.0;
+        assert!(wire.check_gains().unwrap_err().contains("13 dB"));
+        wire.gain_db = 0.0;
+        wire.channels.as_mut().unwrap()[0].gain_db = f32::NEG_INFINITY;
+        assert!(wire.check_gains().is_err());
     }
 
     #[test]
@@ -429,15 +594,37 @@ mod tests {
         let w = Wire {
             from: Origin::Input("alsa_input.usb".into()),
             output: "orpheus.output.kitchen".into(),
-            channels: Some(vec![Pair {
-                to: Channel::Number(1),
-                from: Channel::Name("U03".into()),
-            }]),
+            channels: Some(vec![
+                Pair {
+                    to: Channel::Number(1),
+                    from: Channel::Name("U03".into()),
+                    gain_db: 0.0,
+                },
+                Pair {
+                    to: Channel::Number(2),
+                    from: Channel::Number(4),
+                    gain_db: -3.5,
+                },
+            ]),
+            gain_db: 0.0,
+            mute: false,
         };
         let json = serde_json::to_string(&w).unwrap();
         assert_eq!(
             json,
-            r#"{"input":"alsa_input.usb","output":"orpheus.output.kitchen","channels":[{"to":1,"from":"U03"}]}"#
+            r#"{"input":"alsa_input.usb","output":"orpheus.output.kitchen","channels":[{"to":1,"from":"U03"},{"to":2,"from":4,"gain_db":-3.5}]}"#
+        );
+        assert_eq!(serde_json::from_str::<Wire>(&json).unwrap(), w);
+        let w = Wire {
+            gain_db: -6.0,
+            mute: true,
+            channels: None,
+            ..w
+        };
+        let json = serde_json::to_string(&w).unwrap();
+        assert_eq!(
+            json,
+            r#"{"input":"alsa_input.usb","output":"orpheus.output.kitchen","gain_db":-6.0,"mute":true}"#
         );
         assert_eq!(serde_json::from_str::<Wire>(&json).unwrap(), w);
         let both = r#"{"input":"a","source":"B73AQ0P0","output":"o"}"#;

@@ -29,7 +29,8 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `inputs` | Lists the node's [inputs](#inputs-and-outputs): the receivers' streams and the audio system's inputs, such as microphones, with their channels. |
 | `output create NAME DEVICE CHANNEL… [--layout LAYOUT]` | Creates an output that plays on chosen channels of another, for example channels 3 and 4 of an audio interface (see [inputs and outputs](#inputs-and-outputs)). Kept across restarts. |
 | `output remove OUTPUT` | Removes a created output. |
-| `wire FROM OUTPUT [OUT=IN…]` | Plays channels of a source or an input on an output (see [wires](#wires)): `L=R R=L` plays the input's right channel on the output's left and the other way round; without pairs, all channels go where they belong. A source with wires plays only on them. Kept across restarts. |
+| `wire FROM OUTPUT [OUT=IN[@DB]…] [--gain DB] [--mute]` | Plays channels of a source or an input on an output (see [wires](#wires)): `L=R R=L` plays the input's right channel on the output's left and the other way round, `L=C@-3` the centre on the left 3 dB down; without pairs, all channels go where they belong. `--gain` sets the wire's gain in dB. A source with wires plays only on them. Kept across restarts. |
+| `wire-gain FROM OUTPUT DB\|mute\|unmute` | Changes a wire's gain in dB, or mutes it, keeping its channels. |
 | `unwire FROM OUTPUT [OUT=IN…]` | Removes a wire, or some of its channel pairs. A source left without wires is [parked](#lost-outputs) until played or wired again. |
 | `patch` | Shows the wires as a patch bay: for each output channel, everything that plays on it. |
 | `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
@@ -465,6 +466,9 @@ orpheusctl wire TV Kitchen                  # all channels, where they belong
 orpheusctl wire TV Kitchen L=R R=L          # left and right swapped
 orpheusctl wire TV "Scarlett 4i4" 3=L 4=R   # on channels 3 and 4
 orpheusctl wire "USB mic" Kitchen 1=1 2=1   # a mono mic on both sides
+orpheusctl wire TV Kitchen L=C@-3 R=C@-3    # the centre on both, 3 dB down
+orpheusctl wire-gain TV Kitchen -6          # the whole wire 6 dB down
+orpheusctl wire-gain TV Kitchen mute
 orpheusctl unwire TV Kitchen 3=L            # one pair
 orpheusctl unwire TV Kitchen                # the whole wire
 orpheusctl patch
@@ -481,8 +485,8 @@ Without pairs, each channel goes to the output channel of the same
 symbol. What the output lacks is folded onto it: side and rear channels
 onto its left and right, the centre onto its centre or else both sides,
 mono onto every channel; the LFE is left out. Channels with no symbols in
-common go by number. Folded channels are summed as they are, not turned
-down, and can clip.
+common go by number. Folded channels are turned down by 3 dB, as in the
+usual downmix from 5.1 to stereo.
 
 `wire` and `patch` mark each channel that plays on another one as part of
 a mix with `⤵`, and say what the wire does: a downmix where it sums
@@ -491,23 +495,38 @@ upmix where it spreads one onto several. Stereo onto 5.1 plays on the
 front left and right only, which is no mix.
 
 What several wires bring into one output channel is summed, too.
-`patch` shows it as it is, every input on each output channel:
+`patch` shows it as it is, every input on each output channel with its
+gain:
 
 ```
 Kitchen (orpheus.output.kitchen)
-  L  ← TV: R, USB mic: M1⤵
-  R  ← TV: L, USB mic: M1⤵
+  L  ← TV: R -6 dB, USB mic: M1⤵ -3 dB
+  R  ← TV: L -6 dB, USB mic: M1⤵ -3 dB
   ⤵ USB mic: upmix M → ST
 
 Waiting
   Radio → Kitchen (all): Radio plays nowhere
 ```
 
+#### Gain
+
+A wire has a gain in dB, and so has each of its pairs, on top of the
+wire's: 0 dB plays a channel as it is, -6 dB at about half its amplitude,
+from -90 to +12 dB. Muting a wire silences it and keeps its gains. A
+change ramps over 20 ms, so it doesn't click. The gain is the wire's
+alone: the source's volume and the output's volume still apply as well.
+Several channels summed onto one can still get louder than any of them;
+turn the wires down where they clip.
+
+`wire` replaces the whole wire, gains included; `wire-gain` changes only
+the wire's gain or muting. A pair's own gain is set with `wire`, after
+`@`.
+
 Wires are kept in `wires.json` in the [state
 directory](configuration.md#files). A wire waits while its source plays
 nowhere or an end is missing, and links again once it is back. On Linux,
-each pair is a PipeWire link from the input's port to the output's port;
-`pw-link -l` shows them.
+each wire is a small PipeWire node, `orpheus.wire.N`, that plays each pair
+at its gain, linked between the two ends; `pw-link -l` shows the links.
 
 ## Aliases and pins
 
@@ -709,8 +728,9 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `PUT /x-orpheus/v1/outputs/{name}/type` | Sets an output's type. Body: `{"type": "hifi"}`. Returns `204`, or `404` if there is no such output. |
 | `DELETE /x-orpheus/v1/outputs/{name}/type` | Goes back to the detected type. Returns `204`, or `404` if no type was set. |
 | `GET /x-orpheus/v1/inputs` | The [inputs](#inputs-and-outputs): `name`, `description`, `kind` (`receiver` or `device`), `receiver` (its ID, for a receiver) and `channels`. |
-| `GET /x-orpheus/v1/wires` | The [wires](#wires): `source` (ID) or `input` (machine name), `from_name`, `output`, `output_name`, `channels` (the pairs as set, absent for all), `links` (what it links now: `from` and `to` channel, counted from 1, whether the audio system has made the link, and `folded` for a channel played on another one as part of a mix), `mix` (`downmix` or `upmix`, absent where each channel plays on its own), `dropped` (the channels a wire of all channels leaves out, such as the LFE) and, while known, `from_channels` and `output_channels` as [layouts](#channel-layouts). |
-| `PUT /x-orpheus/v1/wires` | Sets the wire between a source or input and an output, replacing one there. Body: `{"source": "<id>", "output": "<name>"}` or `{"input": "<name>", …}`, optionally with `"channels": [{"to": "L", "from": "R"}, {"to": 3, "from": 1}]`. Returns `200` with the wire as listed; `400` for a malformed request or no pairs, `422` if there is no such source, input or output, or no such channel, `503` without an audio system. |
+| `GET /x-orpheus/v1/wires` | The [wires](#wires): `source` (ID) or `input` (machine name), `from_name`, `output`, `output_name`, `channels` (the pairs as set, absent for all), `links` (what it links now: `from` and `to` channel, counted from 1, whether the audio system has made the link, and `gain_db`, the wire's and the pair's together, and `folded` for a channel played on another one as part of a mix), `gain_db` and `mute` (absent at 0 dB and unmuted), `mix` (`downmix` or `upmix`, absent where each channel plays on its own), `dropped` (the channels a wire of all channels leaves out, such as the LFE) and, while known, `from_channels` and `output_channels` as [layouts](#channel-layouts). |
+| `PUT /x-orpheus/v1/wires` | Sets the wire between a source or input and an output, replacing one there. Body: `{"source": "<id>", "output": "<name>"}` or `{"input": "<name>", …}`, optionally with `"channels": [{"to": "L", "from": "R"}, {"to": 3, "from": 1, "gain_db": -3}]`, `"gain_db": -6` and `"mute": true`; gains go from -90 to +12 dB. Returns `200` with the wire as listed; `400` for a malformed request, no pairs or a gain out of range, `422` if there is no such source, input or output, or no such channel, `503` without an audio system. |
+| `PUT /x-orpheus/v1/wires/gain?source=<id>&output=<name>` | Changes a wire's gain or muting, keeping its channels; `input=<name>` instead of `source` for an input. Body: `{"gain_db": -6}`, `{"mute": true}` or both. Returns `200` with the wire as listed; `400` without either end or for a gain out of range, `404` if there is no such wire. |
 | `DELETE /x-orpheus/v1/wires?source=<id>&output=<name>` | Removes a wire; `input=<name>` instead of `source` for an input. Returns `204`; `400` without either, `404` if there is no such wire. |
 | `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |

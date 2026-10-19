@@ -96,8 +96,9 @@ pub trait AudioBackend: Send {
 
     /// Keeps exactly these links made, besides those the audio system
     /// makes itself, as far as their nodes and channels are there; made
-    /// again once they are back. What several links bring into one
-    /// channel is summed.
+    /// again once they are back. Each plays at its gain, which changes
+    /// without a click; what several links bring into one channel is
+    /// summed.
     fn set_links(&self, _links: &[Link]) -> Result<(), BackendError> {
         Err("this audio system cannot link channels".into())
     }
@@ -169,15 +170,19 @@ pub struct OutputSpec {
 }
 
 /// A link from a channel of an input, or of a receiver's stream, to a
-/// channel of an output. Nodes go by machine name, channels are counted
-/// from 0.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// channel of an output, at a gain. Nodes go by machine name, channels are
+/// counted from 0.
+#[derive(Debug, Clone, PartialEq)]
 pub struct Link {
     pub from: String,
     pub from_channel: usize,
     pub to: String,
     pub to_channel: usize,
+    /// The factor the channel is played at: 1 as it is, 0 silent (see
+    /// [`gain`](crate::gain)).
+    pub gain: f32,
 }
+
 
 /// Where a playback stream plays.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

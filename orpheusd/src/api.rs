@@ -626,6 +626,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(remove_output))
         .routes(routes!(inputs))
         .routes(routes!(list_wires, set_wire, remove_wire))
+        .routes(routes!(set_wire_gain))
         .routes(routes!(set_output_type, clear_output_type))
         .routes(routes!(set_default_output))
         .routes(routes!(set_receiver_output, clear_receiver_output))
@@ -1623,6 +1624,12 @@ struct WireEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<Vec<WirePair>>)]
     channels: Option<Vec<crate::wires::Pair>>,
+    /// Its gain in dB; absent for 0, which plays the channels as they are.
+    #[serde(skip_serializing_if = "crate::wires::is_zero")]
+    gain_db: f32,
+    /// Silent, whatever the gains.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mute: bool,
     /// The channels it links now; empty while the source plays nowhere
     /// or an end is missing.
     links: Vec<WireLink>,
@@ -1653,6 +1660,9 @@ struct WireLink {
     to: usize,
     /// Whether the audio system has made the link.
     linked: bool,
+    /// Its gain in dB, the wire's and the pair's together, also while
+    /// the wire is muted.
+    gain_db: f32,
     /// It plays the channel on another one as part of a mix, such as the
     /// centre on the left.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -1665,6 +1675,9 @@ struct WireLink {
 struct WirePair {
     to: WireChannel,
     from: WireChannel,
+    /// Its gain in dB, on top of the wire's; 0 if left out.
+    #[schema(example = -3.0)]
+    gain_db: Option<f32>,
 }
 
 /// A channel: its number, counted from 1, or its symbol or label.
@@ -1689,8 +1702,23 @@ struct NewWire {
     /// The output, by machine name.
     output: String,
     /// The channel pairs; leave it out for all channels, where they
-    /// belong.
+    /// belong, with folded channels at -3 dB.
     channels: Option<Vec<WirePair>>,
+    /// Its gain in dB, from -90 to +12; 0 if left out, which plays the
+    /// channels as they are.
+    gain_db: Option<f32>,
+    /// Silent, whatever the gains.
+    mute: Option<bool>,
+}
+
+/// A wire's gain to change; what is left out stays.
+#[derive(Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+struct WireGain {
+    /// Its gain in dB, from -90 to +12.
+    #[schema(example = -6.0)]
+    gain_db: Option<f32>,
+    mute: Option<bool>,
 }
 
 /// Names a wire by its ends.
@@ -1763,6 +1791,7 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
                             from: l.from_channel + 1,
                             to: l.to_channel + 1,
                             linked: made.contains(&l),
+                            gain_db: r.gain_db(w, i),
                             folded: wired.as_ref().is_some_and(|m| m.folded[i]),
                         })
                         .collect()
@@ -1793,6 +1822,8 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
                     .find(|o| o.name == w.output)
                     .map_or_else(|| w.output.clone(), |o| o.description.clone()),
                 channels: w.channels.clone(),
+                gain_db: w.gain_db,
+                mute: w.mute,
                 links,
                 mix: wired.as_ref().and_then(|m| m.mix),
                 dropped: wired
@@ -1807,9 +1838,11 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
 /// Plays channels of a source or an input on an output, replacing the
 /// wire between the two. Each pair names an output channel and the input
 /// channel played on it, by number (from 1), symbol or label; without
-/// pairs all channels go where they belong. A source with wires plays
-/// only on them. What several wires bring into one output channel is
-/// summed. Kept across restarts.
+/// pairs all channels go where they belong, with channels folded onto
+/// others at -3 dB. The wire and each pair have a gain in dB; 0 plays the
+/// channels as they are, and a change ramps over 20 ms. A source with
+/// wires plays only on them. What several wires bring into one output
+/// channel is summed. Kept across restarts.
 #[utoipa::path(
     put,
     path = "/x-orpheus/v1/wires",
@@ -1817,7 +1850,7 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
     request_body = NewWire,
     responses(
         (status = OK, description = "Set", body = WireEntry),
-        (status = BAD_REQUEST, description = "A malformed request, or no channels", body = ErrorBody),
+        (status = BAD_REQUEST, description = "A malformed request, no channels, or a gain out of range", body = ErrorBody),
         (status = UNPROCESSABLE_ENTITY, description = "No such source, input, output or channel", body = ErrorBody),
         (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
     ),
@@ -1840,6 +1873,7 @@ async fn set_wire(
             return Err(bad("channels are counted from 1, or named".into()));
         }
     }
+    wire.check_gains().map_err(bad)?;
     blocking(move || {
         let unknown = |e: String| (StatusCode::UNPROCESSABLE_ENTITY, e);
         let Some(engine) = &node.engine else {
@@ -1907,6 +1941,63 @@ async fn set_wire(
     .await
 }
 
+/// Changes the gain of the wire between a source or an input and an
+/// output, or mutes it, keeping its channels. The change ramps over 20 ms.
+#[utoipa::path(
+    put,
+    path = "/x-orpheus/v1/wires/gain",
+    tag = "wires",
+    params(WireQuery),
+    request_body = WireGain,
+    responses(
+        (status = OK, description = "Set", body = WireEntry),
+        (status = BAD_REQUEST, description = "Neither or both of source and input, or a gain out of range", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such wire", body = ErrorBody),
+    ),
+)]
+async fn set_wire_gain(
+    State(node): State<Arc<Node>>,
+    Query(q): Query<WireQuery>,
+    Body(body): Body<WireGain>,
+) -> Result<Json<WireEntry>, ApiError> {
+    let bad = |e: String| ApiError(StatusCode::BAD_REQUEST, e);
+    let from = wire_origin(q.source, q.input).map_err(bad)?;
+    if let Some(db) = body.gain_db
+        && !orpheus_engine::gain::valid(db)
+    {
+        return Err(bad(format!(
+            "a gain of {db} dB; gains go from {} to +{} dB",
+            orpheus_engine::gain::MIN_DB,
+            orpheus_engine::gain::MAX_DB
+        )));
+    }
+    blocking(move || {
+        let wire = node
+            .wires
+            .lock()
+            .unwrap()
+            .set_gain(&from, &q.output, body.gain_db, body.mute)
+            .ok_or((StatusCode::NOT_FOUND, "no such wire".to_owned()))?;
+        tracing::info!(from = ?from, output = %q.output, gain_db = wire.gain_db, mute = wire.mute, "wire gain");
+        crate::wires::follow(&node);
+        Ok(Json(wire_entries(&node, &[wire]).remove(0)))
+    })
+    .await
+}
+
+/// The end a wire comes from, as a query names it.
+fn wire_origin(
+    source: Option<SourceId>,
+    input: Option<String>,
+) -> Result<crate::wires::Origin, String> {
+    use crate::wires::Origin;
+    match (source, input) {
+        (Some(id), None) => Ok(Origin::Source(id)),
+        (None, Some(name)) => Ok(Origin::Input(name)),
+        _ => Err("give either source or input".into()),
+    }
+}
+
 /// Removes the wire between a source or an input and an output. A source
 /// left without wires is parked: it plays nowhere until played on an output
 /// or wired again; with `[receiver] when_lost = "default"` it plays on its
@@ -1927,16 +2018,7 @@ async fn remove_wire(
     Query(q): Query<WireQuery>,
 ) -> Result<StatusCode, ApiError> {
     use crate::wires::Origin;
-    let from = match (q.source, q.input) {
-        (Some(id), None) => Origin::Source(id),
-        (None, Some(name)) => Origin::Input(name),
-        _ => {
-            return Err(ApiError(
-                StatusCode::BAD_REQUEST,
-                "give either source or input".into(),
-            ));
-        }
-    };
+    let from = wire_origin(q.source, q.input).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
     blocking(move || {
         let left = {
             let mut wires = node.wires.lock().unwrap();
@@ -2303,6 +2385,7 @@ mod tests {
                 "/x-orpheus/v1/sources/{id}/layout",
                 "/x-orpheus/v1/status",
                 "/x-orpheus/v1/wires",
+                "/x-orpheus/v1/wires/gain",
             ]
         );
     }

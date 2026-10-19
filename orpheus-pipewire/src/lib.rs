@@ -25,6 +25,9 @@ use spa::pod::deserialize::PodDeserializer;
 use spa::pod::{Object, Pod, Property, Value, serialize::PodSerializer};
 use spa::sys as spa_sys;
 
+mod wire;
+use wire::WireNode;
+
 /// Native-endian `f32`, so buffers can be reinterpreted without conversion.
 const SAMPLE_FORMAT: SpaFormat = if cfg!(target_endian = "little") {
     SpaFormat::F32LE
@@ -123,6 +126,8 @@ enum Command {
     SetVolume(u64, Volume),
     /// Makes an output the default one, for the user.
     SetDefault(String, mpsc::SyncSender<Result<(), String>>),
+    /// Applies changed wires now rather than at the next relink.
+    Rewire,
     Quit,
 }
 
@@ -328,20 +333,17 @@ impl AudioBackend for PipeWireBackend {
         if g.wires != links {
             g.wires = links.to_vec();
             g.changed = true;
+            drop(g);
+            self.tx
+                .send(Command::Rewire)
+                .map_err(|_| "PipeWire thread is gone")?;
         }
         Ok(())
     }
 
     fn links(&self) -> Vec<Link> {
         let g = self.graph.lock().unwrap();
-        g.wires
-            .iter()
-            .filter(|l| {
-                g.ports_of_link(l)
-                    .is_some_and(|(_, out, _, input)| g.has_link((out, input)))
-            })
-            .cloned()
-            .collect()
+        g.wires.iter().filter(|l| g.linked(l)).cloned().collect()
     }
 
     fn app_streams(&self) -> Vec<AppStream> {
@@ -473,23 +475,32 @@ fn run(
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
     let created: Rc<RefCell<HashMap<u64, Created>>> = Rc::default();
-    // Links the created outputs to their devices, and the wires, as ports
-    // come and go.
-    let relink = mainloop.loop_().add_timer({
+    // Links the created outputs to their devices, and the wires through
+    // their nodes, as ports come and go.
+    let relink = Rc::new({
         let core = core.clone();
         let graph = graph.clone();
         let created = created.clone();
         let wired = RefCell::new(Made::new());
-        move |_| {
+        let nodes = RefCell::new(Wiring::default());
+        move || {
             if std::mem::take(&mut graph.lock().unwrap().changed) {
                 link_outputs(&core, &graph, &mut created.borrow_mut());
+                let retired = nodes.borrow_mut().update(&core, &graph);
                 let g = graph.lock().unwrap();
                 let want = g.wired_links();
                 reconcile(&core, &g, &want, &mut wired.borrow_mut(), "wires");
+                // Only now, which would take the links along that were
+                // just dropped.
+                drop(retired);
             }
         }
     });
-    let _ = relink.update_timer(Some(RELINK), Some(RELINK));
+    let timer = mainloop.loop_().add_timer({
+        let relink = relink.clone();
+        move |_| relink()
+    });
+    let _ = timer.update_timer(Some(RELINK), Some(RELINK));
     let _receiver = rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let streams = streams.clone();
@@ -602,6 +613,7 @@ fn run(
             Command::SetDefault(name, reply) => {
                 let _ = reply.send(set_default(&graph, &metadata, &name));
             }
+            Command::Rewire => relink(),
             Command::Quit => mainloop.quit(),
         }
     });
@@ -665,6 +677,81 @@ fn link_outputs(
     for c in created.values_mut() {
         let want = g.wanted_links(&c.spec);
         reconcile(core, &g, &want, &mut c.links, &c.spec.name);
+    }
+}
+
+/// A wire node, for other threads.
+#[derive(Debug, Clone)]
+struct WireInfo {
+    /// The node's machine name.
+    name: String,
+    from: String,
+    to: String,
+    pairs: Vec<(usize, usize)>,
+}
+
+/// The wire nodes, one per pair of nodes the wires link, by those nodes.
+#[derive(Default)]
+struct Wiring {
+    nodes: HashMap<(String, String), WireNode>,
+    next: u64,
+}
+
+impl Wiring {
+    /// Makes a wire node for each pair of nodes the wires link while both
+    /// are there, with the wires' pairs and gains, and returns the others
+    /// for the caller to drop once their links are. A node whose pairs
+    /// change is made again; a gain changes in place.
+    fn update(&mut self, core: &pw::core::CoreRc, graph: &Mutex<Graph>) -> Vec<WireNode> {
+        type Pairs = (Vec<(usize, usize)>, Vec<f32>);
+        let mut want: BTreeMap<(String, String), Pairs> = BTreeMap::new();
+        {
+            let g = graph.lock().unwrap();
+            for l in &g.wires {
+                if g.node_id(&l.from).is_none() || g.node_id(&l.to).is_none() {
+                    continue;
+                }
+                let (pairs, gains) = want.entry((l.from.clone(), l.to.clone())).or_default();
+                pairs.push((l.from_channel, l.to_channel));
+                gains.push(l.gain);
+            }
+        }
+        let gone: Vec<(String, String)> = self
+            .nodes
+            .iter()
+            .filter(|(key, node)| want.get(*key).is_none_or(|(pairs, _)| *pairs != node.pairs))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let retired: Vec<WireNode> = gone.iter().filter_map(|k| self.nodes.remove(k)).collect();
+        for (key, (pairs, gains)) in &want {
+            match self.nodes.get(key) {
+                Some(node) => node.set_gains(gains),
+                None => {
+                    let name = format!("orpheus.wire.{}", self.next);
+                    self.next += 1;
+                    let description = format!("Orpheus wire {} → {}", key.0, key.1);
+                    match WireNode::new(core, &name, &description, pairs.clone(), gains) {
+                        Ok(node) => {
+                            self.nodes.insert(key.clone(), node);
+                        }
+                        Err(e) => {
+                            tracing::warn!(from = %key.0, to = %key.1, error = %e, "making a wire node")
+                        }
+                    }
+                }
+            }
+        }
+        graph.lock().unwrap().wire_nodes = self
+            .nodes
+            .iter()
+            .map(|((from, to), node)| WireInfo {
+                name: node.name.clone(),
+                from: from.clone(),
+                to: to.clone(),
+                pairs: node.pairs.clone(),
+            })
+            .collect();
+        retired
     }
 }
 
@@ -1137,6 +1224,8 @@ struct Graph {
     names: HashMap<u32, String>,
     /// The links asked for besides those of created outputs.
     wires: Vec<Link>,
+    /// The wire nodes made for them.
+    wire_nodes: Vec<WireInfo>,
     /// Whether ports, links or wires came or went since the created
     /// outputs and the wires were last linked.
     changed: bool,
@@ -1293,30 +1382,76 @@ impl Graph {
             .collect()
     }
 
+    fn node_id(&self, name: &str) -> Option<u32> {
+        self.names
+            .iter()
+            .find(|(_, n)| *n == name)
+            .map(|(&id, _)| id)
+    }
+
+    /// The links of each wire node's pair `i` whose ports are there: into
+    /// the node and out of it, each output node and port, input node and
+    /// port.
+    fn wire_node_links(&self, w: &WireInfo) -> Vec<(usize, (u32, u32, u32, u32))> {
+        let (Some(id), Some(from), Some(to)) = (
+            self.node_id(&w.name),
+            self.node_id(&w.from),
+            self.node_id(&w.to),
+        ) else {
+            return Vec::new();
+        };
+        let (ins, outs) = (self.channel_ports(id, false), self.channel_ports(id, true));
+        let (sources, sinks) = (
+            self.channel_ports(from, true),
+            self.channel_ports(to, false),
+        );
+        let mut links = Vec::new();
+        for (i, &(f, t)) in w.pairs.iter().enumerate() {
+            if let (Some((a, _)), Some((b, _))) = (sources.get(f), ins.get(i)) {
+                links.push((i, (from, *a, id, *b)));
+            }
+            if let (Some((c, _)), Some((d, _))) = (outs.get(i), sinks.get(t)) {
+                links.push((i, (id, *c, to, *d)));
+            }
+        }
+        links
+    }
+
     /// The wires' links whose ports are there: output node and port,
     /// input node and port.
     fn wired_links(&self) -> Vec<(u32, u32, u32, u32)> {
         let mut want: Vec<_> = self
-            .wires
+            .wire_nodes
             .iter()
-            .filter_map(|w| self.ports_of_link(w))
+            .flat_map(|w| self.wire_node_links(w).into_iter().map(|(_, l)| l))
             .collect();
         want.sort_unstable();
         want.dedup();
         want
     }
 
-    fn ports_of_link(&self, link: &Link) -> Option<(u32, u32, u32, u32)> {
-        let node = |name: &str| {
-            self.names
-                .iter()
-                .find(|(_, n)| *n == name)
-                .map(|(&id, _)| id)
+    /// Whether `link` plays: both links through its wire node are made.
+    fn linked(&self, link: &Link) -> bool {
+        let Some(w) = self
+            .wire_nodes
+            .iter()
+            .find(|w| w.from == link.from && w.to == link.to)
+        else {
+            return false;
         };
-        let (from, to) = (node(&link.from)?, node(&link.to)?);
-        let (out_port, _) = *self.channel_ports(from, true).get(link.from_channel)?;
-        let (in_port, _) = *self.channel_ports(to, false).get(link.to_channel)?;
-        Some((from, out_port, to, in_port))
+        let Some(i) = w
+            .pairs
+            .iter()
+            .position(|&p| p == (link.from_channel, link.to_channel))
+        else {
+            return false;
+        };
+        let made = self
+            .wire_node_links(w)
+            .into_iter()
+            .filter(|&(j, (_, out, _, input))| j == i && self.has_link((out, input)))
+            .count();
+        made == 2
     }
 
     fn has_link(&self, (output_port, input_port): (u32, u32)) -> bool {

@@ -109,7 +109,7 @@ time instead of catching up ("realign").
 |---|---|
 | main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type and can set the default output, as the desktop does. The engine talks to it through a channel. |
-| PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports |
+| PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports; play the wires at their gains |
 | `orpheus-ptp` | PTP: sockets, timers, statime; restarts the port when its interface changes or the settings do, and retries while it can't start |
 | TX, one per sender | Pacing, ASRC, RTP send |
 | RX, one per running receiver | RTP receive, jitter buffer, level meter and gain, ASRC |
@@ -328,16 +328,31 @@ an output whose device was unplugged plays there again once it is back.
 The node and its links are destroyed with the handle, and with orpheusd,
 since they don't linger.
 
-[Wires](usage.md#wires) are links made the same way. `wires.rs` keeps them
-by their ends: a source (by its ID, not the receiver playing it) or an
-input, and an output, with channel pairs by number, symbol or label, or
-none for all. Every second, after the sources are placed, it resolves them
+[Wires](usage.md#wires) are links made the same way, through a node of
+their own. `wires.rs` keeps them by their ends: a source (by its ID, not
+the receiver playing it) or an input, and an output, with channel pairs
+by number, symbol or label, or none for all, and gains for the wire and
+each pair. Every second, after the sources are placed, it resolves them
 against the running receivers and the inputs and outputs there are into
-links by node name and channel index, and hands the list to the engine;
-the PipeWire thread makes the missing ones and drops those no longer
-asked for on the same timer. A source with wires is placed nowhere
+links by node name and channel index, each with its gain as a factor,
+and hands the list to the engine. Unchosen pairs that fold a channel onto
+another get -3 dB. A source with wires is placed nowhere
 (`Placement::Held`), so the session manager doesn't link it as well.
-PipeWire sums what meets at an input port; nothing is turned down.
+
+The PipeWire thread makes a wire node (`wire.rs`) for each pair of nodes
+the links join while both are there: a `pw_filter`, through the C API
+since pipewire-rs has no binding for it, with an input and an output port
+per channel pair. Its process callback runs on the realtime thread in the
+same graph cycle as its ends, so it adds no latency, and plays each pair
+through a `Ramp` from `orpheus_engine::gain`, which moves to a new gain
+in a straight line over 960 frames (20 ms at 48 kHz); the gains are
+atomics the PipeWire thread sets. The gain code is plain Rust, for other
+platforms' nodes to use too. The same timer links the source's ports to
+the node's inputs and its outputs to the output's ports; a changed gain
+only sets the atomic, while changed pairs make the node again. A new wire
+list is applied at once, not only at the next tick. The node is dropped
+after its links, which it would otherwise take along under the reconciler.
+PipeWire sums what meets at an input port.
 
 `connection.rs` watches the peers' receivers the senders are connected to.
 Discovery keeps each node's receiver change counter (`ver_rcv` in its mDNS

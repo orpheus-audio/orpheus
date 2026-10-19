@@ -192,10 +192,29 @@ enum Command {
         /// The output: its name or description, or a unique part of either.
         output: String,
         /// Output channel = input channel, each by number (from 1),
-        /// symbol or label: `L=R R=L`, `1=U03`, `2=1`. Without any, all
-        /// channels go where they belong.
-        #[arg(value_name = "OUT=IN")]
+        /// symbol or label, with a gain in dB after `@` if wanted:
+        /// `L=R R=L`, `1=U03@-6`, `2=1`. Without any, all channels go
+        /// where they belong, those folded onto others at -3 dB.
+        #[arg(value_name = "OUT=IN[@DB]")]
         channels: Vec<String>,
+        /// The wire's gain in dB, from -90 to +12; 0 plays the channels
+        /// as they are.
+        #[arg(long, value_name = "DB", allow_hyphen_values = true)]
+        gain: Option<f32>,
+        /// Make it silent.
+        #[arg(long)]
+        mute: bool,
+    },
+    /// Change the gain of a wire, keeping its channels; the change ramps
+    /// over 20 ms.
+    WireGain {
+        /// The source or input, as for `wire`.
+        from: String,
+        /// The output, as for `wire`.
+        output: String,
+        /// A gain in dB from -90 to +12 (`-6`, `0`), `mute` or `unmute`.
+        #[arg(allow_hyphen_values = true)]
+        gain: String,
     },
     /// Remove a wire, or some of its channels. A source left without
     /// wires is parked until played with `play` or wired again.
@@ -865,8 +884,16 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             from,
             output,
             channels,
+            gain,
+            mute,
         } => {
             let mut body = wire_ends(base, &from, &output)?;
+            if let Some(db) = gain {
+                body["gain_db"] = serde_json::json!(db);
+            }
+            if mute {
+                body["mute"] = serde_json::json!(true);
+            }
             if !channels.is_empty() {
                 let pairs = channels
                     .iter()
@@ -877,6 +904,37 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             let url = format!("{base}/x-orpheus/v1/wires");
             let raw = reply(agent().put(&url).send_json(&body)?)
                 .with_context(|| format!("wiring {from} to {output} via {url}"))?;
+            if cli.json {
+                println!("{}", raw.trim_end());
+            } else {
+                let wire: WireEntry = serde_json::from_str(&raw).context("reading the wire")?;
+                print!("{}", render_wire_set(&wire, Paint::detect()));
+            }
+        }
+        Command::WireGain { from, output, gain } => {
+            let body = match gain.as_str() {
+                "mute" => serde_json::json!({ "mute": true }),
+                "unmute" => serde_json::json!({ "mute": false }),
+                db => {
+                    let db: f32 =
+                        db.trim_end_matches("dB").trim().parse().with_context(|| {
+                            format!("{gain:?} is no gain: give dB, mute or unmute")
+                        })?;
+                    serde_json::json!({ "gain_db": db })
+                }
+            };
+            let ends = wire_ends(base, &from, &output)?;
+            let url = format!("{base}/x-orpheus/v1/wires/gain");
+            let mut req = agent()
+                .put(&url)
+                .query("output", ends["output"].as_str().unwrap_or_default());
+            for key in ["source", "input"] {
+                if let Some(v) = ends[key].as_str() {
+                    req = req.query(key, v);
+                }
+            }
+            let raw = reply(req.send_json(&body)?)
+                .with_context(|| format!("setting the gain of {from} → {output} via {url}"))?;
             if cli.json {
                 println!("{}", raw.trim_end());
             } else {
@@ -1093,12 +1151,24 @@ fn wire_ends(base: &str, from: &str, output: &str) -> Result<serde_json::Value> 
     Ok(body)
 }
 
-/// `OUT=IN` → `{"to": OUT, "from": IN}`, numbers as numbers.
+/// `OUT=IN[@DB]` → `{"to": OUT, "from": IN, "gain_db": DB}`, numbers as
+/// numbers.
 fn parse_pair(text: &str) -> Result<serde_json::Value> {
-    let (to, from) = text
+    let (pair, gain) = match text.rsplit_once('@') {
+        Some((pair, db)) => {
+            let db: f32 = db
+                .trim_end_matches("dB")
+                .trim()
+                .parse()
+                .with_context(|| format!("{text:?}: {db:?} is no gain in dB"))?;
+            (pair, Some(db))
+        }
+        None => (text, None),
+    };
+    let (to, from) = pair
         .split_once('=')
         .filter(|(t, f)| !t.trim().is_empty() && !f.trim().is_empty())
-        .with_context(|| format!("{text:?} is not OUT=IN, e.g. L=R or 1=U03"))?;
+        .with_context(|| format!("{text:?} is not OUT=IN, e.g. L=R, 1=U03 or L=C@-3"))?;
     let channel = |c: &str| {
         let c = c.trim();
         match c.parse::<usize>() {
@@ -1106,7 +1176,20 @@ fn parse_pair(text: &str) -> Result<serde_json::Value> {
             Err(_) => serde_json::json!(c),
         }
     };
-    Ok(serde_json::json!({ "to": channel(to), "from": channel(from) }))
+    let mut p = serde_json::json!({ "to": channel(to), "from": channel(from) });
+    if let Some(db) = gain {
+        p["gain_db"] = serde_json::json!(db);
+    }
+    Ok(p)
+}
+
+/// A gain for people: `-3 dB`, `+2.5 dB`.
+fn db_text(db: f32) -> String {
+    if db > 0.0 {
+        format!("+{db} dB")
+    } else {
+        format!("{db} dB")
+    }
 }
 
 /// A wire, as `/x-orpheus/v1/wires` lists it.
@@ -1119,6 +1202,10 @@ struct WireEntry {
     output_name: String,
     /// `{"to": …, "from": …}` as set; `None` for all channels.
     channels: Option<Vec<serde_json::Value>>,
+    #[serde(default)]
+    gain_db: f32,
+    #[serde(default)]
+    mute: bool,
     links: Vec<WireLink>,
     /// `downmix` or `upmix`; absent where each channel plays on its own.
     mix: Option<String>,
@@ -1134,6 +1221,9 @@ struct WireLink {
     from: usize,
     to: usize,
     linked: bool,
+    /// The wire's and the pair's together.
+    #[serde(default)]
+    gain_db: f32,
     /// Plays the channel on another one as part of a mix.
     #[serde(default)]
     folded: bool,
@@ -1156,6 +1246,16 @@ fn mix_text(mix: &str, from: Option<&Layout>, to: Option<&Layout>, dropped: &[us
 }
 
 impl WireEntry {
+    /// Its own gain, `-6 dB, muted`; `None` at 0 dB.
+    fn gain_text(&self) -> Option<String> {
+        match (self.gain_db, self.mute) {
+            (0.0, false) => None,
+            (0.0, true) => Some("muted".into()),
+            (db, false) => Some(db_text(db)),
+            (db, true) => Some(format!("{}, muted", db_text(db))),
+        }
+    }
+
     fn mix_text(&self) -> Option<String> {
         let mix = self.mix.as_deref()?;
         Some(mix_text(
@@ -1197,6 +1297,9 @@ fn waiting(w: &WireEntry) -> String {
 fn render_wire_set(w: &WireEntry, p: Paint) -> String {
     let mut o = String::new();
     let _ = write!(o, "{} → {}", w.from_name, w.output_name);
+    if let Some(gain) = w.gain_text() {
+        let _ = write!(o, " ({gain})");
+    }
     if w.links.is_empty() {
         let _ = writeln!(
             o,
@@ -1209,11 +1312,18 @@ fn render_wire_set(w: &WireEntry, p: Paint) -> String {
         .links
         .iter()
         .map(|l| {
+            // The pair's own gain, as `wire` takes it.
+            let own = l.gain_db - w.gain_db;
             format!(
-                "{}={}{}",
+                "{}={}{}{}",
                 channel_name(w.output_channels.as_ref(), l.to),
                 channel_name(w.from_channels.as_ref(), l.from),
-                if l.folded { FOLDED } else { "" }
+                if l.folded { FOLDED } else { "" },
+                if own == 0.0 {
+                    String::new()
+                } else {
+                    format!("@{own:+}")
+                }
             )
         })
         .collect();
@@ -1260,8 +1370,15 @@ fn render_patch(wires: &[WireEntry], p: Paint) -> String {
                 .iter()
                 .flat_map(|w| {
                     w.links.iter().filter(|l| l.to == *c).map(move |l| {
+                        let gain = if w.mute {
+                            " muted".to_owned()
+                        } else if l.gain_db != 0.0 {
+                            format!(" {}", db_text(l.gain_db))
+                        } else {
+                            String::new()
+                        };
                         let text = format!(
-                            "{}: {}{}",
+                            "{}: {}{}{gain}",
                             w.from_name,
                             channel_name(w.from_channels.as_ref(), l.from),
                             if l.folded { FOLDED } else { "" }
@@ -2629,7 +2746,10 @@ Routes
         let six = r#"[{"symbol": "L"}, {"symbol": "R"}, {"symbol": "C"},
                       {"symbol": "LFE"}, {"symbol": "Ls"}, {"symbol": "Rs"}]"#;
         let link = |from: usize, to: usize, folded: bool| {
-            format!(r#"{{"from": {from}, "to": {to}, "linked": true, "folded": {folded}}}"#)
+            let gain = if folded { -3 } else { 0 };
+            format!(
+                r#"{{"from": {from}, "to": {to}, "linked": true, "gain_db": {gain}, "folded": {folded}}}"#
+            )
         };
         let links = [
             link(1, 1, false),
@@ -2649,14 +2769,49 @@ Routes
         assert_eq!(
             render_patch(&wires, Paint(false)),
             "TV (tv)\n  \
-             L  ← Film: L, Film: C⤵, Film: Ls⤵\n  \
-             R  ← Film: R, Film: C⤵, Film: Rs⤵\n  \
+             L  ← Film: L, Film: C⤵ -3 dB, Film: Ls⤵ -3 dB\n  \
+             R  ← Film: R, Film: C⤵ -3 dB, Film: Rs⤵ -3 dB\n  \
              ⤵ Film: downmix 51 → ST, LFE left out\n"
         );
         assert_eq!(
             render_wire_set(&wires[0], Paint(false)),
-            "Film → TV: L=L R=R L=C⤵ R=C⤵ L=Ls⤵ R=Rs⤵ (downmix 51 → ST, LFE left out)\n"
+            "Film → TV: L=L R=R L=C⤵@-3 R=C⤵@-3 L=Ls⤵@-3 R=Rs⤵@-3 (downmix 51 → ST, LFE left out)\n"
         );
+    }
+
+    #[test]
+    fn wire_gains() {
+        let wires: Vec<WireEntry> = serde_json::from_str(
+            r#"[{"input": "mic", "from_name": "Mic", "output": "tv", "output_name": "TV",
+                 "gain_db": -6, "links": [
+                     {"from": 1, "to": 1, "linked": true, "gain_db": -6},
+                     {"from": 1, "to": 2, "linked": true, "gain_db": 0}]}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_wire_set(&wires[0], Paint(false)),
+            "Mic → TV (-6 dB): 1=1 2=1@+6\n"
+        );
+        assert_eq!(
+            render_patch(&wires, Paint(false)),
+            "TV (tv)\n  1  ← Mic: 1 -6 dB\n  2  ← Mic: 1\n"
+        );
+        let mut muted = wires;
+        muted[0].mute = true;
+        assert_eq!(
+            render_wire_set(&muted[0], Paint(false)),
+            "Mic → TV (-6 dB, muted): 1=1 2=1@+6\n"
+        );
+        assert!(render_patch(&muted, Paint(false)).contains("← Mic: 1 muted\n"));
+        assert_eq!(
+            parse_pair("L=C@-3").unwrap(),
+            serde_json::json!({"to": "L", "from": "C", "gain_db": -3.0})
+        );
+        assert_eq!(
+            parse_pair("2=1@+1.5 dB").unwrap(),
+            serde_json::json!({"to": 2, "from": 1, "gain_db": 1.5})
+        );
+        assert!(parse_pair("L=C@loud").is_err());
     }
 
     #[test]
