@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "orpheus-core",
+    "orpheus-aes70",
     "orpheus-nmos",
     "orpheus-clock",
     "orpheus-discovery",

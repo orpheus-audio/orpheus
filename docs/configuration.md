@@ -13,6 +13,7 @@ A node keeps its files where the XDG base directory specification says:
 ~/.local/state/orpheus/sources.json output and volume of each source played here
 ~/.local/state/orpheus/settings.json settings changed over the API
 ~/.local/state/orpheus/wires.json   wires from sources and inputs to outputs
+~/.local/state/orpheus/aes70.json   AES70 object numbers, so they stay the same
 ~/.cache/orpheus/               anything that can be rebuilt (not used yet)
 ```
 
@@ -85,6 +86,10 @@ priority2 = 128
 slave_only = false
 step_threshold_us = 1000
 settle_threshold_us = 100
+
+[aes70]
+enabled = true
+port = 7481
 
 [ui]
 # language = "de"
@@ -276,6 +281,20 @@ The `orpheus-*` icons ship with Orpheus, see
 [`orpheusd/dist/icons`](../orpheusd/dist/icons/README.md); the others come
 from the icon theme. A sink to another node takes the type its receiver
 announces; see [output types](usage.md#output-types).
+
+### `[aes70]`
+
+[AES70](usage.md#aes70) controllers, such as AES70 Explorer, see the wires
+and the outputs they play on, and set the wires' gains.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Take AES70 controllers, and announce them over mDNS. |
+| `port` | `7481` | TCP port for OCP.1, on the address of `[api] listen`. Over a WebSocket, controllers use the API's port. |
+
+Like the API, AES70 has no authentication yet: anyone who can reach the
+port can change the wires' gains. Set `enabled = false` where that is
+unwanted; then the WebSocket path answers `404` as well.
 
 ### `[loopback]`
 

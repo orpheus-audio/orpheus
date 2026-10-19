@@ -69,6 +69,9 @@ pub struct Node {
     pub events: crate::events::Events,
     /// Channels of sources and inputs played on outputs. Lock it last.
     pub wires: Mutex<crate::wires::Wires>,
+    /// What AES70 controllers see; `None` where they can't connect. Lock
+    /// it first.
+    pub aes70: Option<crate::aes70::Aes70>,
 }
 
 impl Node {
@@ -649,6 +652,7 @@ pub fn router(node: Arc<Node>) -> Router {
     router
         .merge(crate::nmos::router())
         .merge(crate::connection::router())
+        .route(crate::aes70::PATH, get(aes70))
         .route(
             &format!("{BASE}/openapi.json"),
             get(move || async move { ([(header::CONTENT_TYPE, "application/json")], spec) }),
@@ -2243,6 +2247,18 @@ async fn events(
     };
     let ws = ws.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.body_text()))?;
     Ok(ws.on_upgrade(move |socket| crate::events::serve(socket, node, topics)))
+}
+
+/// AES70 over a WebSocket: binary messages of OCP.1.
+async fn aes70(
+    State(node): State<Arc<Node>>,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Result<axum::response::Response, ApiError> {
+    if node.aes70.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "AES70 is off".into()));
+    }
+    let ws = ws.map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.body_text()))?;
+    Ok(ws.on_upgrade(move |socket| crate::aes70::websocket(socket, node)))
 }
 
 /// Sets the type of an output, overriding what was detected. Kept across

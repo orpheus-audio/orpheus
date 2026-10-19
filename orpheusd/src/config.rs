@@ -25,6 +25,7 @@ pub struct Config {
     pub sources: SourcesConfig,
     pub ptp: PtpConfig,
     pub loopback: LoopbackConfig,
+    pub aes70: Aes70Config,
     pub ui: UiConfig,
     /// Icon names for other nodes' outputs, by output type, replacing the
     /// defaults (Linux: XDG icon names).
@@ -371,6 +372,25 @@ impl Default for LoopbackConfig {
     }
 }
 
+/// AES70 (OCA) control: controllers see the wires and set their gains.
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Aes70Config {
+    pub enabled: bool,
+    /// TCP port for OCP.1, on the API's address. Over a WebSocket,
+    /// controllers use the API's port.
+    pub port: u16,
+}
+
+impl Default for Aes70Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 7481,
+        }
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match fs::read_to_string(path) {
@@ -461,6 +481,15 @@ mod tests {
         assert!(c.loopback.enabled);
         assert_eq!(c.loopback.latency_ms, 20);
         assert!(!Config::default().loopback.enabled);
+    }
+
+    #[test]
+    fn aes70_section() {
+        let c = Config::default();
+        assert!(c.aes70.enabled);
+        assert_eq!(c.aes70.port, 7481);
+        let c: Config = toml::from_str("[aes70]\nenabled = false").unwrap();
+        assert!(!c.aes70.enabled);
     }
 
     #[test]

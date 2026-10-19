@@ -18,8 +18,9 @@ clock synchronized over PTP and sample-rate conversion against the sound
 cards' clocks. Nodes find each other over mDNS and speak NMOS (IS-04,
 IS-05, BCP-004), so routes can be set with `orpheusctl`, which
 connects both ends, or an NMOS controller; they are kept across restarts.
-Settings can be changed while a node runs, and its state is pushed over a
-WebSocket. There is no authentication and no UI yet.
+Wires play any channel on any output channel, with gains and meters, which
+AES70 controllers can see and set too. Settings can be changed while a
+node runs, and its state is pushed over a WebSocket. There is no authentication and no UI yet.
 
 ## Quick start
 

@@ -46,6 +46,7 @@ Linux.
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
 | `orpheus-discovery` | Announces the node over mDNS and keeps the list of other nodes. |
 | `orpheus-nmos` | NMOS IS-04 resources, IDs and versions; IS-05 parameters; writing and reading SDP. |
+| `orpheus-aes70` | The device side of AES70: OCP.1 messages and data types, the managers, a tree of blocks, gains, mutes and level meters, and subscriptions. `no_std` with `alloc`, for the ESP32 firmware too. |
 
 ## Audio path
 
@@ -107,7 +108,7 @@ time instead of catching up ("realign").
 
 | Thread | Work |
 |---|---|
-| main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
+| main | tokio runtime: HTTP, NMOS and AES70 APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type and can set the default output, as the desktop does. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports; play the wires at their gains; measure the wires and the outputs they play on |
 | `orpheus-ptp` | PTP: sockets, timers, statime; restarts the port when its interface changes or the settings do, and retries while it can't start |
@@ -125,7 +126,8 @@ The TX, RX and PTP threads run at normal priority for now.
 | 320/udp | PTP general messages | multicast, IPv4 or IPv6 |
 | 5004–5018/udp | RTP: receiver *k* on 5004 + 2*k*, up to `[receiver] max` (by default; connections can pick other ports) | unicast; multicast only for interop, IPv4 and IPv6 |
 | 5353/udp | mDNS | multicast, IPv4 and IPv6 |
-| 7480/tcp | HTTP API | IPv4 and IPv6 |
+| 7480/tcp | HTTP API; AES70 over WebSocket | IPv4 and IPv6 |
+| 7481/tcp | AES70 (OCP.1) | IPv4 and IPv6 |
 
 ## Stream format
 
@@ -365,6 +367,21 @@ thread takes them into `Meter`s, which hold the peak over a second and the
 RMS over 300 ms, and publishes the levels for `/levels` and the health
 check, which warns while an output reached full scale in the last 10
 seconds.
+
+`aes70.rs` shows the wires to AES70 controllers. While any is
+connected, it builds an `orpheus_aes70::Tree` from the wires, the outputs
+and the levels every 100 ms; `Device::set_tree` compares it with the last
+one property by property, and each connection turns the changes into
+notifications for what its controller subscribed to. Object numbers come
+from `aes70.json`, keyed by what each object stands for (`output/<name>`,
+`wire/input:<name>/<output>/gain`, …), so they outlive restarts. A
+controller's `SetGain` or `SetState` comes back from the device as a
+`Set`, which `aes70.rs` carries out on the wires as the API would, then
+builds the tree at once, so that every controller hears of it. OCP.1
+arrives over TCP (its own listener) or as binary WebSocket messages on
+the API's router; both go through the same connection loop, which also
+sends keepalives at the interval the controller asks for and drops a
+controller silent for three of them.
 
 `connection.rs` watches the peers' receivers the senders are connected to.
 Discovery keeps each node's receiver change counter (`ver_rcv` in its mDNS

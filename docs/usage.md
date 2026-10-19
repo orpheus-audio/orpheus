@@ -755,6 +755,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `GET /x-orpheus/v1/settings` | The [settings](configuration.md#settings-changed-over-the-api) in effect, by section (`ptp`, `receiver`, `sender`), and `sources`: for each key where its value comes from, `default`, `config` or `api`. |
 | `PATCH /x-orpheus/v1/settings` | Changes settings, as a JSON merge patch: `{"receiver": {"policy": "mix"}}` sets a value, `null` in its place resets it. Returns `200` with the settings now in effect; `400` for an unknown key or a bad value, `422` if PTP can't start with the new values. Nothing changes on an error. |
 | `GET /x-orpheus/v1/events` | A WebSocket that pushes the node's state, see [below](#events). |
+| `GET /x-orpheus/v1/aes70` | A WebSocket for [AES70](#aes70) controllers, binary OCP.1 messages. `404` with `[aes70] enabled = false`. |
 | `GET /x-orpheus/v1/openapi.json` | The OpenAPI 3.1 description of the API. |
 
 The same OpenAPI document is printed by `orpheusd --openapi`.
@@ -943,6 +944,53 @@ avahi-browse -rt _nmos-node._tcp
 
 If two nodes have the same name, the second announces itself as
 `Name (2)`, and `orpheusctl nodes` shows it that way.
+
+A node that takes [AES70](#aes70) controllers also announces OCP.1 over
+TCP (`_oca._tcp`, port 7481) and over a WebSocket (`_ocaws._tcp`, the
+API's port, with the TXT key `path=/x-orpheus/v1/aes70`), under the same
+name.
+
+## AES70
+
+AES70 controllers, such as [AES70 Explorer](https://aes70explorer.com/),
+find each node over mDNS and see its wires and the outputs they play on,
+with their gains and meters. It is a view on the [wires](#wires):
+
+```text
+Root
+└── test.one                    output (machine name), labelled with its name
+    ├── level.1, level.2        peak meter per channel, in dBFS
+    └── input:test.mic2         a wire: source:<id> or input:<name>
+        ├── gain                the wire's gain, -90 to +12 dB
+        ├── mute                its mute
+        ├── gain.L=L            the gain of each pair the wire names
+        └── level.1=1           peak meter per link, output=input channel
+```
+
+| Object | AES70 class | A controller can |
+|---|---|---|
+| output, wire | `OcaBlock` | list the members, find them by role or label |
+| `gain`, `gain.TO=FROM` | `OcaGain` | read and set it, as `orpheusctl wire-gain` and `wire … TO=FROM@dB` do |
+| `mute` | `OcaMute` | read and set it |
+| `level.…` | `OcaAudioLevelSensor` | read the peak over the last second; below -90 dBFS, and while silent, it reads -90 and `Underrange` |
+
+A change made over AES70 goes the way one over the API does, ramped and
+kept in `wires.json`. Controllers that subscribed hear of every change
+within 100 ms, also of changes made over the API, and of meters while
+their peak moves by 0.1 dB or more. The device manager has the node's name,
+its ID as the serial number, and the version.
+
+Wiring stays with the API and `orpheusctl wire`: blocks can't be changed
+over AES70, and say so (`Configurability` is empty). A pair the wire
+doesn't name, because it plays all channels where they belong, has a meter
+but no gain of its own. The object numbers stay the same across restarts,
+so that controllers' screens keep working; they are kept in `aes70.json`
+in the [state directory](configuration.md#files).
+
+Controllers connect over TCP, port 7481, or a WebSocket on the API's port
+at `/x-orpheus/v1/aes70`, for controllers in a browser; see
+[`[aes70]`](configuration.md#aes70). As with the API, nothing asks who
+connects.
 
 ## NMOS
 

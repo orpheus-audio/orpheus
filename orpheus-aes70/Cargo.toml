@@ -1,0 +1,11 @@
+[package]
+name = "orpheus-aes70"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AES70 (OCA) device side for Orpheus: OCP.1 encoding and an object tree"
+keywords = ["audio", "aes70", "oca", "ocp1"]
+categories = ["multimedia::audio", "network-programming", "no-std"]
+
+[dependencies]

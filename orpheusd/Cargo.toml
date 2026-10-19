@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 orpheus-core = { workspace = true, features = ["serde"] }
+orpheus-aes70 = { path = "../orpheus-aes70" }
 orpheus-engine = { path = "../orpheus-engine", features = ["openapi"] }
 orpheus-clock = { path = "../orpheus-clock", features = ["openapi"] }
 orpheus-discovery = { path = "../orpheus-discovery", features = ["openapi"] }

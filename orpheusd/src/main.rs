@@ -1,5 +1,6 @@
 //! `orpheusd`: the Orpheus node daemon.
 
+mod aes70;
 mod api;
 mod config;
 mod connection;
@@ -83,17 +84,45 @@ async fn main() -> Result<()> {
         .with_context(|| format!("binding API to {}", config.api.listen))?;
     let listen = listener.local_addr()?;
     tracing::info!(addr = %listen, "API listening");
+    let aes70 = if config.aes70.enabled {
+        let addr = SocketAddr::new(config.api.listen.ip(), config.aes70.port);
+        match listen_tcp(addr) {
+            Ok(l) => {
+                tracing::info!(addr = %l.local_addr()?, "AES70 listening");
+                Some(l)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %addr, "AES70 unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let discovery = Discovery::start(&Announcement {
         id,
         name: name.clone(),
         port: listen.port(),
         version: env!("CARGO_PKG_VERSION").into(),
+        aes70: match &aes70 {
+            Some(l) => Some(orpheus_discovery::Aes70 {
+                port: l.local_addr()?.port(),
+                path: aes70::PATH.into(),
+            }),
+            None => None,
+        },
     })
     .inspect_err(|e| tracing::warn!(error = %e, "mDNS unavailable; no discovery"))
     .ok();
     let node = Arc::new(api::Node {
         id,
+        aes70: aes70.as_ref().map(|_| {
+            aes70::Aes70::new(
+                aes70::identity(&name, id),
+                home.state_dir().join("aes70.json"),
+            )
+        }),
         name,
         listen,
         engine: engine.map(Mutex::new),
@@ -130,6 +159,12 @@ async fn main() -> Result<()> {
     let events = tokio::spawn(events::watch(node.clone()));
     let streams = tokio::spawn(sources::run(node.clone()));
     let claims = tokio::spawn(connection::claim_on_play(node.clone()));
+    let control = aes70.map(|l| {
+        (
+            tokio::spawn(aes70::listen(node.clone(), l)),
+            tokio::spawn(aes70::run(node.clone())),
+        )
+    });
     // NMOS clients may add a trailing slash and call from browsers.
     let app =
         NormalizePathLayer::trim_trailing_slash().layer(api::router(node.clone()).layer(cors()));
@@ -143,6 +178,12 @@ async fn main() -> Result<()> {
     mixer.abort();
     streams.abort();
     claims.abort();
+    if let Some((listen, run)) = control {
+        listen.abort();
+        run.abort();
+        let _ = listen.await;
+        let _ = run.await;
+    }
     let _ = refresh.await;
     let _ = peers.await;
     let _ = health.await;

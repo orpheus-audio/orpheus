@@ -49,16 +49,16 @@ and it follows the grandmaster again within seconds, without a restart.
 
 - **Firewall.** PTP needs UDP 319 and 320 in both directions; RTP needs UDP
   5004 to 5018 (one port in two per receiver, up to `[receiver] max`; see
-  [configuration](configuration.md#receiver)), mDNS UDP 5353, and the API
-  TCP 7480. With firewalld:
+  [configuration](configuration.md#receiver)), mDNS UDP 5353, the API
+  TCP 7480, and [AES70](usage.md#aes70) TCP 7481. With firewalld:
 
   ```sh
-  sudo firewall-cmd --permanent --add-port=319-320/udp --add-port=5004-5018/udp --add-port=7480/tcp --add-service=mdns
+  sudo firewall-cmd --permanent --add-port=319-320/udp --add-port=5004-5018/udp --add-port=7480-7481/tcp --add-service=mdns
   sudo firewall-cmd --reload
   ```
 
   With ufw: `sudo ufw allow 319:320/udp`, `sudo ufw allow 5004:5018/udp`,
-  `sudo ufw allow 5353/udp`, `sudo ufw allow 7480/tcp`. To open them to the
+  `sudo ufw allow 5353/udp`, `sudo ufw allow 7480:7481/tcp`. To open them to the
   home network only, name it, as in
   `sudo ufw allow from 192.168.0.0/16 to any port 319:320 proto udp`.
 

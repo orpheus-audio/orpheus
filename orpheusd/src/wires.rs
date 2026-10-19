@@ -231,6 +231,35 @@ impl Wires {
         Some(wire)
     }
 
+    /// Sets the gain of the pair that plays `channel` on `to` in the wire
+    /// from `from` to `output`; `None` if there is no such pair, else the
+    /// wire.
+    pub fn set_pair_gain(
+        &mut self,
+        from: &Origin,
+        output: &str,
+        to: &Channel,
+        channel: &Channel,
+        gain_db: f32,
+    ) -> Option<Wire> {
+        let w = self
+            .list
+            .iter_mut()
+            .find(|w| w.from == *from && w.output == output)?;
+        let p = w
+            .channels
+            .iter_mut()
+            .flatten()
+            .find(|p| p.to == *to && p.from == *channel)?;
+        let changed = p.gain_db != gain_db;
+        p.gain_db = gain_db;
+        let wire = w.clone();
+        if changed {
+            self.save();
+        }
+        Some(wire)
+    }
+
     /// Removes the wire from `from` to `output`; `false` if there is none.
     pub fn remove(&mut self, from: &Origin, output: &str) -> bool {
         let before = self.list.len();

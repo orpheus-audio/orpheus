@@ -1169,6 +1169,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "orpheus-aes70"
+version = "0.0.1"
+
+[[package]]
 name = "orpheus-clock"
 version = "0.0.1"
 dependencies = [
@@ -1260,6 +1264,7 @@ dependencies = [
  "fluent-bundle",
  "fluent-langneg",
  "fluent-syntax",
+ "orpheus-aes70",
  "orpheus-clock",
  "orpheus-core",
  "orpheus-discovery",

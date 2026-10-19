@@ -14,7 +14,7 @@
 | M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes (through WirePlumber) | done, except the two-box test |
 | — | Route identity: stable route and source IDs, output and volume remembered per source, claiming the peer's receiver on play, default output | done |
 | M6 | Configurability: settings over the API (clock, receivers, senders), PTP that retries and holds over, WebSocket state stream, output selection, BCP-004, IS-08 per receiver (removed again in M7, replaced by wires) | done, except the two-box test |
-| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking, unavailable sinks, pausing players), English and German names, multichannel routes (up to 64 channels), gain per wire, meters done |
+| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking, unavailable sinks, pausing players), English and German names, multichannel routes (up to 64 channels), gain per wire, meters, AES70 done |
 
 After M7 the API should be stable enough for the web UI.
 
@@ -39,8 +39,12 @@ and Bluetooth inputs.
   set per source instead.
 - Wires have gains and meters, and an output that clips is warned
   about, but nothing guards it: there is no limiter, which would need
-  Orpheus to do the summing itself. Gains are set through Orpheus's API
-  only; AES70 comes later.
+  Orpheus to do the summing itself.
+- AES70 controllers see the wires and set their gains and mutes, but
+  can't make or remove wires (see [future work](#aes70-wiring)). A pair
+  has a gain of its own only where the wire names its pairs; nothing
+  mutes a single pair. Meters show the peak only; the RMS is in the API.
+  AES70 has no authentication and no OCP.1 over UDP.
 - `when_lost = "pause"` pauses only MPRIS players whose process it can
   tell for sure, not those in a Flatpak sandbox or players without MPRIS;
   their streams are parked. Nothing resumes a paused player when its
@@ -258,6 +262,22 @@ network delay, and no jitter or loss. Expected problems on real networks:
   option, a raw icon name per sink.
 - **Source types** (todo): the same for inputs, such as microphone, turntable
   or TV audio.
+
+### AES70 wiring
+
+Optional: wires made and removed over AES70, through an `OcaMatrix` per
+output, its rows the channels of the inputs and sources there are, its
+columns the output's channels, a gain at each crossing. Raising a
+crossing from silence would make a wire, lowering it to silence remove
+it. It can only show part of the model, so it waits for a controller
+someone wants to wire from:
+
+- A wire to a source that plays nowhere now has no row, and rows shift as
+  sources come and go.
+- Pairs named by symbol or label (`L=C`) become fixed channel numbers once
+  set through the matrix.
+- With no wires an input plays whole on its output; the matrix would show
+  that as empty, or setting a crossing would turn it into explicit wires.
 
 ### Receiver pool and policies
 

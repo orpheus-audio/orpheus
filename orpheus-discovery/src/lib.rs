@@ -9,6 +9,10 @@
 //! orpheusd version) and `x-orpheus-link` (`wired` or `wifi`, the node's
 //! own network link, so that peers can warn about it). The name is the instance name, so TXT stays
 //! ASCII, which some NMOS tools expect.
+//!
+//! A node that takes AES70 controllers also announces OCP.1 over TCP
+//! (`_oca._tcp`) and over a WebSocket on the API's port (`_ocaws._tcp`),
+//! under the same name.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -24,6 +28,11 @@ pub use mdns_sd::Error;
 /// DNS-SD service type of an NMOS node API.
 pub const SERVICE_TYPE: &str = "_nmos-node._tcp.local.";
 
+/// DNS-SD service types of AES70 devices: OCP.1 over TCP and over a
+/// WebSocket.
+pub const OCA_SERVICE_TYPE: &str = "_oca._tcp.local.";
+pub const OCA_WS_SERVICE_TYPE: &str = "_ocaws._tcp.local.";
+
 /// Longest DNS label is 63 bytes; leave room for a conflict suffix " (2)".
 const MAX_INSTANCE: usize = 56;
 
@@ -36,6 +45,17 @@ pub struct Announcement {
     pub port: u16,
     /// orpheusd version.
     pub version: String,
+    /// Where AES70 controllers connect, if they may.
+    pub aes70: Option<Aes70>,
+}
+
+/// Where AES70 controllers connect.
+#[derive(Debug, Clone)]
+pub struct Aes70 {
+    /// TCP port for OCP.1.
+    pub port: u16,
+    /// The WebSocket's path on the API's port.
+    pub path: String,
 }
 
 /// What kind of network link a node has.
@@ -107,6 +127,8 @@ pub struct Discovery {
     /// What the TXT record says beyond the fixed keys.
     announced: Mutex<(Counters, Option<Link>)>,
     registry: Arc<Mutex<Registry>>,
+    /// The full names of the AES70 services.
+    oca: Vec<String>,
 }
 
 impl Discovery {
@@ -119,6 +141,14 @@ impl Discovery {
         let info = service_info(me, instance_name(&me.name), Counters::default(), None)?;
         let fullname = Arc::new(Mutex::new(info.get_fullname().to_owned()));
         daemon.register(info)?;
+
+        let mut oca = Vec::new();
+        if let Some(a) = &me.aes70 {
+            for info in oca_service_info(me, a, instance_name(&me.name))? {
+                oca.push(info.get_fullname().to_owned());
+                daemon.register(info)?;
+            }
+        }
 
         let events = daemon.monitor()?;
         let ours = fullname.clone();
@@ -167,6 +197,7 @@ impl Discovery {
             fullname,
             announced: Mutex::new((Counters::default(), None)),
             registry,
+            oca,
         })
     }
 
@@ -203,8 +234,10 @@ impl Discovery {
 impl Drop for Discovery {
     fn drop(&mut self) {
         let fullname = self.fullname.lock().unwrap().clone();
-        if let Ok(done) = self.daemon.unregister(&fullname) {
-            let _ = done.recv_timeout(Duration::from_secs(1));
+        for name in std::iter::once(&fullname).chain(&self.oca) {
+            if let Ok(done) = self.daemon.unregister(name) {
+                let _ = done.recv_timeout(Duration::from_secs(1));
+            }
         }
         if let Ok(done) = self.daemon.shutdown() {
             let _ = done.recv_timeout(Duration::from_secs(1));
@@ -238,6 +271,49 @@ fn service_info(
     }
     let host = format!("orpheus-{}.local.", id.to_lowercase());
     Ok(ServiceInfo::new(SERVICE_TYPE, instance, &host, (), me.port, &txt[..])?.enable_addr_auto())
+}
+
+/// The AES70 services: OCP.1 over TCP and over a WebSocket. TXT as AES70
+/// asks (`txtvers`, `protovers`, the WebSocket's `path`), plus the
+/// manufacturer and model it suggests.
+fn oca_service_info(
+    me: &Announcement,
+    a: &Aes70,
+    instance: &str,
+) -> Result<Vec<ServiceInfo>, Error> {
+    let host = format!("orpheus-{}.local.", me.id.to_string().to_lowercase());
+    let txt = |path: Option<&str>| {
+        let mut txt = vec![
+            ("txtvers", "1".to_owned()),
+            ("protovers", "1".to_owned()),
+            ("manufacturer", "Orpheus".to_owned()),
+            ("model", "orpheusd".to_owned()),
+        ];
+        if let Some(path) = path {
+            txt.push(("path", path.to_owned()));
+        }
+        txt
+    };
+    Ok(vec![
+        ServiceInfo::new(
+            OCA_SERVICE_TYPE,
+            instance,
+            &host,
+            (),
+            a.port,
+            &txt(None)[..],
+        )?
+        .enable_addr_auto(),
+        ServiceInfo::new(
+            OCA_WS_SERVICE_TYPE,
+            instance,
+            &host,
+            (),
+            me.port,
+            &txt(Some(&a.path))[..],
+        )?
+        .enable_addr_auto(),
+    ])
 }
 
 /// The DNS-SD instance name: the node name, cut to fit one DNS label.
