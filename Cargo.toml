@@ -28,3 +28,11 @@ serde = { version = "1", features = ["derive"] }
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+
+# The resampler runs on every packet; unoptimized, it can't keep up with
+# streams of many channels, so debug builds optimize it too.
+[profile.dev.package]
+rubato.opt-level = 3
+audioadapter.opt-level = 3
+audioadapter-buffers.opt-level = 3
+audioadapter-sample.opt-level = 3

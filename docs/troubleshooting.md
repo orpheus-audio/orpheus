@@ -110,7 +110,9 @@ affected.
   not a host name either. `orpheusctl nodes` lists the names known.
 - `422 … has no receiver for L24/48000/2: …`: none of the peer's
   receivers can play the stream; the message names the first capability
-  that doesn't fit, for example `channel count 2; it takes 8`.
+  that doesn't fit, for example `channel count 16; it takes 1 to 8`. Give
+  the route fewer channels (`--layout`), up to 8 for receivers that take
+  only 1 ms packets.
 - `502 … no answer`: the peer's API is unreachable: wrong address, the node
   is down, or a firewall blocks TCP 7480. `orpheusctl nodes` shows
   whether the node was discovered and under which address.

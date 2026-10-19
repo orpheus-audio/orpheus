@@ -5,6 +5,7 @@
 //! request; the [`Store`] keeps their versions and counts changes, which
 //! discovery announces.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -30,24 +31,29 @@ use crate::api::{ClockSource, Node};
 use crate::sources::Parked;
 
 const CLOCK: &str = "clk0";
-/// What every sender sends and the receiver plays.
+/// What senders send and receivers play, with as many channels as each
+/// stream has; this many by default.
 pub const FORMAT: AudioFormat = AudioFormat::AES67;
 pub const ENCODING: Encoding = Encoding::L24;
 
-/// What the channels of every sender carry: those of its sink.
-pub fn layout() -> Layout {
-    Layout::default_for(FORMAT.channels.into())
+/// [`FORMAT`] with `channels` channels.
+pub fn format(channels: usize) -> AudioFormat {
+    AudioFormat {
+        channels: channels as u16,
+        ..FORMAT
+    }
 }
-pub const PTIME_MS: u32 = 1;
 
-/// What every sender sends, as receiver capabilities see it.
-pub fn stream() -> Stream<'static> {
+/// What a sender of `channels` channels sends, as receiver capabilities
+/// see it.
+pub fn stream(channels: usize) -> Stream<'static> {
+    let format = format(channels);
     Stream {
         media_type: media_type(),
-        sample_rate: FORMAT.rate,
-        channel_count: FORMAT.channels,
+        sample_rate: format.rate,
+        channel_count: format.channels,
         sample_depth: 8 * ENCODING.bytes_per_sample() as u8,
-        packet_time_ms: PTIME_MS.into(),
+        packet_time_ms: f64::from(format.packet_us()) / 1000.0,
     }
 }
 
@@ -215,10 +221,19 @@ fn snapshot(node: &Node) -> Snapshot {
         _ => Clock::Internal { name: CLOCK.into() },
     };
 
-    let engine = node
+    let (engine, layouts) = node
         .engine
         .as_ref()
-        .map(|e| e.lock().unwrap().status())
+        .map(|e| {
+            let e = e.lock().unwrap();
+            let status = e.status();
+            let layouts: BTreeMap<SenderId, Layout> = status
+                .senders
+                .iter()
+                .filter_map(|&(id, _)| Some((id, e.sender_layout(id)?.clone())))
+                .collect();
+            (status, layouts)
+        })
         .unwrap_or_default();
     let conns = node.connections.lock().unwrap();
     let receivers: Vec<(ReceiverId, ReceiverParams)> = conns
@@ -294,8 +309,12 @@ fn snapshot(node: &Node) -> Snapshot {
             format: FORMAT_AUDIO,
             caps: ReceiverCaps {
                 media_types: vec![media_type],
-                // Receivers play exactly what the senders send.
-                constraint_sets: vec![AudioConstraints::exactly(&stream())],
+                // Receivers play what senders send, with any number of
+                // channels a packet fits.
+                constraint_sets: vec![AudioConstraints::up_to(
+                    &stream(FORMAT.channels.into()),
+                    AudioFormat::MAX_CHANNELS,
+                )],
                 version: *CAPS_VERSION,
             },
             device_id,
@@ -325,7 +344,7 @@ fn snapshot(node: &Node) -> Snapshot {
             device_id,
             parents: vec![],
             clock_name: Some(CLOCK.into()),
-            channels: Channel::of(&layout()),
+            channels: layouts.get(n).map(Channel::of).unwrap_or_default(),
         });
         snap.flows.push(Flow {
             base: base(flow_id),
@@ -338,7 +357,7 @@ fn snapshot(node: &Node) -> Snapshot {
                 numerator: format.rate,
                 denominator: 1,
             },
-            bit_depth: stream().sample_depth,
+            bit_depth: 8 * ENCODING.bytes_per_sample() as u8,
         });
         snap.senders.push(Sender {
             base: base(uuid),
@@ -409,6 +428,13 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
             .or_else(|| interfaces().into_iter().next())
             .map_or([0; 6], |i| i.mac))),
     };
+    let layout = node
+        .engine
+        .as_ref()?
+        .lock()
+        .unwrap()
+        .sender_layout(id)?
+        .clone();
     let first = u64::from_be_bytes(uuid.as_bytes()[..8].try_into().unwrap());
     let session = sdp::Session {
         // NTP-style numbers fit 63 bits.
@@ -421,9 +447,8 @@ pub fn sdp(node: &Node, id: SenderId) -> Option<String> {
         destination,
         payload_type: PAYLOAD_TYPE,
         encoding: ENCODING,
-        format: FORMAT,
-        layout: &layout(),
-        ptime_ms: PTIME_MS,
+        format: format(layout.len()),
+        layout: &layout,
         clock,
         // RTP timestamps count media-clock frames since the epoch.
         media_clock_offset: 0,

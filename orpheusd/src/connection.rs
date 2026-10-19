@@ -38,7 +38,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use orpheus_core::{Layout, OutputType};
+use orpheus_core::{AudioFormat, Layout, OutputType, SourceId};
 use orpheus_engine::{
     Engine, Filter, Group, Placement, ReceiverConfig, ReceiverId, Route, SenderConfig, SenderId,
     Volume,
@@ -190,6 +190,9 @@ pub struct Cached {
     /// The sink's volume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     volume: Option<Volume>,
+    /// What the sink's channels carry, if not stereo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<Layout>,
 }
 
 impl Cached {
@@ -261,6 +264,9 @@ struct Link {
     /// The sink's volume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     volume: Option<Volume>,
+    /// What the sink's channels carry, if not stereo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layout: Option<Layout>,
     /// When this node last claimed or let go of the peer's receiver, or
     /// started waiting for one; what the peer said before that is out of
     /// date.
@@ -273,6 +279,21 @@ struct Link {
     /// receivers fit, if discovery knew it.
     #[serde(skip)]
     unfit_at: Option<u8>,
+}
+
+impl Link {
+    /// What the sink's channels carry.
+    fn layout(&self) -> Layout {
+        self.layout
+            .clone()
+            .unwrap_or_else(|| Layout::default_for(FORMAT.channels.into()))
+    }
+}
+
+/// `layout` as routes keep it: `None` for stereo, which they have unless
+/// told otherwise.
+fn custom(layout: Layout) -> Option<Layout> {
+    (layout != Layout::default_for(FORMAT.channels.into())).then_some(layout)
 }
 
 /// How a sender's connection to a peer's receiver stands.
@@ -572,7 +593,7 @@ pub fn restore(node: &Node) {
                     s.name,
                     peer,
                     sink_type(node, s.id, &s.link),
-                    s.link.volume.clone(),
+                    &s.link,
                 ),
             )
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -597,17 +618,19 @@ fn sender_config(
     name: String,
     peer: SocketAddr,
     remote: OutputType,
-    volume: Option<Volume>,
+    link: &Link,
 ) -> SenderConfig {
+    let layout = link.layout();
     SenderConfig {
         name: outputs::sender_sink(id),
         description: name,
-        format: nmos::FORMAT,
+        format: nmos::format(layout.len()),
+        layout,
         encoding: nmos::ENCODING,
         peer,
         remote,
         block_frames: node.block_frames,
-        volume,
+        volume: link.volume.clone(),
         fade_in_ms: node.settings().sender.fade_in_ms,
     }
 }
@@ -623,25 +646,30 @@ fn destination(p: &SenderParams) -> Option<SocketAddr> {
 
 /// Starts a sender to `peer` and activates that destination, without
 /// telling the peer. A route that only sent there with that priority
-/// before comes back under its ID.
+/// before comes back under its ID, and with its layout unless another is
+/// given.
 pub fn add_sender(
     node: &Node,
     peer: SocketAddr,
     name: String,
     priority: Priority,
+    layout: Option<Layout>,
 ) -> Result<SenderId, Fail> {
-    let (id, volume) = {
+    let (id, cached) = {
         let conns = node.connections.lock().unwrap();
-        conns
-            .cached
-            .iter()
-            .find(|c| c.sends(peer, priority))
-            .map_or_else(|| (conns.new_id(), None), |c| (c.id, c.volume.clone()))
+        let cached = conns.cached.iter().find(|c| c.sends(peer, priority));
+        (
+            cached.map_or_else(|| conns.new_id(), |c| c.id),
+            cached.cloned(),
+        )
     };
     let link = Link {
         named: true,
         priority,
-        volume,
+        volume: cached.as_ref().and_then(|c| c.volume.clone()),
+        layout: layout
+            .and_then(custom)
+            .or_else(|| cached.and_then(|c| c.layout)),
         ..Link::default()
     };
     start_sender(node, id, peer, name, link)
@@ -652,13 +680,14 @@ pub fn add_sender(
 /// receiver refuses, the sender goes again. A second connection to the
 /// same peer is refused unless it has another priority. A route to the
 /// peer with that priority remembered from before comes back under its ID,
-/// and with its name unless another is given.
+/// and with its name and layout unless others are given.
 pub fn connect(
     node: &Node,
     peer: &str,
     name: Option<String>,
     force: bool,
     priority: Priority,
+    layout: Option<Layout>,
 ) -> Result<Connected, Fail> {
     let found = peer::resolve(node, peer)?;
     let shown = found.name.clone().unwrap_or_else(|| peer.to_owned());
@@ -686,7 +715,11 @@ pub fn connect(
         let id = cached.as_ref().map_or_else(|| conns.new_id(), |c| c.id);
         (ours, cached, id)
     };
-    let target = peer::find_receiver(&found, &ours, force)?;
+    let layout = layout
+        .and_then(custom)
+        .or_else(|| cached.as_ref().and_then(|c| c.layout.clone()));
+    let channels = layout.as_ref().map_or(FORMAT.channels.into(), Layout::len);
+    let target = peer::find_receiver(&found, &ours, force, channels)?;
     let (named, name) = match (name, &cached) {
         (Some(n), _) => (true, n),
         (None, Some(c)) if c.named => (true, c.name.clone()),
@@ -708,6 +741,7 @@ pub fn connect(
         output: target.output,
         receiver: Some(to.clone()),
         volume: cached.as_ref().and_then(|c| c.volume.clone()),
+        layout,
         since: Some(Instant::now()),
         unreachable_since: None,
         unfit_at: None,
@@ -728,7 +762,7 @@ pub fn connect(
             %id,
             "another sender took the peer's receiver; trying another"
         );
-        let again = peer::find_receiver(&found, &ours, false)?;
+        let again = peer::find_receiver(&found, &ours, false, channels)?;
         let to = PeerReceiver {
             id: again.receiver,
             ..to.clone()
@@ -855,10 +889,7 @@ fn start_sender(
     let mut engine = lock_engine(node)?;
     let remote = sink_type(node, id, &link);
     engine
-        .insert_sender(
-            id,
-            &sender_config(node, id, name, peer, remote, link.volume.clone()),
-        )
+        .insert_sender(id, &sender_config(node, id, name, peer, remote, &link))
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     let params = SenderParams {
         receiver_id: link.receiver.as_ref().map(|r| r.id),
@@ -914,6 +945,72 @@ pub fn remove_sender(node: &Node, id: SenderId, forget: bool) -> Result<bool, Fa
         conns.save(node.engine.as_ref().map(|e| e.lock().unwrap()).as_deref());
     }
     Ok(removed || dropped)
+}
+
+/// Gives route `id` other channels. A running sender starts again with
+/// `layout`, and the peer's receiver it holds gets the new SDP file, with
+/// which it restarts; meanwhile the sender sends nothing, so that the
+/// receiver never takes its packets for another layout. If the peer
+/// refuses, the route goes back to the layout it had. A remembered route
+/// keeps the layout for when it runs again. False if there is no such
+/// route.
+pub fn set_layout(node: &Node, id: SenderId, layout: Layout) -> Result<bool, Fail> {
+    let (old, holds) = {
+        let mut conns = node.connections.lock().unwrap();
+        let conns = &mut *conns;
+        let engine = node.engine.as_ref().map(|e| e.lock().unwrap());
+        let Some(link) = conns.links.get_mut(&id) else {
+            let Some(cached) = conns.cached.iter_mut().find(|c| c.id == id) else {
+                return Ok(false);
+            };
+            cached.layout = custom(layout);
+            conns.save(engine.as_deref());
+            return Ok(true);
+        };
+        let old = link.layout();
+        let holds = link
+            .receiver
+            .clone()
+            .filter(|_| matches!(link.state, PeerState::Connected | PeerState::Connecting));
+        (old, holds)
+    };
+    if old == layout {
+        return Ok(true);
+    }
+    let apply = |layout: &Layout, paused: bool| -> Result<(), Fail> {
+        let mut conns = node.connections.lock().unwrap();
+        let mut engine = lock_engine(node)?;
+        engine.pause_sender(id, paused);
+        engine
+            .set_sender_layout(id, layout.clone())
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if let Some(link) = conns.links.get_mut(&id) {
+            link.layout = custom(layout.clone());
+        }
+        conns.save(Some(&engine));
+        Ok(())
+    };
+    let resume = || {
+        let conns = node.connections.lock().unwrap();
+        let paused = conns.links.get(&id).is_some_and(|l| l.state.pauses());
+        if let Some(engine) = &node.engine {
+            engine.lock().unwrap().pause_sender(id, paused);
+        }
+    };
+    apply(&layout, holds.is_some())?;
+    if let Some(to) = holds
+        && let Err(e) = attach(node, id, &to)
+    {
+        tracing::warn!(%id, error = %e.1, "the peer refused the new layout");
+        if apply(&old, true).is_ok() {
+            let _ = attach(node, id, &to);
+        }
+        resume();
+        return Err(e);
+    }
+    resume();
+    tracing::info!(%id, %layout, "route has a new layout");
+    Ok(true)
 }
 
 /// The type a sender's sink shows: the user's, else the peer's.
@@ -1515,6 +1612,7 @@ fn stop_sender(node: &Node, id: SenderId, keep: bool) -> Result<bool, Fail> {
                     peer,
                     used: unix_now(),
                     volume: engine.sender_volume(id).or(link.volume),
+                    layout: link.layout,
                 },
             );
             conns.evict(&node.peers.lock().unwrap());
@@ -1801,7 +1899,7 @@ fn apply_receiver(
                 &ReceiverConfig {
                     name: receiver_stream(id),
                     description: name.clone().unwrap_or_else(|| "Orpheus".into()),
-                    format: FORMAT,
+                    format: nmos::format(layout.len()),
                     layout,
                     encoding: nmos::ENCODING,
                     listen,
@@ -1846,10 +1944,45 @@ fn apply_receiver(
     Ok(resolved(port))
 }
 
+/// How many channels the stream of source `id` has, if a receiver plays it
+/// now: as its SDP file says, else two.
+pub fn source_channels(node: &Node, id: SourceId) -> Option<usize> {
+    let key = node
+        .sources
+        .lock()
+        .unwrap()
+        .list()
+        .iter()
+        .find(|s| s.id == id)?
+        .key
+        .clone();
+    let receiver = {
+        let engine = node.engine.as_ref()?.lock().unwrap();
+        engine
+            .status()
+            .receivers
+            .iter()
+            .map(|&(r, _)| r)
+            .find(|&r| engine.receiver_key(r) == Some(Some(&key)))?
+    };
+    let conns = node.connections.lock().unwrap();
+    let file = conns
+        .receiver_active(receiver)?
+        .transport_file
+        .data
+        .as_deref();
+    Some(
+        file.and_then(|d| sdp::parse(d).ok())
+            .map_or(FORMAT.channels, |s| s.channels)
+            .into(),
+    )
+}
+
 /// What the channels of a stream carry: as set for its source, else as
-/// its SDP file says, else what its channel count suggests.
+/// its SDP file says, else what its channel count suggests. Without an
+/// SDP file, a stream is taken to have two channels.
 fn stream_layout(node: &Node, key: Option<&str>, stream: Option<&sdp::Stream>) -> Layout {
-    let channels = usize::from(FORMAT.channels);
+    let channels = stream.map_or(FORMAT.channels, |s| s.channels).into();
     key.and_then(|k| node.sources.lock().unwrap().get(k)?.layout.clone())
         .filter(|l| l.len() == channels)
         .or_else(|| stream.and_then(|s| s.layout.clone()))
@@ -1903,14 +2036,14 @@ fn check_receiver(p: &ReceiverParams) -> Result<(), String> {
     if let Some(data) = &file.data {
         let s = sdp::parse(data)?;
         let want = nmos::FORMAT;
-        if (s.encoding.as_str(), s.rate, s.channels)
-            != (nmos::ENCODING.name(), want.rate, want.channels)
+        let max = AudioFormat::MAX_CHANNELS;
+        if (s.encoding.as_str(), s.rate) != (nmos::ENCODING.name(), want.rate)
+            || !(1..=max).contains(&s.channels)
         {
             return Err(format!(
-                "the receiver plays {}/{}/{}, not {}/{}/{}",
+                "the receiver plays {}/{} with 1 to {max} channels, not {}/{}/{}",
                 nmos::ENCODING.name(),
                 want.rate,
-                want.channels,
                 s.encoding,
                 s.rate,
                 s.channels
@@ -2443,6 +2576,7 @@ mod tests {
             peer: "10.0.0.2:5004".parse().unwrap(),
             used,
             volume: None,
+            layout: None,
         }
     }
 
@@ -2529,8 +2663,13 @@ mod tests {
         for bad in [
             other("L24/48000/2", "L16/48000/2"),
             other("L24/48000/2", "L24/44100/2"),
+            other("L24/48000/2", "L24/48000/65"),
         ] {
             assert!(check_receiver(&receiver(Some(&bad))).is_err(), "{bad}");
+        }
+        for channels in ["L24/48000", "L24/48000/6", "L24/48000/64"] {
+            let fits = other("L24/48000/2", channels);
+            assert_eq!(check_receiver(&receiver(Some(&fits))), Ok(()), "{fits}");
         }
         let multicast = SDP.replace("c=IN IP4 10.0.0.2", "c=IN IP4 239.1.1.1/32");
         assert_eq!(check_receiver(&receiver(Some(&multicast))), Ok(()));

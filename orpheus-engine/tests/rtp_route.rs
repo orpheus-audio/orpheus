@@ -40,13 +40,23 @@ const QUANTUM: usize = 240; // 5 ms
 const LINK_OFFSET_MS: u32 = 5;
 const FULL: f32 = (1 << 23) as f32;
 
-/// Builds a sender → receiver route on `clock` and plays a ramp through it
-/// for `cycles` audio cycles. The fake sound card runs on `Instant`. Each
-/// sample is its frame number, which L24 carries exactly and the resamplers
-/// (at a ratio of almost exactly 1) to within a fraction of a frame. Returns
-/// the played samples (left channel).
-fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
-    let format = AudioFormat::AES67;
+/// Between the ramps of neighbouring channels.
+const CHANNEL_STEP: f64 = 1000.0;
+
+/// Builds a sender → receiver route of `channels` channels on `clock` and
+/// plays a ramp through it for `cycles` audio cycles. The fake sound card
+/// runs on `Instant`. Each sample is its frame number, plus
+/// [`CHANNEL_STEP`] for each channel before its own, which L24 carries
+/// exactly and the resamplers (at a ratio of almost exactly 1) to within a
+/// fraction of a frame. Returns the played samples of the first channel
+/// and the last frame played.
+fn play_ramp(clock: Arc<dyn Clock>, cycles: usize, channels: u16) -> (Engine, Vec<f64>, Vec<f64>) {
+    let format = AudioFormat {
+        rate: 48_000,
+        channels,
+    };
+    let ch = usize::from(channels);
+    let layout = Layout::default_for(ch);
     let fake = FakeBackend::default();
     let mut engine = Engine::new(Box::new(fake.clone()), clock);
     engine
@@ -56,7 +66,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 name: "rx".into(),
                 description: "rx".into(),
                 format,
-                layout: Layout::default_for(2),
+                layout: layout.clone(),
                 encoding: Encoding::L24,
                 listen: "127.0.0.1:0".parse().unwrap(),
                 link_offset_ms: LINK_OFFSET_MS,
@@ -76,6 +86,7 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
                 name: "tx".into(),
                 description: "tx".into(),
                 format,
+                layout,
                 encoding: Encoding::L24,
                 peer: listen,
                 remote: OutputType::Generic,
@@ -88,20 +99,28 @@ fn play_ramp(clock: Arc<dyn Clock>, cycles: usize) -> (Engine, Vec<f64>) {
     let mut sink = fake.sinks.lock().unwrap().pop().unwrap();
     let mut playback = fake.playbacks.lock().unwrap().pop().unwrap();
 
-    let mut out = vec![0.0f32; QUANTUM * 2];
+    let mut out = vec![0.0f32; QUANTUM * ch];
     let mut played = Vec::new();
     let start = Instant::now();
     for cycle in 0..cycles {
         let input: Vec<f32> = (0..QUANTUM)
-            .flat_map(|i| [(cycle * QUANTUM + i + 1) as f32 / FULL; 2])
+            .flat_map(|i| {
+                (0..ch).map(move |c| {
+                    ((cycle * QUANTUM + i + 1) as f64 + c as f64 * CHANNEL_STEP) as f32 / FULL
+                })
+            })
             .collect();
         sink.push(&input);
         playback.fill(&mut out);
-        played.extend(out.iter().step_by(2).map(|s| (s * FULL) as f64));
+        played.extend(out.iter().step_by(ch).map(|s| (s * FULL) as f64));
         let due = start + Duration::from_millis(5 * (cycle as u64 + 1));
         thread::sleep(due.saturating_duration_since(Instant::now()));
     }
-    (engine, played)
+    let last = out[out.len() - ch..]
+        .iter()
+        .map(|s| (s * FULL) as f64)
+        .collect();
+    (engine, played, last)
 }
 
 /// Latency in frames of the audio at `at`, from the ramp value there.
@@ -111,7 +130,7 @@ fn latency_at(played: &[f64], at: usize) -> f64 {
 
 #[test]
 fn audio_arrives_intact_and_on_time() {
-    let (engine, played) = play_ramp(Arc::new(SystemClock::new()), 300);
+    let (engine, played, _) = play_ramp(Arc::new(SystemClock::new()), 300, 2);
 
     let first = played
         .iter()
@@ -138,6 +157,31 @@ fn audio_arrives_intact_and_on_time() {
     eprintln!("latency {ms:.1} ms, {rx:?}");
 }
 
+/// More than 8 channels go in 125 µs packets of 6 frames; each channel
+/// arrives in its place.
+#[test]
+fn many_channels_arrive_in_short_packets() {
+    let (engine, played, last) = play_ramp(Arc::new(SystemClock::new()), 200, 16);
+    let tail = &played[played.len() - 4800..];
+    assert!(
+        tail.windows(2).all(|w| (w[1] - w[0] - 1.0).abs() < 0.1),
+        "last 100 ms not continuous"
+    );
+    for (c, s) in last.iter().enumerate() {
+        let step = s - last[0];
+        assert!(
+            (step - c as f64 * CHANNEL_STEP).abs() < 0.5,
+            "channel {c}: {step}"
+        );
+    }
+    let status = engine.status();
+    let rx = status.receivers[0].1;
+    assert_eq!(rx.lost, 0);
+    assert_eq!(rx.malformed, 0);
+    // 8 packets per millisecond over a second.
+    assert!(rx.packets > 6000, "{} packets", rx.packets);
+}
+
 /// The media clock runs 500 ppm fast against the sound card. Without ASRC
 /// the sender's buffer would run dry about every 20 s and the receiver's
 /// overflow; with it the latency holds. Takes two minutes.
@@ -147,7 +191,7 @@ fn drift_is_absorbed() {
     let skew = 500.0;
     let clock = SystemClock::with_timescale(Timescale::tai().skewed(skew, 0));
     let cycles = 24_000; // 120 s
-    let (engine, played) = play_ramp(Arc::new(clock), cycles);
+    let (engine, played, _) = play_ramp(Arc::new(clock), cycles, 2);
 
     let status = engine.status();
     let rx = status.receivers[0].1;
@@ -217,6 +261,7 @@ fn routes_and_filters_change_at_runtime() {
                 name: "tx".into(),
                 description: "tx".into(),
                 format: AudioFormat::AES67,
+                layout: Layout::default_for(2),
                 encoding: Encoding::L24,
                 peer: listen,
                 remote: OutputType::Generic,
@@ -317,6 +362,7 @@ fn gain_mutes_and_the_meter_hears_through_it() {
                 name: "tx".into(),
                 description: "tx".into(),
                 format,
+                layout: Layout::default_for(2),
                 encoding: Encoding::L24,
                 peer: listen,
                 remote: OutputType::Generic,

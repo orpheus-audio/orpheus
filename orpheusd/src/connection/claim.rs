@@ -178,11 +178,16 @@ fn humanize(d: Duration) -> String {
 /// sender, which fades in; if the peer has none, the route waits for one,
 /// and if none fits, for the peer's receivers to change.
 fn claim(node: &Node, id: SenderId, first: bool) {
-    let from = {
+    let (from, channels) = {
         let conns = node.connections.lock().unwrap();
-        conns.links.get(&id).and_then(|l| l.receiver.clone())
+        let link = conns.links.get(&id);
+        (
+            link.and_then(|l| l.receiver.clone()),
+            link.map(|l| l.layout().len()),
+        )
     };
-    let (Some(from), Some(mut dest)) = (from, destination_of(node, id)) else {
+    let (Some(from), Some(channels), Some(mut dest)) = (from, channels, destination_of(node, id))
+    else {
         return;
     };
     let ours: Vec<Uuid> = node
@@ -199,7 +204,7 @@ fn claim(node: &Node, id: SenderId, first: bool) {
         name: None,
         node: from.node.clone(),
     };
-    let claimed = peer::find_receiver(&peer, &ours, false).and_then(|t| {
+    let claimed = peer::find_receiver(&peer, &ours, false, channels).and_then(|t| {
         dest.set_port(t.port);
         let to = PeerReceiver {
             id: t.receiver,

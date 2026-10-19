@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use orpheus_clock::ptp::{PtpClock, PtpStatus};
-use orpheus_core::{DeviceId, Layout, SourceId};
+use orpheus_core::{AudioFormat, DeviceId, Layout, SourceId};
 use orpheus_discovery::Discovery;
 use orpheus_engine::{Engine, ReceiverId, ReceiverStatus, SenderId, SenderStatus, StatsSnapshot};
 use serde::de::DeserializeOwned;
@@ -558,6 +558,9 @@ pub struct RouteEntry {
     /// For a running route to a peer's receiver: how that stands.
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<crate::connection::PeerState>,
+    /// What the sink's channels carry, and with them the stream's.
+    #[schema(value_type = Vec<LayoutChannel>)]
+    layout: Layout,
     /// When a remembered route last ran, in seconds since the Unix epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used: Option<u64>,
@@ -587,6 +590,11 @@ struct NewSender {
     #[serde(default)]
     #[schema(value_type = String, example = "normal")]
     priority: Priority,
+    /// What the sink's channels carry, as for a [source's
+    /// layout](#/sources/set_source_layout); defaults to the layout the
+    /// route had before, else stereo.
+    #[schema(value_type = Option<LayoutText>)]
+    layout: Option<LayoutBody>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -611,6 +619,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(list_routes, add_sender))
         .routes(routes!(remove_sender))
         .routes(routes!(sender_sdp))
+        .routes(routes!(set_route_layout))
         .routes(routes!(nodes))
         .routes(routes!(change_node))
         .routes(routes!(outputs, create_output))
@@ -801,14 +810,23 @@ fn status_of(node: &Node) -> Status {
 }
 
 fn routes_of(node: &Node) -> Vec<RouteEntry> {
-    let engine = node
-        .engine
-        .as_ref()
-        .map(|e| e.lock().unwrap().status().senders)
-        .unwrap_or_default();
+    let (engine, mut layouts) = match &node.engine {
+        Some(e) => {
+            let e = e.lock().unwrap();
+            let senders = e.status().senders;
+            let layouts: BTreeMap<SenderId, Layout> = senders
+                .iter()
+                .filter_map(|&(id, _)| Some((id, e.sender_layout(id)?.clone())))
+                .collect();
+            (senders, layouts)
+        }
+        None => Default::default(),
+    };
+    let stereo = || Layout::default_for(crate::nmos::FORMAT.channels.into());
     let conns = node.connections.lock().unwrap();
     let links = conns.peer_links();
     let active = engine.into_iter().map(|(id, s)| RouteEntry {
+        layout: layouts.remove(&id).unwrap_or_else(stereo),
         id,
         name: s.name,
         priority: conns.sender_priority(id),
@@ -826,6 +844,7 @@ fn routes_of(node: &Node) -> Vec<RouteEntry> {
         node: c.node.clone(),
         active: false,
         state: None,
+        layout: c.layout.clone().unwrap_or_else(stereo),
         last_used: Some(c.used),
     });
     active.chain(cached).collect()
@@ -955,23 +974,42 @@ async fn set_source_layout(
     Id(id): Id<SourceId>,
     Body(req): Body<SetLayout>,
 ) -> Result<StatusCode, ApiError> {
-    let layout = match req.layout {
+    let layout = layout_of(req.layout)?;
+    blocking(move || {
+        let channels = crate::connection::source_channels(&node, id);
+        if let Some(channels) = channels.filter(|&c| c != layout.len()) {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!(
+                    "{layout} has {} channels; the source's stream has {channels}",
+                    layout.len()
+                ),
+            ));
+        }
+        set_layout(&node, id, Some(layout))
+    })
+    .await
+}
+
+/// A layout as given, of 1 to [`AudioFormat::MAX_CHANNELS`] channels.
+fn layout_of(body: LayoutBody) -> Result<Layout, ApiError> {
+    let layout = match body {
         LayoutBody::Text(text) => {
             Layout::parse(&text).map_err(|e| ApiError(StatusCode::BAD_REQUEST, e.to_string()))?
         }
         LayoutBody::Channels(layout) => layout,
     };
-    let channels = usize::from(crate::nmos::FORMAT.channels);
-    if layout.len() != channels {
+    let max = usize::from(AudioFormat::MAX_CHANNELS);
+    if !(1..=max).contains(&layout.len()) {
         return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
+            StatusCode::BAD_REQUEST,
             format!(
-                "{layout} has {} channels; streams here have {channels}",
+                "{layout} has {} channels; streams have 1 to {max}",
                 layout.len()
             ),
         ));
     }
-    blocking(move || set_layout(&node, id, Some(layout))).await
+    Ok(layout)
 }
 
 /// Goes back to the layout a source's stream says.
@@ -1042,13 +1080,15 @@ async fn add_sender(
     State(node): State<Arc<Node>>,
     Body(req): Body<NewSender>,
 ) -> Result<(StatusCode, Json<Created>), ApiError> {
+    let layout = req.layout.map(layout_of).transpose()?;
     let created = if req.send_only {
         let peer = resolve(&req.peer).await?;
         let name = req.name.unwrap_or_else(|| req.peer.clone());
         let label = name.clone();
         let priority = req.priority;
         let id =
-            blocking(move || crate::connection::add_sender(&node, peer, label, priority)).await?;
+            blocking(move || crate::connection::add_sender(&node, peer, label, priority, layout))
+                .await?;
         Created {
             id,
             name,
@@ -1057,7 +1097,7 @@ async fn add_sender(
         }
     } else {
         let c = blocking(move || {
-            crate::connection::connect(&node, &req.peer, req.name, req.force, req.priority)
+            crate::connection::connect(&node, &req.peer, req.name, req.force, req.priority, layout)
         })
         .await?;
         Created {
@@ -1129,6 +1169,40 @@ async fn sender_sdp(
         crate::nmos::sdp(&node, id)
             .map(|sdp| ([(header::CONTENT_TYPE, "application/sdp")], sdp))
             .ok_or((StatusCode::NOT_FOUND, format!("no route {id} running")))
+    })
+    .await
+}
+
+/// Sets what the channels of a route's sink carry, and with them how many
+/// channels its stream has: as ST 2110-30 groups or channel symbols
+/// (`{"layout": "51"}`), or as the channels with labels. A running route
+/// starts its sink again, and the peer's receiver restarts with the new
+/// stream; a remembered route keeps it for when it runs again. Streams of
+/// up to 8 channels go in 1 ms packets, more in 125 µs packets.
+#[utoipa::path(
+    put,
+    path = "/x-orpheus/v1/routes/{id}/layout",
+    tag = "routes",
+    params(("id" = String, Path, description = "Route ID")),
+    request_body = SetLayout,
+    responses(
+        (status = NO_CONTENT, description = "Set"),
+        (status = BAD_REQUEST, description = "A malformed request or layout", body = ErrorBody),
+        (status = NOT_FOUND, description = "No such route", body = ErrorBody),
+        (status = BAD_GATEWAY, description = "The peer cannot be reached or refused the stream; the route keeps its layout", body = ErrorBody),
+        (status = SERVICE_UNAVAILABLE, description = "No audio system", body = ErrorBody),
+    ),
+)]
+async fn set_route_layout(
+    State(node): State<Arc<Node>>,
+    Id(id): Id<SenderId>,
+    Body(req): Body<SetLayout>,
+) -> Result<StatusCode, ApiError> {
+    let layout = layout_of(req.layout)?;
+    blocking(move || {
+        crate::connection::set_layout(&node, id, layout)?
+            .then_some(StatusCode::NO_CONTENT)
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no route {id}")))
     })
     .await
 }
@@ -2221,6 +2295,7 @@ mod tests {
                 "/x-orpheus/v1/receivers/{id}/output",
                 "/x-orpheus/v1/routes",
                 "/x-orpheus/v1/routes/{id}",
+                "/x-orpheus/v1/routes/{id}/layout",
                 "/x-orpheus/v1/routes/{id}/sdp",
                 "/x-orpheus/v1/settings",
                 "/x-orpheus/v1/sources",

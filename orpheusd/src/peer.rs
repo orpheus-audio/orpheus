@@ -232,9 +232,15 @@ fn patch_receiver(api: &str, receiver: Uuid, body: &Value) -> Result<(), Fail> {
 }
 
 /// Picks a receiver on `peer` whose capabilities (BCP-004-01) take our
-/// stream and that has no sender, or with `force`, one that plays another
-/// node's sender. `ours` are our senders, whose receivers are never taken.
-pub fn find_receiver(peer: &Peer, ours: &[Uuid], force: bool) -> Result<Target, Fail> {
+/// stream of `channels` channels and that has no sender, or with `force`,
+/// one that plays another node's sender. `ours` are our senders, whose
+/// receivers are never taken.
+pub fn find_receiver(
+    peer: &Peer,
+    ours: &[Uuid],
+    force: bool,
+    channels: usize,
+) -> Result<Target, Fail> {
     let receivers = get(&peer.api, "/x-nmos/node/v1.3/receivers")?;
     let receivers = receivers.as_array().cloned().unwrap_or_default();
     let audio: Vec<&Value> = receivers
@@ -253,7 +259,7 @@ pub fn find_receiver(peer: &Peer, ours: &[Uuid], force: bool) -> Result<Target, 
             format!("{name} has no audio receiver over RTP"),
         ));
     }
-    let stream = crate::nmos::stream();
+    let stream = crate::nmos::stream(channels);
     let checked: Vec<_> = audio
         .iter()
         .map(|r| (*r, caps::check(&r["caps"], &stream)))

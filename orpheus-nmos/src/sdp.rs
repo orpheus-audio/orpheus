@@ -43,9 +43,9 @@ pub struct Session<'a> {
     pub payload_type: u8,
     pub encoding: Encoding,
     pub format: AudioFormat,
-    /// Of `format.channels` channels.
+    /// Of `format.channels` channels; the packet time follows from the
+    /// format.
     pub layout: &'a Layout,
-    pub ptime_ms: u32,
     pub clock: RefClock,
     /// The RTP timestamp at the clock's epoch; Orpheus counts from 0.
     pub media_clock_offset: u32,
@@ -101,7 +101,7 @@ impl Session<'_> {
              a=sendonly\r\n\
              a=ptime:{}\r\n",
             family(dst),
-            self.ptime_ms,
+            ptime(f.packet_us()),
         );
         let _ = match &self.clock {
             RefClock::Ptp { gmid, domain } => write!(
@@ -125,6 +125,12 @@ impl Session<'_> {
         }
         s
     }
+}
+
+/// A packet time in milliseconds as `a=ptime` has it: `1`, `0.125`.
+fn ptime(us: u32) -> String {
+    let ms = format!("{}.{:03}", us / 1000, us % 1000);
+    ms.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 /// What a receiver needs from an SDP file: the first audio stream.
@@ -299,7 +305,6 @@ mod tests {
             encoding: Encoding::L24,
             format: AudioFormat::AES67,
             layout: Box::leak(Box::new(Layout::default_for(2))),
-            ptime_ms: 1,
             clock,
             media_clock_offset: 0,
             node: None,
@@ -331,6 +336,25 @@ mod tests {
              a=ts-refclk:ptp=IEEE1588-2008:72-8E-2C-FF-FE-86-7F-85:0\r\n\
              a=mediaclk:direct=0\r\n"
         );
+    }
+
+    #[test]
+    fn many_channels_in_short_packets() {
+        let mut sdp = session(RefClock::LocalMac("00-1b-21-ab-cd-ef".into()));
+        sdp.format.channels = 16;
+        sdp.layout = Box::leak(Box::new(Layout::parse("51 U10").unwrap()));
+        let sdp = sdp.render();
+        assert!(sdp.contains("a=rtpmap:97 L24/48000/16\r\n"), "{sdp}");
+        assert!(
+            sdp.contains("channel-order=SMPTE2110.(51,U10)\r\n"),
+            "{sdp}"
+        );
+        assert!(sdp.contains("a=ptime:0.125\r\n"), "{sdp}");
+        let stream = parse(&sdp).unwrap();
+        assert_eq!(stream.channels, 16);
+        assert_eq!(stream.layout.unwrap().to_string(), "51,U10");
+        assert_eq!(ptime(250), "0.25");
+        assert_eq!(ptime(4000), "4");
     }
 
     #[test]

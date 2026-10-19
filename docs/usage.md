@@ -17,9 +17,10 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `status` | Shows the node's ID, name, version, clock, receivers and routes. |
 | `status --watch [SECONDS]` | Refreshes the status every second, or every `SECONDS`, until interrupted. Counters are shown as rates, for example `3 late/s`. |
 | `nodes` | Lists the other nodes the node found on the network, with ID, address, version and link (`wired` or `Wi-Fi`, as each node announces it). Nodes that stopped stay listed as offline. A node with an [alias](#aliases-and-pins) is shown as `Alias (Name)`. |
-| `connect PEER [--name NAME] [--priority high] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a route: a sink called `NAME` (the route's name from before, else the peer's name), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. `--priority high` plays over the peer's other streams (see [several streams](#several-streams)). The route is kept across restarts. By default it holds the peer's receiver all the time; it can also [claim it only while audio plays](#claiming-a-receiver-on-play). |
+| `connect PEER [--name NAME] [--priority high] [--layout LAYOUT] [--force]` | Sends the node's audio to `PEER` and connects a free receiver there to it (see [connecting](#connecting)). This creates a route: a sink called `NAME` (the route's name from before, else the peer's name), with an icon for the peer's kind of output. Whatever is played into the sink comes out of the peer. `--priority high` plays over the peer's other streams (see [several streams](#several-streams)). `--layout` gives the sink, and with it the stream, other channels than stereo (see [multichannel routes](#multichannel-routes)). The route is kept across restarts. By default it holds the peer's receiver all the time; it can also [claim it only while audio plays](#claiming-a-receiver-on-play). |
 | `connect PEER --send-only [--name NAME]` | Only sends; the peer's receiver is left alone. For devices without NMOS, and receivers set to accept any stream. |
 | `routes` | Lists the routes: the ones that run, with how they stand (`connected`, `idle`, `waiting for a free receiver`, `peer offline`, …), and the ones [remembered](#routes) from before. |
+| `route-layout ROUTE LAYOUT` | Gives a route's sink other channels, such as `51` or `U16` (see [multichannel routes](#multichannel-routes)); `ST` makes it stereo again. Whatever plays into the sink goes on in the new one; the peer's receiver restarts with the stream. |
 | `disconnect ROUTE` | Stops a route, removes its sink and disconnects the peer's receiver. The route is remembered. `ROUTE` is its name, or its ID or the start of it, as `routes` shows. |
 | `forget ROUTE` | Forgets a route, so that the next `connect` starts a new one; a route that runs is disconnected first. |
 | `alias NODE ALIAS` | Gives another node a name of your own, shown instead of the one it announces (see [aliases and pins](#aliases-and-pins)). `alias NODE --remove` removes it. |
@@ -150,7 +151,8 @@ that should be the same next time hangs on it:
   desktop's volume control moved there find it again, as does the
   [output type](#output-types) set for it;
 - the sink's volume, which the node keeps with the route in `routes.json`
-  (WirePlumber keeps nothing for these sinks);
+  (WirePlumber keeps nothing for these sinks), and its
+  [layout](#multichannel-routes);
 - the source the stream announces (`a=x-orpheus-source` in the SDP file,
   and its NMOS source ID): the peer remembers by it on which output and at
   what volume the stream plays (see [outputs and
@@ -389,8 +391,35 @@ curl -X PUT localhost:7480/x-orpheus/v1/sources/<id>/layout -H 'content-type: ap
   -d '{"layout": [{"symbol": "U01", "label": "Mic 1"}, {"symbol": "U02", "label": "Mic 2"}]}'
 ```
 
-Streams have two channels for now; a layout with another number is
-refused. Orpheus' own senders send stereo, `L` and `R`.
+A source's layout must have as many channels as its stream; while it
+plays, a layout with another number is refused.
+
+### Multichannel routes
+
+A route sends stereo unless told otherwise. Its layout says what the
+sink's channels carry, and with them how many channels the stream has,
+from 1 to 64:
+
+```sh
+orpheusctl connect Cinema --layout 51     # a 5.1 sink "Cinema"
+orpheusctl route-layout Cinema 71         # 7.1 from now on
+orpheusctl route-layout Stage U16         # 16 numbered channels
+orpheusctl route-layout Cinema ST         # stereo again
+```
+
+Applications see the sink with these channels, play into it as into a
+5.1 sound card, and PipeWire mixes stereo applications up onto it (or
+down, for a sink with fewer channels). The route keeps its layout while it
+is remembered. Changing it starts a new sink with the same name; whatever
+played into the old one goes on in the new one, and the peer's receiver
+restarts with the new stream. `orpheusctl routes` shows each route's
+channels.
+
+Up to 8 channels go in 1 ms packets, more in 125 µs packets (8000 a
+second), as SMPTE ST 2110-30 has it, so that every packet fits an
+Ethernet frame. Receivers of other makers must take that packet time;
+those of level A (most AES67 devices) take only 8 channels at 1 ms, and
+`connect` refuses a peer whose receivers don't take the stream.
 
 ### Inputs and outputs
 
@@ -664,9 +693,10 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | Method and path | Effect |
 |---|---|
 | `GET /x-orpheus/v1/status` | Node status as JSON (what `orpheusctl status` shows); see [below](#the-status-json). |
-| `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, for running routes to a peer's receiver `state` (as in [the status JSON](#the-status-json)), and for remembered ones `last_used` (Unix seconds). |
-| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `422` if there is no such peer or none of its receivers can play the stream, `502` if it can't be reached or refuses. |
+| `GET /x-orpheus/v1/routes` | The [routes](#routes) that run, then the remembered ones, most recently used first: `id`, `name`, `priority`, `peer` (address), `node` (the peer's node ID), `active`, for running routes to a peer's receiver `state` (as in [the status JSON](#the-status-json)), `layout` (the sink's channels, `symbol` and `label` each, see [multichannel routes](#multichannel-routes)), and for remembered ones `last_used` (Unix seconds). |
+| `POST /x-orpheus/v1/routes` | Starts a route and [connects](#connecting) a receiver of the peer to it. Body: `{"peer": "Kitchen"}`, optionally with `"name"`, `"priority": "high"`, `"layout"` (as for [sources](#channel-layouts)), `"force": true` or `"send_only": true`. Returns `201` with `{"id": "K7QM3XRA", "name": "Kitchen", "destination": "192.168.1.20:5004", "receiver": "<uuid>"}`; `409` if the peer has no free receiver or this node is already connected to it with the same priority, `422` if there is no such peer or none of its receivers can play the stream, `502` if it can't be reached or refuses. |
 | `DELETE /x-orpheus/v1/routes/{id}` | Stops a route and disconnects the peer's receiver; the route is remembered. With `?forget=true` it is forgotten, also one that doesn't run. Returns `204`, or `404` if there is no such route. |
+| `PUT /x-orpheus/v1/routes/{id}/layout` | Gives a route's sink other channels: `{"layout": "51"}`, or the channels with labels as for [sources](#channel-layouts); 1 to 64 channels (see [multichannel routes](#multichannel-routes)). A running route starts its sink again and the peer's receiver restarts with the stream; a remembered one keeps it for when it runs. Returns `204`; `400` for a malformed layout, `404` if there is no such route, `502` if the peer can't be reached or refuses the stream, in which case the route keeps its layout. |
 | `GET /x-orpheus/v1/routes/{id}/sdp` | A running route's stream as an SDP file (`application/sdp`). |
 | `GET /x-orpheus/v1/sources` | The [sources](#outputs-and-volume) the receivers remember, most recently played first: `id`, `name`, `key` (what the stream is recognized by), `node` (the sending node's ID, if Orpheus), `output` (machine name, absent for the default), `volume` (`channels`, linear per channel, and `mute`), `layout` (if [set](#channel-layouts): `symbol` and `label` per channel), `receiver` (while it plays) and `last_used` (Unix seconds). |
 | `DELETE /x-orpheus/v1/sources/{id}` | Forgets a source's output, volume and layout; a stream playing it goes to the default output at full volume. Returns `204`, or `404` if there is no such source. |
@@ -882,10 +912,11 @@ controllers can see it. It describes the node as one device with:
 
 - a **receiver** per connection and a free one (see [several
   streams](#several-streams)), up to 8 by default. Its capabilities
-  (`caps`, after BCP-004-01) say what it plays: L24, 48 kHz, 2 channels;
+  (`caps`, after BCP-004-01) say what it plays: L24, 48 kHz, 1 to 64
+  channels;
 - per sender started with `connect`, a **source**, with its `channels`
   (symbol and label, see [channel layouts](#channel-layouts)), a **flow**
-  (L24, 48 kHz, stereo) and a **sender**.
+  (L24, 48 kHz) and a **sender**.
 
 ```sh
 curl -s localhost:7480/x-nmos/node/v1.3/self | jq
@@ -894,8 +925,9 @@ curl -s localhost:7480/x-nmos/node/v1.3/senders | jq '.[].label'
 
 Each sender's `manifest_href` points to its SDP file, which describes the
 stream the way AES67 and SMPTE ST 2110-30 receivers expect: destination,
-L24/48000/2, the channel grouping (`channel-order=SMPTE2110.(ST)`), payload
-type 97, 1 ms packets, the PTP grandmaster and domain (`ts-refclk`) and
+the format (`L24/48000/2` for stereo), the channel grouping
+(`channel-order=SMPTE2110.(ST)`), payload type 97, the packet time
+(`ptime:1`, or `ptime:0.125` for more than 8 channels), the PTP grandmaster and domain (`ts-refclk`) and
 `mediaclk:direct=0`:
 
 ```sh

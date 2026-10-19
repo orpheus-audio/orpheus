@@ -59,6 +59,11 @@ enum Command {
         /// meanwhile, whatever the peer's policy (for announcements).
         #[arg(long, value_parser = ["normal", "high"], default_value = "normal")]
         priority: String,
+        /// What the sink's channels carry, and with them the stream's: ST
+        /// 2110-30 groups (`51`, `71`, `U16`) or channel symbols (`"L R
+        /// C"`); defaults to the route's layout from before, else stereo.
+        #[arg(long)]
+        layout: Option<String>,
     },
     /// List the other nodes on the network.
     Nodes,
@@ -150,6 +155,18 @@ enum Command {
         /// The route: its name, or its ID or the start of it (see
         /// `routes`).
         route: String,
+    },
+    /// Set what the channels of a route's sink carry, and with them how
+    /// many channels its stream has; the sink starts again, and so does
+    /// the peer's receiver.
+    RouteLayout {
+        /// The route: its name, or its ID or the start of it (see
+        /// `routes`).
+        route: String,
+        /// ST 2110-30 groups (`ST`, `51`, `71`, `U16`) or channel symbols
+        /// (`L R C`).
+        #[arg(required = true, num_args = 1..)]
+        layout: Vec<String>,
     },
     /// List the sources the receivers remember: where each plays and how
     /// loud.
@@ -454,6 +471,8 @@ struct NewSender {
     send_only: bool,
     force: bool,
     priority: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    layout: Option<Layout>,
 }
 
 #[derive(Deserialize)]
@@ -572,7 +591,11 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             send_only,
             force,
             priority,
+            layout,
         } => {
+            let layout = layout
+                .map(|l| Layout::parse(&l).map_err(|e| anyhow::anyhow!("{e}")))
+                .transpose()?;
             let url = format!("{base}/x-orpheus/v1/routes");
             let raw = post(
                 &url,
@@ -582,6 +605,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     send_only,
                     force,
                     priority,
+                    layout,
                 },
             )
             .with_context(|| format!("connecting to {peer} via {url}"))?;
@@ -793,6 +817,17 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             reply(agent().delete(&url).call()?)
                 .with_context(|| format!("forgetting {route} via {url}"))?;
         }
+        Command::RouteLayout { route, layout } => {
+            let layout = Layout::parse(&layout.join(" ")).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let id = find_route(base, &route)?;
+            let url = format!("{base}/x-orpheus/v1/routes/{id}/layout");
+            reply(
+                agent()
+                    .put(&url)
+                    .send_json(serde_json::json!({ "layout": layout }))?,
+            )
+            .with_context(|| format!("setting the layout of {route} via {url}"))?;
+        }
         Command::Sources => {
             let url = format!("{base}/x-orpheus/v1/sources");
             let raw = get(&url)?;
@@ -943,6 +978,8 @@ struct RouteEntry {
     active: bool,
     /// How a running route to a peer's receiver stands.
     state: Option<String>,
+    #[serde(default)]
+    layout: Option<Layout>,
     last_used: Option<u64>,
 }
 
@@ -1370,7 +1407,7 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
         let _ = writeln!(o, "{}", p.mark(Level::Off, "no routes"));
         return o;
     }
-    let rows: Vec<[String; 5]> = routes
+    let rows: Vec<[String; 6]> = routes
         .iter()
         .map(|r| {
             let state = match (r.active, r.last_used) {
@@ -1390,13 +1427,14 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
                 r.name.clone(),
                 r.id.clone(),
                 r.peer.clone(),
+                r.layout.as_ref().map_or_else(|| "-".into(), short),
                 r.priority.clone(),
                 state,
             ]
         })
         .collect();
-    let header = ["NAME", "ID", "PEER", "PRIORITY", "STATE"];
-    table(&mut o, p, header, [false; 5], &rows);
+    let header = ["NAME", "ID", "PEER", "CHANNELS", "PRIORITY", "STATE"];
+    table(&mut o, p, header, [false; 6], &rows);
     o
 }
 
@@ -2538,10 +2576,13 @@ Routes
     fn renders_routes() {
         let routes: Vec<RouteEntry> = serde_json::from_str(
             r#"[{"id": "K7QM3XRA", "name": "Kitchen",
-                 "priority": "normal", "peer": "192.168.1.20:5004", "active": true},
+                 "priority": "normal", "peer": "192.168.1.20:5004", "active": true,
+                 "layout": [{"symbol": "L", "label": "Left"}, {"symbol": "R", "label": "Right"}]},
                 {"id": "9F2D4C71", "name": "Kitchen",
                  "priority": "high", "peer": "192.168.1.20:5006", "active": false,
-                 "last_used": 1000},
+                 "last_used": 1000,
+                 "layout": [{"symbol": "L"}, {"symbol": "R"}, {"symbol": "C"}, {"symbol": "LFE"},
+                            {"symbol": "Ls"}, {"symbol": "Rs"}]},
                 {"id": "M2R8D0C4", "name": "Bath",
                  "priority": "normal", "peer": "192.168.1.21:5004", "active": true,
                  "state": "idle"}]"#,
@@ -2550,10 +2591,10 @@ Routes
         let out = render_routes(&routes, Paint(false), 1000 + 3 * 86_400);
         assert_eq!(
             out,
-            "  NAME     ID        PEER               PRIORITY  STATE\n  \
-             Kitchen  K7QM3XRA  192.168.1.20:5004  normal    ● connected\n  \
-             Kitchen  9F2D4C71  192.168.1.20:5006  high      ○ remembered, last used 3 days ago\n  \
-             Bath     M2R8D0C4  192.168.1.21:5004  normal    ○ idle, claims a receiver when audio plays\n"
+            "  NAME     ID        PEER               CHANNELS  PRIORITY  STATE\n  \
+             Kitchen  K7QM3XRA  192.168.1.20:5004  ST        normal    ● connected\n  \
+             Kitchen  9F2D4C71  192.168.1.20:5006  51        high      ○ remembered, last used 3 days ago\n  \
+             Bath     M2R8D0C4  192.168.1.21:5004  -         normal    ○ idle, claims a receiver when audio plays\n"
         );
     }
 

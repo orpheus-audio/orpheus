@@ -20,7 +20,8 @@ pub const SAMPLE_DEPTH: &str = "urn:x-nmos:cap:format:sample_depth";
 pub const PACKET_TIME: &str = "urn:x-nmos:cap:transport:packet_time";
 const ENABLED: &str = "urn:x-nmos:cap:meta:enabled";
 
-/// The one constraint set of a receiver that plays exactly one format.
+/// The one constraint set of a receiver that plays one format with any
+/// number of channels up to a limit.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AudioConstraints {
     #[serde(rename = "urn:x-nmos:cap:format:media_type")]
@@ -28,24 +29,35 @@ pub struct AudioConstraints {
     #[serde(rename = "urn:x-nmos:cap:format:sample_rate")]
     pub sample_rate: Enum<Rational>,
     #[serde(rename = "urn:x-nmos:cap:format:channel_count")]
-    pub channel_count: Enum<u16>,
+    pub channel_count: Range<u16>,
     #[serde(rename = "urn:x-nmos:cap:format:sample_depth")]
     pub sample_depth: Enum<u8>,
 }
 
 impl AudioConstraints {
-    /// Exactly `stream`'s format, at any packet time.
-    pub fn exactly(stream: &Stream<'static>) -> Self {
+    /// `stream`'s format with 1 to `max_channels` channels, at any packet
+    /// time.
+    pub fn up_to(stream: &Stream<'static>, max_channels: u16) -> Self {
         Self {
             media_type: Enum::one(stream.media_type),
             sample_rate: Enum::one(Rational {
                 numerator: stream.sample_rate,
                 denominator: 1,
             }),
-            channel_count: Enum::one(stream.channel_count),
+            channel_count: Range {
+                minimum: 1,
+                maximum: max_channels,
+            },
             sample_depth: Enum::one(stream.sample_depth),
         }
     }
+}
+
+/// A constraint that allows the values from `minimum` to `maximum`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Range<T> {
+    pub minimum: T,
+    pub maximum: T,
 }
 
 /// A constraint that allows only the values listed.
@@ -257,21 +269,23 @@ mod tests {
 
     #[test]
     fn our_constraints_take_our_stream() {
-        let set = serde_json::to_value(AudioConstraints::exactly(&L24)).unwrap();
+        let set = serde_json::to_value(AudioConstraints::up_to(&L24, 64)).unwrap();
         assert_eq!(
             set[SAMPLE_RATE],
             json!({"enum": [{"numerator": 48000, "denominator": 1}]})
         );
-        assert_eq!(set[CHANNEL_COUNT], json!({"enum": [2]}));
+        assert_eq!(set[CHANNEL_COUNT], json!({"minimum": 1, "maximum": 64}));
         let caps = json!({"media_types": ["audio/L24"], "constraint_sets": [set]});
         assert_eq!(check(&caps, &L24), Ok(()));
-        let mono = Stream {
-            channel_count: 1,
+        let with = |channel_count| Stream {
+            channel_count,
+            packet_time_ms: 0.125,
             ..L24
         };
+        assert_eq!(check(&caps, &with(64)), Ok(()));
         assert_eq!(
-            check(&caps, &mono),
-            Err("channel count 1; it takes 2".into())
+            check(&caps, &with(65)),
+            Err("channel count 65; it takes 1 to 64".into())
         );
     }
 

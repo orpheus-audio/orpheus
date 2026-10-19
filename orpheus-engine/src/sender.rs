@@ -1,13 +1,14 @@
 //! Sender: a virtual sink whose audio goes out as an RTP stream to one peer.
 //!
 //! Applications play into the sink; its realtime callback pushes the audio
-//! into a port. A TX thread drains the port one packet (1 ms) at a time on
-//! the media-clock grid and stamps each packet with the media-clock time of
-//! its first frame. The port's target covers one audio-system cycle, since
-//! the sink delivers a whole cycle at once while the TX thread takes 1 ms.
-//! The TX thread resamples from the sound card's clock to the media clock
-//! ([`asrc`](crate::asrc)), taking a little more or less than 1 ms from the
-//! port so that its level stays put.
+//! into a port. A TX thread drains the port one packet (1 ms, or 125 µs
+//! for more than 8 channels) at a time on the media-clock grid and stamps
+//! each packet with the media-clock time of its first frame. The port's
+//! target covers one audio-system cycle, since the sink delivers a whole
+//! cycle at once while the TX thread takes one packet. The TX thread
+//! resamples from the sound card's clock to the media clock
+//! ([`asrc`](crate::asrc)), taking a little more or less than a packet's
+//! worth from the port so that its level stays put.
 //!
 //! The TX thread also notes whether the sink plays (applications feed it)
 //! and when it last carried sound, so that the node can claim a receiver
@@ -49,7 +50,10 @@ pub struct SenderConfig {
     pub name: String,
     /// Name of the sink shown to the user.
     pub description: String,
+    /// Of as many channels as `layout` has.
     pub format: AudioFormat,
+    /// What the sink's channels carry.
+    pub layout: Layout,
     pub encoding: Encoding,
     pub peer: SocketAddr,
     /// The kind of output at the other end, which the sink shows.
@@ -254,6 +258,11 @@ impl Sender {
         &self.cfg.name
     }
 
+    /// What the sink's channels carry.
+    pub fn layout(&self) -> &Layout {
+        &self.cfg.layout
+    }
+
     pub fn label(&self) -> Option<&str> {
         self.label.as_deref()
     }
@@ -294,6 +303,7 @@ impl Sender {
         cfg: &SenderConfig,
     ) -> Result<Self, BackendError> {
         let format = cfg.format;
+        let packet = format.packet_frames();
         let block_frames = cfg.block_frames.unwrap_or(DEFAULT_BLOCK_FRAMES);
         let target = block_frames as usize + format.frames_in_ms(JITTER_MARGIN_MS);
         let (capture, playback, buffer) = port_pair(format.channels, target);
@@ -302,16 +312,16 @@ impl Sender {
         let asrc = Asrc::new(
             format.rate,
             format.channels as usize,
-            format.frames_in_ms(1),
+            packet,
             Fixed::Output,
-            0.001,
+            f64::from(format.packet_us()) / 1e6,
         );
         let sink = backend.create_sink(
             &StreamSpec {
                 name: cfg.name.clone(),
                 description: cfg.description.clone(),
                 format,
-                layout: Layout::default_for(format.channels.into()),
+                layout: cfg.layout.clone(),
                 group: None,
                 remote: Some(cfg.remote),
                 block_frames: Some(block_frames),
@@ -445,7 +455,7 @@ struct Tx {
 
 impl Tx {
     fn run(mut self, stop: &AtomicBool) {
-        let ptime = self.format.frames_in_ms(1);
+        let ptime = self.format.packet_frames();
         let ch = self.format.channels as usize;
         let mut input = vec![0.0f32; self.asrc.input_frames_max() * ch];
         let mut samples = vec![0.0f32; ptime * ch];

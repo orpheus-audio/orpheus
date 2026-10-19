@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use orpheus_clock::Clock;
 use orpheus_core::{AudioFormat, Layout, OutputType};
@@ -34,6 +35,9 @@ struct Loopback {
     _playback: StreamHandle,
     stats: Arc<PortStats>,
 }
+
+/// How long a sender's new sink may take to show in the audio system.
+const SINK_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Senders are named by the route they serve, which outlives them.
 pub type SenderId = orpheus_core::RouteId;
@@ -204,6 +208,64 @@ impl Engine {
     /// Whether sender `id`'s sink is hidden.
     pub fn sender_hidden(&self, id: SenderId) -> bool {
         self.hidden.contains_key(&id)
+    }
+
+    /// What the channels of sender `id`'s sink carry, also while it is
+    /// hidden.
+    pub fn sender_layout(&self, id: SenderId) -> Option<&Layout> {
+        self.senders
+            .get(&id)
+            .map(Sender::layout)
+            .or_else(|| self.hidden.get(&id).map(|h| &h.cfg.layout))
+    }
+
+    /// Gives sender `id`'s sink other channels: starts a new sink with
+    /// `layout`, of the same name, route, volume and label, and removes
+    /// the old one once the audio system shows the new one, so that what
+    /// played into the old one goes on in the new one. A hidden sender
+    /// keeps the layout for when it shows. If the new sink can't start,
+    /// the old one stays. `Ok(false)` if there is no such sender.
+    pub fn set_sender_layout(
+        &mut self,
+        id: SenderId,
+        layout: Layout,
+    ) -> Result<bool, BackendError> {
+        if let Some(h) = self.hidden.get_mut(&id) {
+            h.cfg.format.channels = layout.len() as u16;
+            h.cfg.layout = layout;
+            return Ok(true);
+        }
+        let Some(old) = self.senders.get(&id) else {
+            return Ok(false);
+        };
+        let mut cfg = old.config();
+        cfg.format.channels = layout.len() as u16;
+        cfg.layout = layout;
+        let (paused, label, route) = (old.paused(), old.label().map(str::to_owned), old.route());
+        let mut new = Sender::start(self.backend.as_mut(), self.clock.clone(), &cfg)?;
+        new.pause(paused);
+        new.set_label(label.as_deref());
+        // Both the same name: wait until the audio system shows the new
+        // sink, else what plays into the old one has nowhere to go.
+        let channels = cfg.layout.len();
+        let before = self.sinks_named(&cfg.name, channels);
+        let until = Instant::now() + SINK_TIMEOUT;
+        while self.sinks_named(&cfg.name, channels) <= before && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let routed = new.set_route(route);
+        self.senders.insert(id, new);
+        routed.map(|()| true).map_err(Into::into)
+    }
+
+    /// How many of the audio system's outputs are named `name` and have
+    /// `channels` channels.
+    fn sinks_named(&self, name: &str, channels: usize) -> usize {
+        self.backend
+            .outputs()
+            .iter()
+            .filter(|o| o.name == name && o.channels.len() == channels)
+            .count()
     }
 
     /// Changes how long the senders fade in, for those that run and those

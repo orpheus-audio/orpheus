@@ -14,7 +14,7 @@
 | M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes (through WirePlumber) | done, except the two-box test |
 | — | Route identity: stable route and source IDs, output and volume remembered per source, claiming the peer's receiver on play, default output | done |
 | M6 | Configurability: settings over the API (clock, receivers, senders), PTP that retries and holds over, WebSocket state stream, output selection, BCP-004, IS-08 per receiver (removed again in M7, replaced by wires) | done, except the two-box test |
-| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking, unavailable sinks, pausing players), English and German names done |
+| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking, unavailable sinks, pausing players), English and German names, multichannel routes (up to 64 channels) done |
 
 After M7 the API should be stable enough for the web UI.
 
@@ -27,9 +27,13 @@ and Bluetooth inputs.
 
 **Audio**
 
-- The stream format is fixed: L24, 48 kHz, stereo, 1 ms packets, payload type
-  97. A receiver refuses SDP files for other formats; without an SDP file it
-  accepts any payload type.
+- The stream format is L24 at 48 kHz, payload type 97, with 1 to 64
+  channels; packets are 1 ms long up to 8 channels and 125 µs above, with
+  no choice of packet time. A receiver refuses SDP files for other formats;
+  without an SDP file it takes the stream for stereo and accepts any
+  payload type.
+- Changing a route's layout cuts its stream on the peer for a moment,
+  while the receiver restarts.
 - A receiver reads a stream's channel layout from its SDP file only, so
   channel labels, which only IS-04 carries, don't reach it; a label can be
   set per source instead.

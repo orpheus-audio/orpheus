@@ -57,10 +57,10 @@ app ─▶ sink "B"                                 receiver k (UDP 5004 + 2k)
         │ PipeWire RT callback                    │ RX thread
         ▼                                         ▼
       port (lock-free ring)                     jitter buffer
-        │ TX thread, every 1 ms                   │ on the media-clock grid,
+        │ TX thread, every packet (1 ms)          │ on the media-clock grid,
         │ ASRC: sound card → media clock          │ at timestamp + link offset
         ▼                                         │ ASRC: media clock → sound card
-      RTP L24/48k/2ch ───── unicast UDP ─────▶    ▼
+      RTP L24/48k ───────── unicast UDP ─────▶    ▼
                                                 port (lock-free ring)
                                                   │ PipeWire RT callback
                                                   ▼
@@ -68,10 +68,11 @@ app ─▶ sink "B"                                 receiver k (UDP 5004 + 2k)
 ```
 
 **Sender.** Each sender is a virtual PipeWire sink. Its realtime callback
-copies whatever is played into it into a port. A TX thread takes 1 ms of
-audio (48 frames) at a time, on the media-clock grid, resamples it to the
-media clock, and sends it as one RTP packet. Each packet carries the
-media-clock time of its first frame.
+copies whatever is played into it into a port. A TX thread takes one
+packet's worth of audio at a time (1 ms, 48 frames; 125 µs, 6 frames, for
+more than 8 channels), on the media-clock grid, resamples it to the media
+clock, and sends it as one RTP packet. Each packet carries the media-clock
+time of its first frame.
 
 **Receiver.** An RX thread stores incoming packets in a jitter buffer indexed
 by RTP timestamp. Out-of-order, duplicate and late packets are handled there;
@@ -128,10 +129,22 @@ The TX, RX and PTP threads run at normal priority for now.
 
 ## Stream format
 
-L24 (24-bit big-endian PCM), 48 kHz, 2 channels, 1 ms per packet, RTP payload
-type 97. This is the AES67 baseline. It is fixed for now. Each sender
-describes its stream in an SDP file; RTP timestamps count media-clock frames
-since the PTP epoch, so the SDP says `mediaclk:direct=0`.
+L24 (24-bit big-endian PCM), 48 kHz, RTP payload type 97, with 1 to 64
+channels: as many as the route's layout has, stereo unless set otherwise.
+The packet time follows from the channel count, as the levels of SMPTE ST
+2110-30 have it: 1 ms for up to 8 channels (level A, the AES67 baseline),
+125 µs for more (level C), so that a packet stays within an Ethernet frame
+(at most 1152 bytes of audio). Each sender describes its stream in an SDP
+file; RTP timestamps count media-clock frames since the PTP epoch, so the
+SDP says `mediaclk:direct=0`.
+
+The receiver doesn't care about the packet time: its jitter buffer is
+indexed by timestamp and read every millisecond, whatever size the packets
+are. It plays as many channels as the SDP file says, else two.
+
+Without optimization, the resampler can't keep up with many channels at
+short packets, so debug builds optimize it (`[profile.dev.package]` in
+`Cargo.toml`).
 
 ## Channel layouts
 
@@ -150,8 +163,15 @@ wire:
 A receiver's layout is resolved when its stream starts, in this order: the
 layout set for its [source](#receiver-pool-and-policy) (`sources.json`),
 the stream's SDP file, then a default by channel count. A change of the
-layout restarts the stream, as a change of the link offset does. Senders
-send stereo for now; the sink's layout is `ST`.
+layout restarts the stream, as a change of the link offset does.
+
+A sender's layout is its route's: `ST` unless set, kept with the route in
+`routes.json`. Changing it starts a new sink of the same name, with the new
+channels, and removes the old one once PipeWire shows the new one; the
+session manager then moves what played into the old sink to the new one
+by name, so nothing goes silent or plays elsewhere meanwhile. The sender
+holds its packets back while the peer's receiver gets the new SDP file
+and restarts with it, so that it never reads packets in the wrong layout.
 
 ## NMOS
 
@@ -163,9 +183,10 @@ announces a new `ver_*` counter in its mDNS TXT record, which tells NMOS
 controllers and other nodes to fetch the resources again.
 
 Receivers announce what they play in their capabilities (BCP-004-01): one
-constraint set with media type, sample rate, channel count and sample
-depth. Before `connect` takes a peer's receiver, it checks the receiver's
-constraint sets against the stream; constraints on other parameters are
+constraint set with media type, sample rate, sample depth and a channel
+count from 1 to 64, at any packet time. Before `connect` takes a peer's
+receiver, it checks the receiver's constraint sets against the route's
+stream; constraints on other parameters are
 ignored, receivers without constraint sets are judged by `media_types`.
 
 There is no IS-08 Channel Mapping API: [wires](usage.md#wires) route
