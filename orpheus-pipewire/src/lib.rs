@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use orpheus_core::{AudioFormat, Layout, OutputType, Symbol};
 use orpheus_engine::{
-    AppStream, AudioBackend, BackendError, CapturePort, Input, Link, Output, OutputSpec, Placement,
-    PlaybackPort, StreamControl, StreamHandle, StreamSpec, Volume,
+    AppStream, AudioBackend, BackendError, CapturePort, Input, Levels, Link, Output, OutputLevel,
+    OutputSpec, Placement, PlaybackPort, StreamControl, StreamHandle, StreamSpec, Volume, level,
 };
 use pipewire::{self as pw, properties::properties, spa};
 use spa::param::audio::{AudioFormat as SpaFormat, AudioInfoRaw, MAX_CHANNELS};
@@ -26,7 +26,7 @@ use spa::pod::{Object, Pod, Property, Value, serialize::PodSerializer};
 use spa::sys as spa_sys;
 
 mod wire;
-use wire::WireNode;
+use wire::{MeterNode, WireNode};
 
 /// Native-endian `f32`, so buffers can be reinterpreted without conversion.
 const SAMPLE_FORMAT: SpaFormat = if cfg!(target_endian = "little") {
@@ -346,6 +346,10 @@ impl AudioBackend for PipeWireBackend {
         g.wires.iter().filter(|l| g.linked(l)).cloned().collect()
     }
 
+    fn levels(&self) -> Levels {
+        self.graph.lock().unwrap().levels.clone()
+    }
+
     fn app_streams(&self) -> Vec<AppStream> {
         self.graph.lock().unwrap().app_streams()
     }
@@ -475,6 +479,7 @@ fn run(
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
     let created: Rc<RefCell<HashMap<u64, Created>>> = Rc::default();
+    let nodes: Rc<RefCell<Wiring>> = Rc::default();
     // Links the created outputs to their devices, and the wires through
     // their nodes, as ports come and go.
     let relink = Rc::new({
@@ -482,7 +487,7 @@ fn run(
         let graph = graph.clone();
         let created = created.clone();
         let wired = RefCell::new(Made::new());
-        let nodes = RefCell::new(Wiring::default());
+        let nodes = nodes.clone();
         move || {
             if std::mem::take(&mut graph.lock().unwrap().changed) {
                 link_outputs(&core, &graph, &mut created.borrow_mut());
@@ -501,6 +506,11 @@ fn run(
         move |_| relink()
     });
     let _ = timer.update_timer(Some(RELINK), Some(RELINK));
+    let meter = mainloop.loop_().add_timer({
+        let graph = graph.clone();
+        move |_| nodes.borrow_mut().measure(&graph)
+    });
+    let _ = meter.update_timer(Some(level::WINDOW), Some(level::WINDOW));
     let _receiver = rx.attach(mainloop.loop_(), {
         let mainloop = mainloop.clone();
         let streams = streams.clone();
@@ -690,21 +700,37 @@ struct WireInfo {
     pairs: Vec<(usize, usize)>,
 }
 
-/// The wire nodes, one per pair of nodes the wires link, by those nodes.
+/// A meter node, for other threads.
+#[derive(Debug, Clone)]
+struct MeterInfo {
+    /// The node's machine name.
+    name: String,
+    /// The output it measures.
+    output: String,
+}
+
+/// The wire nodes, one per pair of nodes the wires link, by those nodes;
+/// and the meter nodes, one per output they play on, by its name.
 #[derive(Default)]
 struct Wiring {
     nodes: HashMap<(String, String), WireNode>,
+    meters: HashMap<String, MeterNode>,
     next: u64,
 }
+
+/// Nodes to drop once their links are.
+type Retired = (Vec<WireNode>, Vec<MeterNode>);
 
 impl Wiring {
     /// Makes a wire node for each pair of nodes the wires link while both
     /// are there, with the wires' pairs and gains, and returns the others
     /// for the caller to drop once their links are. A node whose pairs
-    /// change is made again; a gain changes in place.
-    fn update(&mut self, core: &pw::core::CoreRc, graph: &Mutex<Graph>) -> Vec<WireNode> {
+    /// change is made again; a gain changes in place. Each output they
+    /// play on gets a meter node on its monitor ports, where it has them.
+    fn update(&mut self, core: &pw::core::CoreRc, graph: &Mutex<Graph>) -> Retired {
         type Pairs = (Vec<(usize, usize)>, Vec<f32>);
         let mut want: BTreeMap<(String, String), Pairs> = BTreeMap::new();
+        let mut monitored: BTreeMap<String, usize> = BTreeMap::new();
         {
             let g = graph.lock().unwrap();
             for l in &g.wires {
@@ -715,6 +741,12 @@ impl Wiring {
                 pairs.push((l.from_channel, l.to_channel));
                 gains.push(l.gain);
             }
+            for (_, to) in want.keys() {
+                let channels = g.node_id(to).map_or(0, |id| g.monitor_ports(id).len());
+                if channels > 0 {
+                    monitored.insert(to.clone(), channels);
+                }
+            }
         }
         let gone: Vec<(String, String)> = self
             .nodes
@@ -723,6 +755,28 @@ impl Wiring {
             .map(|(key, _)| key.clone())
             .collect();
         let retired: Vec<WireNode> = gone.iter().filter_map(|k| self.nodes.remove(k)).collect();
+        let gone: Vec<String> = self
+            .meters
+            .iter()
+            .filter(|(output, node)| monitored.get(*output) != Some(&node.channels))
+            .map(|(output, _)| output.clone())
+            .collect();
+        let retired_meters: Vec<MeterNode> =
+            gone.iter().filter_map(|o| self.meters.remove(o)).collect();
+        for (output, &channels) in &monitored {
+            if self.meters.contains_key(output) {
+                continue;
+            }
+            let name = format!("orpheus.meter.{}", self.next);
+            self.next += 1;
+            let description = format!("Orpheus meter {output}");
+            match MeterNode::new(core, &name, &description, channels) {
+                Ok(node) => {
+                    self.meters.insert(output.clone(), node);
+                }
+                Err(e) => tracing::warn!(%output, error = %e, "making a meter node"),
+            }
+        }
         for (key, (pairs, gains)) in &want {
             match self.nodes.get(key) {
                 Some(node) => node.set_gains(gains),
@@ -741,7 +795,8 @@ impl Wiring {
                 }
             }
         }
-        graph.lock().unwrap().wire_nodes = self
+        let mut g = graph.lock().unwrap();
+        g.wire_nodes = self
             .nodes
             .iter()
             .map(|((from, to), node)| WireInfo {
@@ -751,7 +806,49 @@ impl Wiring {
                 pairs: node.pairs.clone(),
             })
             .collect();
-        retired
+        g.meter_nodes = self
+            .meters
+            .iter()
+            .map(|(output, node)| MeterInfo {
+                name: node.name.clone(),
+                output: output.clone(),
+            })
+            .collect();
+        (retired, retired_meters)
+    }
+
+    /// Takes what the nodes measured since the last time into the levels
+    /// other threads see.
+    fn measure(&mut self, graph: &Mutex<Graph>) {
+        for node in self.nodes.values_mut() {
+            node.measure();
+        }
+        for node in self.meters.values_mut() {
+            node.measure();
+        }
+        let mut g = graph.lock().unwrap();
+        let links = g
+            .wires
+            .iter()
+            .filter_map(|l| {
+                let node = self.nodes.get(&(l.from.clone(), l.to.clone()))?;
+                let i = node
+                    .pairs
+                    .iter()
+                    .position(|&p| p == (l.from_channel, l.to_channel))?;
+                Some((l.clone(), *node.levels().get(i)?))
+            })
+            .collect();
+        let outputs = self
+            .meters
+            .iter()
+            .map(|(output, node)| OutputLevel {
+                name: output.clone(),
+                channels: node.levels(),
+                clipped: node.clipped,
+            })
+            .collect();
+        g.levels = Levels { links, outputs };
     }
 }
 
@@ -1226,6 +1323,10 @@ struct Graph {
     wires: Vec<Link>,
     /// The wire nodes made for them.
     wire_nodes: Vec<WireInfo>,
+    /// The meter nodes on the outputs they play on.
+    meter_nodes: Vec<MeterInfo>,
+    /// What the wire and meter nodes measured last.
+    levels: Levels,
     /// Whether ports, links or wires came or went since the created
     /// outputs and the wires were last linked.
     changed: bool,
@@ -1417,13 +1518,36 @@ impl Graph {
         links
     }
 
-    /// The wires' links whose ports are there: output node and port,
-    /// input node and port.
+    /// The monitor ports of sink `node`, which carry what it plays.
+    fn monitor_ports(&self, node: u32) -> Vec<(u32, &Port)> {
+        self.ports_of(node, |p| p.output && p.monitor)
+    }
+
+    /// The links of a meter node from its output's monitor ports whose
+    /// ports are there.
+    fn meter_node_links(&self, m: &MeterInfo) -> Vec<(u32, u32, u32, u32)> {
+        let (Some(id), Some(output)) = (self.node_id(&m.name), self.node_id(&m.output)) else {
+            return Vec::new();
+        };
+        self.monitor_ports(output)
+            .iter()
+            .zip(self.channel_ports(id, false))
+            .map(|(&(from, _), (to, _))| (output, from, id, to))
+            .collect()
+    }
+
+    /// The wires' links whose ports are there, and those of the meters:
+    /// output node and port, input node and port.
     fn wired_links(&self) -> Vec<(u32, u32, u32, u32)> {
         let mut want: Vec<_> = self
             .wire_nodes
             .iter()
             .flat_map(|w| self.wire_node_links(w).into_iter().map(|(_, l)| l))
+            .chain(
+                self.meter_nodes
+                    .iter()
+                    .flat_map(|m| self.meter_node_links(m)),
+            )
             .collect();
         want.sort_unstable();
         want.dedup();

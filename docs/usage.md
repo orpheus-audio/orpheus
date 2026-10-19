@@ -32,7 +32,7 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 | `wire FROM OUTPUT [OUT=IN[@DB]…] [--gain DB] [--mute]` | Plays channels of a source or an input on an output (see [wires](#wires)): `L=R R=L` plays the input's right channel on the output's left and the other way round, `L=C@-3` the centre on the left 3 dB down; without pairs, all channels go where they belong. `--gain` sets the wire's gain in dB. A source with wires plays only on them. Kept across restarts. |
 | `wire-gain FROM OUTPUT DB\|mute\|unmute` | Changes a wire's gain in dB, or mutes it, keeping its channels. |
 | `unwire FROM OUTPUT [OUT=IN…]` | Removes a wire, or some of its channel pairs. A source left without wires is [parked](#lost-outputs) until played or wired again. |
-| `patch` | Shows the wires as a patch bay: for each output channel, everything that plays on it. |
+| `patch` | Shows the wires as a patch bay: for each output channel, everything that plays on it, with the peak levels of the channel and of each wire. `--watch [SECONDS]` refreshes it, as a meter. |
 | `play RECEIVER OUTPUT` | Plays a receiver's stream on `OUTPUT` (as for `set-type`), or with `default` where streams play by default; remembered for its [source](#outputs-and-volume). |
 | `default OUTPUT` | Makes `OUTPUT` (as for `set-type`) the default output, where applications play and received streams without an output of their own go; a route's sink works too, so that the node's audio goes to the peer. The same as choosing it in the desktop's sound settings, for nodes without a desktop. The audio system keeps it across restarts. |
 | `sources` | Lists the [sources](#outputs-and-volume) the receivers remember: where each plays, how loud, and whether it plays now. |
@@ -45,7 +45,8 @@ ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 
 `--json` prints the node's JSON responses instead of text: the status as the
 [HTTP API](#http-api) returns it, the node list, the outputs, the routes, and after `connect` the route (`id`, `name`,
-`destination`, and the peer's `receiver`). Scripts
+`destination`, and the peer's `receiver`), and for `patch` both the wires
+and the levels, as `{"wires": …, "levels": …}`. Scripts
 should use it, because the text output may change. With `--watch` it prints
 one line per sample:
 
@@ -496,12 +497,12 @@ front left and right only, which is no mix.
 
 What several wires bring into one output channel is summed, too.
 `patch` shows it as it is, every input on each output channel with its
-gain:
+gain, and how loud each plays (see [levels](#levels)):
 
 ```
 Kitchen (orpheus.output.kitchen)
-  L  ← TV: R -6 dB, USB mic: M1⤵ -3 dB
-  R  ← TV: L -6 dB, USB mic: M1⤵ -3 dB
+  L   -8.1 dBFS  ← TV: R -6 dB [-10.3 dBFS], USB mic: M1⤵ -3 dB [-14.2 dBFS]
+  R   -8.4 dBFS  ← TV: L -6 dB [-10.9 dBFS], USB mic: M1⤵ -3 dB [-14.2 dBFS]
   ⤵ USB mic: upmix M → ST
 
 Waiting
@@ -522,11 +523,26 @@ turn the wires down where they clip.
 the wire's gain or muting. A pair's own gain is set with `wire`, after
 `@`.
 
+#### Levels
+
+`patch` shows the peak of each output channel over the last second, in
+dBFS, and in brackets that of what each wire brings to it, after its
+gain. 0 dBFS is full scale: louder no longer fits the device's samples, or
+those of a stream to another node, and clips. The output's level is all
+that plays on it, also what doesn't come through wires, as its monitor
+carries it; `—` where the output has no monitor. Once an output reaches
+full scale, `patch` says how long ago it last did, and the node warns
+(`clipping`) for 10 seconds. `orpheusctl patch --watch 0.2` follows the
+levels live; `GET /x-orpheus/v1/levels` also has the RMS over the last
+300 ms.
+
 Wires are kept in `wires.json` in the [state
 directory](configuration.md#files). A wire waits while its source plays
 nowhere or an end is missing, and links again once it is back. On Linux,
 each wire is a small PipeWire node, `orpheus.wire.N`, that plays each pair
 at its gain, linked between the two ends; `pw-link -l` shows the links.
+Each output wires play on gets a node `orpheus.meter.N` on its monitor
+ports, which measures without keeping the output running.
 
 ## Aliases and pins
 
@@ -731,6 +747,7 @@ Orpheus' own API lives under `/x-orpheus/v1`, the NMOS APIs under `/x-nmos`
 | `GET /x-orpheus/v1/wires` | The [wires](#wires): `source` (ID) or `input` (machine name), `from_name`, `output`, `output_name`, `channels` (the pairs as set, absent for all), `links` (what it links now: `from` and `to` channel, counted from 1, whether the audio system has made the link, and `gain_db`, the wire's and the pair's together, and `folded` for a channel played on another one as part of a mix), `gain_db` and `mute` (absent at 0 dB and unmuted), `mix` (`downmix` or `upmix`, absent where each channel plays on its own), `dropped` (the channels a wire of all channels leaves out, such as the LFE) and, while known, `from_channels` and `output_channels` as [layouts](#channel-layouts). |
 | `PUT /x-orpheus/v1/wires` | Sets the wire between a source or input and an output, replacing one there. Body: `{"source": "<id>", "output": "<name>"}` or `{"input": "<name>", …}`, optionally with `"channels": [{"to": "L", "from": "R"}, {"to": 3, "from": 1, "gain_db": -3}]`, `"gain_db": -6` and `"mute": true`; gains go from -90 to +12 dB. Returns `200` with the wire as listed; `400` for a malformed request, no pairs or a gain out of range, `422` if there is no such source, input or output, or no such channel, `503` without an audio system. |
 | `PUT /x-orpheus/v1/wires/gain?source=<id>&output=<name>` | Changes a wire's gain or muting, keeping its channels; `input=<name>` instead of `source` for an input. Body: `{"gain_db": -6}`, `{"mute": true}` or both. Returns `200` with the wire as listed; `400` without either end or for a gain out of range, `404` if there is no such wire. |
+| `GET /x-orpheus/v1/levels` | The [levels](#levels), measured every 100 ms: `outputs`, those the wires play on (`output`, `output_name`, `channels` and, once one reached full scale, `clipped_secs_ago`), and `wires` (`source` or `input`, `output`, and `links` by `from` and `to` channel). Each level has `peak_db`, the peak over the last second, and `rms_db`, the RMS over the last 300 ms, in dBFS; both are absent while silent. |
 | `DELETE /x-orpheus/v1/wires?source=<id>&output=<name>` | Removes a wire; `input=<name>` instead of `source` for an input. Returns `204`; `400` without either, `404` if there is no such wire. |
 | `PUT /x-orpheus/v1/outputs/{name}/default` | Makes the output the default one. Returns `204`, `404` if there is no such output, `500` if the audio system doesn't change it, or `503` without an audio system. |
 | `GET /x-orpheus/v1/nodes` | The other nodes found over mDNS (what `orpheusctl nodes` shows), online first, then by the name shown, and pinned nodes that are offline. Each has `id`, `name`, `alias` (if set), `pinned`, `online`, `version`, `host`, `addresses`, `port` and `link`. Returns `503` if mDNS could not start. |
@@ -855,7 +872,8 @@ curl -s -X POST localhost:7480/x-orpheus/v1/routes \
 
 ## Warnings
 
-A node warns about network paths that put the audio at risk. Each warning
+A node warns about network paths that put the audio at risk, and about
+outputs that clip. Each warning
 is shown by `orpheusctl status`, in the status JSON, and logged when it
 appears (`WARN`) and when it is resolved (`INFO`):
 
@@ -873,6 +891,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
 | `peer_busy` | sender | The route wants a receiver on the peer, but all of the peer's receivers play other senders; it tries again every 5 seconds. Raise `[receiver] max` on the peer, or let other routes [claim on play](#claiming-a-receiver-on-play). |
 | `peer_incompatible` | sender | None of the peer's receivers can play the route's stream; it tries again when the peer's receivers change. |
+| `clipping` | output | What plays on an output reached full scale within the last 10 seconds: its wires, and anything else on it, add up to more than it can play. Turn the wires down; see [levels](#levels). The warning names the output in `output`. |
 
 Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
 the stream or PTP takes. Each node also announces its own link, that of its

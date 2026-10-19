@@ -109,7 +109,7 @@ time instead of catching up ("realign").
 |---|---|
 | main | tokio runtime: HTTP and NMOS APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type and can set the default output, as the desktop does. The engine talks to it through a channel. |
-| PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports; play the wires at their gains |
+| PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports; play the wires at their gains; measure the wires and the outputs they play on |
 | `orpheus-ptp` | PTP: sockets, timers, statime; restarts the port when its interface changes or the settings do, and retries while it can't start |
 | TX, one per sender | Pacing, ASRC, RTP send |
 | RX, one per running receiver | RTP receive, jitter buffer, level meter and gain, ASRC |
@@ -353,6 +353,18 @@ only sets the atomic, while changed pairs make the node again. A new wire
 list is applied at once, not only at the next tick. The node is dropped
 after its links, which it would otherwise take along under the reconciler.
 PipeWire sums what meets at an input port.
+
+Each output the links play on gets a meter node too: a passive
+`pw_filter` with an input per channel, linked to the output's monitor
+ports, so it measures the sum, also what else plays there, without keeping
+the output running. The wire nodes measure each pair after its gain. The
+realtime callbacks add each cycle's samples to a `SharedLevel` from
+`orpheus_engine::level` (atomics: the peak, the sum of squares in fixed
+point, the frames, the samples at full scale); every 100 ms the PipeWire
+thread takes them into `Meter`s, which hold the peak over a second and the
+RMS over 300 ms, and publishes the levels for `/levels` and the health
+check, which warns while an output reached full scale in the last 10
+seconds.
 
 `connection.rs` watches the peers' receivers the senders are connected to.
 Discovery keeps each node's receiver change counter (`ver_rcv` in its mDNS

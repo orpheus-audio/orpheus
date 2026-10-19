@@ -1,6 +1,7 @@
 //! Warnings about the paths streams and the clock take: Wi-Fi at either
 //! end, multicast over Wi-Fi, packets that arrive with a wide spread, and a
-//! slow path to the PTP grandmaster.
+//! slow path to the PTP grandmaster; and outputs whose wires add up to
+//! more than they can play.
 //!
 //! Wi-Fi is seen directly on this node's own interfaces and through the
 //! link each peer announces over mDNS. Spread is measured by the receiver;
@@ -41,6 +42,8 @@ pub const PTP_DELAY_LIMIT_MS: f64 = 0.5;
 /// makes it step over and over and never settle.
 const STEPS_LIMIT: u64 = 3;
 const STEPS_WINDOW: Duration = Duration::from_secs(60);
+/// An output warns for this long after it last reached full scale.
+const CLIP_WINDOW: Duration = Duration::from_secs(10);
 /// How often the node's own link is checked for announcing it.
 const LINK_CHECK: Duration = Duration::from_secs(5);
 
@@ -76,6 +79,9 @@ pub enum WarningKind {
     PeerBusy,
     /// None of the peer's receivers can play the route's stream.
     PeerIncompatible,
+    /// What plays on an output reached full scale: the sum of its wires
+    /// and anything else on it clips.
+    Clipping,
 }
 
 /// What a warning is about.
@@ -85,6 +91,7 @@ pub enum Subject {
     Clock,
     Receiver,
     Sender,
+    Output,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
@@ -98,13 +105,30 @@ pub struct Warning {
     /// The receiver, for warnings on a receiver.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub receiver: Option<ReceiverId>,
+    /// The output, by machine name, for warnings on an output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
     /// What is wrong and what to do, for people.
     pub message: String,
 }
 
 impl Warning {
-    fn key(&self) -> (WarningKind, Subject, Option<SenderId>, Option<ReceiverId>) {
-        (self.kind, self.on, self.sender, self.receiver)
+    fn key(
+        &self,
+    ) -> (
+        WarningKind,
+        Subject,
+        Option<SenderId>,
+        Option<ReceiverId>,
+        Option<&str>,
+    ) {
+        (
+            self.kind,
+            self.on,
+            self.sender,
+            self.receiver,
+            self.output.as_deref(),
+        )
     }
 }
 
@@ -179,6 +203,7 @@ fn check(node: &Node, state: &mut State) {
     found.extend(receivers(node, state, &nodes));
     found.extend(senders(node, &nodes));
     found.extend(held(node));
+    found.extend(clipping(node));
 
     let mut health = node.health.lock().unwrap();
     for w in &found {
@@ -210,6 +235,7 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
         on: Subject::Clock,
         sender: None,
         receiver: None,
+        output: None,
         message,
     };
     if !s.running {
@@ -332,6 +358,7 @@ fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) 
             on: Subject::Receiver,
             sender: None,
             receiver: Some(id),
+            output: None,
             message,
         };
         let from = name.unwrap_or_else(|| "the sender".into());
@@ -408,11 +435,45 @@ fn held(node: &Node) -> Vec<Warning> {
             on: Subject::Receiver,
             sender: None,
             receiver: Some(id),
+            output: None,
             message: format!(
                 "receiver {id} plays nowhere: the default output is a sink to another node, \
                  and streams are passed on only when told; choose an output with \
                  `orpheusctl play {id} <output>` or set [receiver] default_output"
             ),
+        })
+        .collect()
+}
+
+/// Outputs that reached full scale lately.
+fn clipping(node: &Node) -> Vec<Warning> {
+    let Some(engine) = &node.engine else {
+        return vec![];
+    };
+    let (levels, outputs) = {
+        let e = engine.lock().unwrap();
+        (e.levels(), e.outputs())
+    };
+    levels
+        .outputs
+        .into_iter()
+        .filter(|o| o.clipped.is_some_and(|t| t.elapsed() < CLIP_WINDOW))
+        .map(|o| {
+            let name = outputs
+                .iter()
+                .find(|d| d.name == o.name)
+                .map_or(o.name.as_str(), |d| d.description.as_str());
+            Warning {
+                kind: WarningKind::Clipping,
+                on: Subject::Output,
+                sender: None,
+                receiver: None,
+                message: format!(
+                    "{name} reached full scale: what plays on it adds up to more than it can \
+                     play, and clips; turn its wires down (`orpheusctl wire-gain`)"
+                ),
+                output: Some(o.name),
+            }
         })
         .collect()
 }
@@ -433,6 +494,7 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
             on: Subject::Sender,
             sender: Some(id),
             receiver: None,
+            output: None,
             message,
         };
         match links.get(&id).map(|l| l.state) {

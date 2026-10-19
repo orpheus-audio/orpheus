@@ -227,8 +227,14 @@ enum Command {
         #[arg(value_name = "OUT=IN")]
         channels: Vec<String>,
     },
-    /// Show the wires: what plays on each output channel.
-    Patch,
+    /// Show the wires: what plays on each output channel, and how loud:
+    /// the peak over the last second of each output channel and of what
+    /// each wire brings to it.
+    Patch {
+        /// Refresh every SECONDS (default 1), as a meter.
+        #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1")]
+        watch: Option<f64>,
+    },
     /// Forget where a source plays and how loud; if it plays now, it goes
     /// to the default output at full volume.
     ForgetSource {
@@ -1006,15 +1012,10 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     .with_context(|| format!("unwiring channels via {url}"))?;
             }
         }
-        Command::Patch => {
-            let raw = get(&format!("{base}/x-orpheus/v1/wires"))?;
-            if cli.json {
-                println!("{}", raw.trim_end());
-            } else {
-                let wires: Vec<WireEntry> =
-                    serde_json::from_str(&raw).context("reading the wires")?;
-                print!("{}", render_patch(&wires, Paint::detect()));
-            }
+        Command::Patch { watch: None } => print!("{}", patch(base, cli.json, Paint::detect())?),
+        Command::Patch { watch: Some(secs) } => {
+            anyhow::ensure!(secs >= 0.1, "--watch needs at least 0.1 seconds");
+            watch_patch(base, Duration::from_secs_f64(secs), cli.json)?;
         }
         Command::ForgetSource { source } => {
             let id = find_source(base, &source)?;
@@ -1338,7 +1339,109 @@ fn render_wire_set(w: &WireEntry, p: Paint) -> String {
 
 /// The wires as a patch bay: per output channel, everything playing on
 /// it; then the wires that link nothing yet.
-fn render_patch(wires: &[WireEntry], p: Paint) -> String {
+/// The patch as text, or with `json` the wires and levels as the node
+/// gives them.
+fn patch(base: &str, json: bool, p: Paint) -> Result<String> {
+    let wires = get(&format!("{base}/x-orpheus/v1/wires"))?;
+    let levels = get(&format!("{base}/x-orpheus/v1/levels"))?;
+    if json {
+        let both = serde_json::json!({
+            "wires": serde_json::from_str::<serde_json::Value>(&wires)?,
+            "levels": serde_json::from_str::<serde_json::Value>(&levels)?,
+        });
+        return Ok(format!("{both}\n"));
+    }
+    let wires: Vec<WireEntry> = serde_json::from_str(&wires).context("reading the wires")?;
+    let levels: Levels = serde_json::from_str(&levels).context("reading the levels")?;
+    Ok(render_patch(&wires, Some(&levels), p))
+}
+
+/// Shows the patch every `interval`, until stopped.
+fn watch_patch(base: &str, interval: Duration, json: bool) -> Result<()> {
+    let paint = Paint::detect();
+    let mut screen = Screen {
+        out: std::io::stdout().lock(),
+        tty: std::io::stdout().is_terminal(),
+        json,
+        first: true,
+    };
+    loop {
+        let frame = patch(base, json, paint).unwrap_or_else(|e| render_error(&e, base, paint));
+        screen.show(&frame).map_err(|Unwritable(e)| e)?;
+        std::thread::sleep(interval);
+    }
+}
+
+/// Levels, as `/x-orpheus/v1/levels` gives them.
+#[derive(Deserialize, Default)]
+struct Levels {
+    outputs: Vec<OutputLevels>,
+    wires: Vec<WireLevels>,
+}
+
+#[derive(Deserialize)]
+struct OutputLevels {
+    output: String,
+    channels: Vec<LevelEntry>,
+    clipped_secs_ago: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct WireLevels {
+    source: Option<String>,
+    input: Option<String>,
+    output: String,
+    links: Vec<LinkLevel>,
+}
+
+#[derive(Deserialize)]
+struct LinkLevel {
+    from: usize,
+    to: usize,
+    #[serde(flatten)]
+    level: LevelEntry,
+}
+
+/// Absent while silent.
+#[derive(Deserialize)]
+struct LevelEntry {
+    peak_db: Option<f32>,
+}
+
+impl Levels {
+    fn output(&self, name: &str) -> Option<&OutputLevels> {
+        self.outputs.iter().find(|o| o.output == name)
+    }
+
+    /// The level of what `w` brings from channel `from` to channel `to`.
+    fn link(&self, w: &WireEntry, from: usize, to: usize) -> Option<&LevelEntry> {
+        self.wires
+            .iter()
+            .find(|l| l.source == w.source && l.input == w.input && l.output == w.output)?
+            .links
+            .iter()
+            .find(|l| l.from == from && l.to == to)
+            .map(|l| &l.level)
+    }
+}
+
+/// How wide the level column of `patch` is.
+const LEVEL_WIDTH: usize = 10;
+
+/// A peak in dBFS, `-12.5 dBFS`, marked once it reaches full scale;
+/// right-aligned to `width`.
+fn peak_text(level: Option<&LevelEntry>, width: usize, p: Paint) -> String {
+    let peak = level.and_then(|l| l.peak_db);
+    let text = peak.map_or_else(|| "silent".to_owned(), |db| format!("{db:.1} dBFS"));
+    let text = format!("{text:>width$}");
+    match peak {
+        Some(db) if db >= 0.0 => p.level(Level::Bad, &text),
+        Some(_) => text,
+        None => p.dim(&text),
+    }
+}
+
+fn render_patch(wires: &[WireEntry], levels: Option<&Levels>, p: Paint) -> String {
     let mut o = String::new();
     if wires.is_empty() {
         let _ = writeln!(o, "{}", p.mark(Level::Off, "no wires"));
@@ -1354,7 +1457,20 @@ fn render_patch(wires: &[WireEntry], p: Paint) -> String {
         if i > 0 {
             o.push('\n');
         }
-        let _ = writeln!(o, "{} {}", p.bold(description), p.dim(&format!("({name})")));
+        let output = levels.and_then(|l| l.output(name));
+        let clipped = output
+            .and_then(|o| o.clipped_secs_ago)
+            .map(|secs| {
+                let text = format!("clipped {secs:.0} s ago");
+                format!("  {}", p.level(Level::Bad, &text))
+            })
+            .unwrap_or_default();
+        let _ = writeln!(
+            o,
+            "{} {}{clipped}",
+            p.bold(description),
+            p.dim(&format!("({name})"))
+        );
         let on: Vec<&WireEntry> = wires.iter().filter(|w| w.output == *name).collect();
         let layout = on.iter().find_map(|w| w.output_channels.as_ref());
         let mut channels: Vec<usize> = on
@@ -1377,8 +1493,11 @@ fn render_patch(wires: &[WireEntry], p: Paint) -> String {
                         } else {
                             String::new()
                         };
+                        let level = levels
+                            .map(|v| format!(" [{}]", peak_text(v.link(w, l.from, *c), 0, p)))
+                            .unwrap_or_default();
                         let text = format!(
-                            "{}: {}{}{gain}",
+                            "{}: {}{}{gain}{level}",
                             w.from_name,
                             channel_name(w.from_channels.as_ref(), l.from),
                             if l.folded { FOLDED } else { "" }
@@ -1391,7 +1510,17 @@ fn render_patch(wires: &[WireEntry], p: Paint) -> String {
                     })
                 })
                 .collect();
-            let _ = writeln!(o, "  {label:<width$}  ← {}", feeds.join(", "));
+            let level = match levels {
+                // The output measures nothing without monitor ports.
+                Some(_) => match output {
+                    Some(out) => {
+                        format!("  {}", peak_text(out.channels.get(c - 1), LEVEL_WIDTH, p))
+                    }
+                    None => format!("  {:>LEVEL_WIDTH$}", "—"),
+                },
+                None => String::new(),
+            };
+            let _ = writeln!(o, "  {label:<width$}{level}  ← {}", feeds.join(", "));
         }
         for w in on.iter().filter(|w| !w.links.is_empty()) {
             if let Some(mix) = w.mix_text() {
@@ -2767,7 +2896,7 @@ Routes
         ))
         .unwrap();
         assert_eq!(
-            render_patch(&wires, Paint(false)),
+            render_patch(&wires, None, Paint(false)),
             "TV (tv)\n  \
              L  ← Film: L, Film: C⤵ -3 dB, Film: Ls⤵ -3 dB\n  \
              R  ← Film: R, Film: C⤵ -3 dB, Film: Rs⤵ -3 dB\n  \
@@ -2776,6 +2905,36 @@ Routes
         assert_eq!(
             render_wire_set(&wires[0], Paint(false)),
             "Film → TV: L=L R=R L=C⤵@-3 R=C⤵@-3 L=Ls⤵@-3 R=Rs⤵@-3 (downmix 51 → ST, LFE left out)\n"
+        );
+    }
+
+    #[test]
+    fn patch_shows_levels() {
+        let wires: Vec<WireEntry> = serde_json::from_str(
+            r#"[{"input": "mic", "from_name": "Mic", "output": "tv", "output_name": "TV",
+                 "links": [
+                     {"from": 1, "to": 1, "linked": true},
+                     {"from": 1, "to": 2, "linked": true, "gain_db": -6}]}]"#,
+        )
+        .unwrap();
+        let levels: Levels = serde_json::from_str(
+            r#"{"outputs": [{"output": "tv", "channels": [{"peak_db": 0.4}, {}],
+                             "clipped_secs_ago": 2.3}],
+                "wires": [{"input": "mic", "output": "tv", "links": [
+                    {"from": 1, "to": 1, "peak_db": -9.04, "rms_db": -12},
+                    {"from": 1, "to": 2}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            render_patch(&wires, Some(&levels), Paint(false)),
+            "TV (tv)  clipped 2 s ago\n  \
+             1    0.4 dBFS  ← Mic: 1 [-9.0 dBFS]\n  \
+             2      silent  ← Mic: 1 -6 dB [silent]\n"
+        );
+        let unmeasured = Levels::default();
+        assert_eq!(
+            render_patch(&wires, Some(&unmeasured), Paint(false)),
+            "TV (tv)\n  1           —  ← Mic: 1 [silent]\n  2           —  ← Mic: 1 -6 dB [silent]\n"
         );
     }
 
@@ -2793,7 +2952,7 @@ Routes
             "Mic → TV (-6 dB): 1=1 2=1@+6\n"
         );
         assert_eq!(
-            render_patch(&wires, Paint(false)),
+            render_patch(&wires, None, Paint(false)),
             "TV (tv)\n  1  ← Mic: 1 -6 dB\n  2  ← Mic: 1\n"
         );
         let mut muted = wires;
@@ -2802,7 +2961,7 @@ Routes
             render_wire_set(&muted[0], Paint(false)),
             "Mic → TV (-6 dB, muted): 1=1 2=1@+6\n"
         );
-        assert!(render_patch(&muted, Paint(false)).contains("← Mic: 1 muted\n"));
+        assert!(render_patch(&muted, None, Paint(false)).contains("← Mic: 1 muted\n"));
         assert_eq!(
             parse_pair("L=C@-3").unwrap(),
             serde_json::json!({"to": "L", "from": "C", "gain_db": -3.0})

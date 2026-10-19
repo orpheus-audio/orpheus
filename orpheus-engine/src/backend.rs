@@ -1,9 +1,11 @@
 //! The interface between the engine and a platform audio system.
 
 use std::error::Error;
+use std::time::Instant;
 
 use orpheus_core::{AudioFormat, Layout, OutputType};
 
+use crate::level::Level;
 use crate::port::{CapturePort, PlaybackPort};
 
 pub type BackendError = Box<dyn Error + Send + Sync>;
@@ -109,10 +111,34 @@ pub trait AudioBackend: Send {
         Vec::new()
     }
 
+    /// How loud the links made play, after their gain, and the outputs
+    /// they play on, with what else plays there.
+    fn levels(&self) -> Levels {
+        Levels::default()
+    }
+
     /// The streams applications play now, besides Orpheus's own.
     fn app_streams(&self) -> Vec<AppStream> {
         Vec::new()
     }
+}
+
+/// How loud links and outputs play; see [`AudioBackend::levels`].
+#[derive(Debug, Clone, Default)]
+pub struct Levels {
+    pub links: Vec<(Link, Level)>,
+    pub outputs: Vec<OutputLevel>,
+}
+
+/// How loud an output plays: all that is summed into it.
+#[derive(Debug, Clone)]
+pub struct OutputLevel {
+    /// Its machine name.
+    pub name: String,
+    /// By channel.
+    pub channels: Vec<Level>,
+    /// When a channel last reached full scale.
+    pub clipped: Option<Instant>,
 }
 
 /// A stream an application plays.
@@ -182,7 +208,6 @@ pub struct Link {
     /// [`gain`](crate::gain)).
     pub gain: f32,
 }
-
 
 /// Where a playback stream plays.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -378,6 +378,12 @@ impl Engine {
         self.backend.links()
     }
 
+    /// How loud the links and their outputs play; see
+    /// [`AudioBackend::levels`].
+    pub fn levels(&self) -> crate::Levels {
+        self.backend.levels()
+    }
+
     /// Makes output `name` the default one; see
     /// [`AudioBackend::set_default_output`].
     pub fn set_default_output(&self, name: &str) -> Result<(), BackendError> {

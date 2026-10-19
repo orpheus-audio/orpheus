@@ -14,7 +14,7 @@
 | M5 | Receiver pool and policy: one receiver per connection, policies (mix, first sender wins, last sender wins) and ducking by priority; following peers (address changes, reclaiming a receiver); pinned peers and aliases; per-sender volumes (through WirePlumber) | done, except the two-box test |
 | — | Route identity: stable route and source IDs, output and volume remembered per source, claiming the peer's receiver on play, default output | done |
 | M6 | Configurability: settings over the API (clock, receivers, senders), PTP that retries and holds over, WebSocket state stream, output selection, BCP-004, IS-08 per receiver (removed again in M7, replaced by wires) | done, except the two-box test |
-| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking, unavailable sinks, pausing players), English and German names, multichannel routes (up to 64 channels), gain per wire done |
+| M7 | Channels and patching: channel layouts after ST 2110 (symbols and labels on the wire), inputs and outputs with their channels, outputs made of chosen device channels, a patchbay wiring any channel of any receiver or local input to any output channel (summing where wires meet), more than 2 channels per route | in progress: layouts, inputs and outputs, wires, mix display, lost outputs (parking, unavailable sinks, pausing players), English and German names, multichannel routes (up to 64 channels), gain per wire, meters done |
 
 After M7 the API should be stable enough for the web UI.
 
@@ -37,9 +37,10 @@ and Bluetooth inputs.
 - A receiver reads a stream's channel layout from its SDP file only, so
   channel labels, which only IS-04 carries, don't reach it; a label can be
   set per source instead.
-- Wires have gains, but nothing guards an output channel against
-  clipping where several meet: there is no limiter and no meter per wire
-  yet. Gains are set through Orpheus's API only; AES70 comes later.
+- Wires have gains and meters, and an output that clips is warned
+  about, but nothing guards it: there is no limiter, which would need
+  Orpheus to do the summing itself. Gains are set through Orpheus's API
+  only; AES70 comes later.
 - `when_lost = "pause"` pauses only MPRIS players whose process it can
   tell for sure, not those in a Flatpak sandbox or players without MPRIS;
   their streams are parked. Nothing resumes a paused player when its

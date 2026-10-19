@@ -627,6 +627,7 @@ fn parts() -> (Router<Arc<Node>>, utoipa::openapi::OpenApi) {
         .routes(routes!(inputs))
         .routes(routes!(list_wires, set_wire, remove_wire))
         .routes(routes!(set_wire_gain))
+        .routes(routes!(levels))
         .routes(routes!(set_output_type, clear_output_type))
         .routes(routes!(set_default_output))
         .routes(routes!(set_receiver_output, clear_receiver_output))
@@ -1835,6 +1836,153 @@ fn wire_entries(node: &Node, wires: &[crate::wires::Wire]) -> Vec<WireEntry> {
         .collect()
 }
 
+/// How loud a channel plays: its peak over the last second and its RMS
+/// over the last 300 ms, in dBFS; absent while silent.
+#[derive(Serialize, ToSchema)]
+struct LevelView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = -12.5)]
+    peak_db: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = -20.1)]
+    rms_db: Option<f32>,
+}
+
+impl From<orpheus_engine::level::Level> for LevelView {
+    fn from(l: orpheus_engine::level::Level) -> Self {
+        use orpheus_engine::level::dbfs;
+        // Adding 0 makes -0.0 0.0.
+        let round = |db: f32| (db * 10.0).round() / 10.0 + 0.0;
+        Self {
+            peak_db: dbfs(l.peak).map(round),
+            rms_db: dbfs(l.rms).map(round),
+        }
+    }
+}
+
+/// The levels of the outputs wires play on and of what each wire brings.
+#[derive(Default, Serialize, ToSchema)]
+struct Levels {
+    outputs: Vec<OutputLevels>,
+    wires: Vec<WireLevels>,
+}
+
+/// What an output plays: all that is summed into it, wired or not, as
+/// its monitor carries it.
+#[derive(Serialize, ToSchema)]
+struct OutputLevels {
+    /// The output, by machine name.
+    output: String,
+    /// Its name.
+    output_name: String,
+    /// By channel, from the first.
+    channels: Vec<LevelView>,
+    /// How long ago a channel last reached full scale, in seconds, where
+    /// it did since the wires play there. At full scale the sum no longer
+    /// fits the device's samples and clips.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clipped_secs_ago: Option<f64>,
+}
+
+/// What a wire brings to its output, by link, after its gain.
+#[derive(Serialize, ToSchema)]
+struct WireLevels {
+    /// The source it comes from, by ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>)]
+    source: Option<SourceId>,
+    /// The input it comes from, by machine name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input: Option<String>,
+    output: String,
+    links: Vec<LinkLevel>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct LinkLevel {
+    /// The input channel, counted from 1.
+    from: usize,
+    /// The output channel, counted from 1.
+    to: usize,
+    #[serde(flatten)]
+    level: LevelView,
+}
+
+/// How loud the outputs wires play on and the wires' links play, for
+/// meters; measured every 100 ms.
+#[utoipa::path(
+    get,
+    path = "/x-orpheus/v1/levels",
+    tag = "wires",
+    responses((status = OK, description = "The levels", body = Levels)),
+)]
+async fn levels(State(node): State<Arc<Node>>) -> Json<Levels> {
+    let levels = tokio::task::spawn_blocking(move || levels_of(&node))
+        .await
+        .unwrap_or_default();
+    Json(levels)
+}
+
+fn levels_of(node: &Node) -> Levels {
+    use crate::wires::Origin;
+    let wires = node.wires.lock().unwrap().list().to_vec();
+    let Some(engine) = &node.engine else {
+        return Levels::default();
+    };
+    let (resolved, measured, outputs) = {
+        let engine = engine.lock().unwrap();
+        (
+            crate::wires::resolve(node, &engine, &wires),
+            engine.levels(),
+            engine.outputs(),
+        )
+    };
+    let wires = wires
+        .iter()
+        .zip(&resolved)
+        .map(|(w, r)| {
+            let links = r
+                .links(w)
+                .filter_map(|l| {
+                    let (_, level) = measured.links.iter().find(|(m, _)| *m == l)?;
+                    Some(LinkLevel {
+                        from: l.from_channel + 1,
+                        to: l.to_channel + 1,
+                        level: (*level).into(),
+                    })
+                })
+                .collect();
+            let (source, input) = match &w.from {
+                Origin::Source(id) => (Some(*id), None),
+                Origin::Input(name) => (None, Some(name.clone())),
+            };
+            WireLevels {
+                source,
+                input,
+                output: w.output.clone(),
+                links,
+            }
+        })
+        .collect();
+    let mut outputs: Vec<OutputLevels> = measured
+        .outputs
+        .into_iter()
+        .map(|o| OutputLevels {
+            output_name: outputs
+                .iter()
+                .find(|d| d.name == o.name)
+                .map_or_else(|| o.name.clone(), |d| d.description.clone()),
+            output: o.name,
+            channels: o.channels.into_iter().map(Into::into).collect(),
+            clipped_secs_ago: o
+                .clipped
+                .map(|t| (t.elapsed().as_secs_f64() * 10.0).round() / 10.0),
+        })
+        .collect();
+    outputs.sort_by(|a, b| a.output_name.cmp(&b.output_name));
+    Levels { outputs, wires }
+}
+
 /// Plays channels of a source or an input on an output, replacing the
 /// wire between the two. Each pair names an output channel and the input
 /// channel played on it, by number (from 1), symbol or label; without
@@ -2368,6 +2516,7 @@ mod tests {
             [
                 "/x-orpheus/v1/events",
                 "/x-orpheus/v1/inputs",
+                "/x-orpheus/v1/levels",
                 "/x-orpheus/v1/nodes",
                 "/x-orpheus/v1/nodes/{id}",
                 "/x-orpheus/v1/outputs",

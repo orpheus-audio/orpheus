@@ -9,13 +9,14 @@ pub mod backend;
 pub mod engine;
 pub mod gain;
 mod grid;
+pub mod level;
 pub mod port;
 pub mod receiver;
 pub mod sender;
 
 pub use backend::{
-    AppStream, AudioBackend, BackendError, Input, Link, Output, OutputSpec, Placement,
-    StreamControl, StreamHandle, StreamSpec, Volume,
+    AppStream, AudioBackend, BackendError, Input, Levels, Link, Output, OutputLevel, OutputSpec,
+    Placement, StreamControl, StreamHandle, StreamSpec, Volume,
 };
 pub use engine::{Engine, EngineStatus, LoopbackConfig, ReceiverId, SenderId};
 pub use port::{CapturePort, PlaybackPort, PortStats, StatsSnapshot, port_pair};
