@@ -77,11 +77,43 @@ and it follows the grandmaster again within seconds, without a restart.
   low rate, and with power saving they hold it back for 100 to 300 ms. Use
   Ethernet if you can; the servo keeps held messages out of the clock
   ([clock](clock.md#ptp)). The node warns about it (`wifi`,
-  `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)).
+  `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)). Turn
+  off [power saving](#wi-fi-power-saving) on every node on Wi-Fi.
 - **Unsteady path.** If `steps` keeps rising (warning `ptp_steps`), the
   delay to the grandmaster jumps by more than `step_threshold_us`, as on
   Wi-Fi. Set `[ptp] step_threshold_us = 20000`; see
   [clock](clock.md#ptp).
+
+## Wi-Fi power saving
+
+A Wi-Fi client with power saving on dozes between beacons, and the access
+point holds its packets until it wakes, 100 ms and more. Clocks then step and
+streams drop out, whatever the buffer. The node warns (`power_save`). Turn it
+off on every node on Wi-Fi.
+
+With NetworkManager, for the connection in use:
+
+```sh
+nmcli connection modify <connection> 802-11-wireless.powersave 2
+nmcli connection up <connection>
+```
+
+or for all connections, in `/etc/NetworkManager/conf.d/wifi-powersave.conf`:
+
+```ini
+[connection]
+wifi.powersave = 2
+```
+
+followed by `sudo systemctl restart NetworkManager`. Without
+NetworkManager, `sudo iw dev <interface> set power_save off` turns it off
+until the next restart; `iw dev <interface> get power_save` shows it.
+Some laptops turn it on again on battery (TLP does by default), so
+the node checks again every 30 seconds.
+
+Power saving on other devices (phones, tablets) still makes the access point
+hold back multicast for everyone, PTP included. That is not something a
+node can turn off.
 
 ## PTP works for a few minutes, then stops
 

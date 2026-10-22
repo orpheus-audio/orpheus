@@ -884,6 +884,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `wifi_grandmaster` | clock | PTP runs over Wi-Fi on a node that does not follow another clock, so it is or may become the grandmaster. That does not hurt this node, but nodes that follow its clock may not settle. Give a wired node a lower `ptp.priority1` so that it becomes the grandmaster. |
 | `multicast_wifi` | receiver, sender | A [multicast](#multicast-interop) stream goes over Wi-Fi, where the access point sends it at its lowest rate to every client. |
 | `peer_wifi` | receiver, sender | The node at the other end is on Wi-Fi, as it announces. |
+| `power_save` | interface | Power saving is on for a Wi-Fi interface the node uses (PTP's or the default route's). The access point then holds the node's packets until it wakes, 100 ms and more, which no buffer or clock filter makes up for. Turn it off; see [troubleshooting](troubleshooting.md#wi-fi-power-saving). The warning names the interface in `interface`. Laptops often turn power saving on when they go on battery, so the node checks again every 30 seconds. |
 | `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). |
 | `peer_jitter` | sender | The peer's receiver warns about `jitter` for this sender. |
 | `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. |

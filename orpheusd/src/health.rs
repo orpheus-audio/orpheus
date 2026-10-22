@@ -1,7 +1,7 @@
 //! Warnings about the paths streams and the clock take: Wi-Fi at either
-//! end, multicast over Wi-Fi, packets that arrive with a wide spread, and a
-//! slow path to the PTP grandmaster; and outputs whose wires add up to
-//! more than they can play.
+//! end, multicast over Wi-Fi, Wi-Fi power saving, packets that arrive with
+//! a wide spread, and a slow path to the PTP grandmaster; and outputs whose
+//! wires add up to more than they can play.
 //!
 //! Wi-Fi is seen directly on this node's own interfaces and through the
 //! link each peer announces over mDNS. Spread is measured by the receiver;
@@ -44,8 +44,9 @@ const STEPS_LIMIT: u64 = 3;
 const STEPS_WINDOW: Duration = Duration::from_secs(60);
 /// An output warns for this long after it last reached full scale.
 const CLIP_WINDOW: Duration = Duration::from_secs(10);
-/// How often the node's own link is checked for announcing it.
-const LINK_CHECK: Duration = Duration::from_secs(5);
+/// How often the network is looked at again: the node's own link, which it
+/// announces, and Wi-Fi power saving. Neither is urgent.
+const NETWORK_CHECK: Duration = Duration::from_secs(30);
 
 /// What is wrong.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -61,6 +62,9 @@ pub enum WarningKind {
     MulticastWifi,
     /// The node at the other end announces that it is on Wi-Fi.
     PeerWifi,
+    /// Power saving is on for a Wi-Fi interface the node uses, so the
+    /// access point holds its packets until it wakes.
+    PowerSave,
     /// The receiver's packets arrive with a wide spread.
     Jitter,
     /// The peer's receiver reports a wide spread for this sender's packets.
@@ -92,6 +96,7 @@ pub enum Subject {
     Receiver,
     Sender,
     Output,
+    Interface,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
@@ -108,26 +113,32 @@ pub struct Warning {
     /// The output, by machine name, for warnings on an output.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    /// The network interface, for warnings on an interface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interface: Option<String>,
     /// What is wrong and what to do, for people.
     pub message: String,
 }
 
+/// What tells warnings apart: all but the message.
+type Key<'a> = (
+    WarningKind,
+    Subject,
+    Option<SenderId>,
+    Option<ReceiverId>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
 impl Warning {
-    fn key(
-        &self,
-    ) -> (
-        WarningKind,
-        Subject,
-        Option<SenderId>,
-        Option<ReceiverId>,
-        Option<&str>,
-    ) {
+    fn key(&self) -> Key<'_> {
         (
             self.kind,
             self.on,
             self.sender,
             self.receiver,
             self.output.as_deref(),
+            self.interface.as_deref(),
         )
     }
 }
@@ -161,11 +172,13 @@ struct State {
     steps: VecDeque<(Instant, u64)>,
     /// When the PTP clock was last unsettled or stepped.
     unsteady: Option<Instant>,
-    link_checked: Option<Instant>,
+    network_checked: Option<Instant>,
+    /// The power saving warnings of the last network check.
+    power_save: Vec<Warning>,
 }
 
 /// Checks once a second, logs warnings as they come and go, and keeps the
-/// node's announced link current.
+/// node's announced link current, every [`NETWORK_CHECK`].
 pub async fn watch(node: Arc<Node>) {
     let mut state = State::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -186,24 +199,29 @@ pub async fn watch(node: Arc<Node>) {
 }
 
 fn check(node: &Node, state: &mut State) {
-    if state.link_checked.is_none_or(|t| t.elapsed() >= LINK_CHECK) {
-        state.link_checked = Some(Instant::now());
-        if let Some(d) = &node.discovery
-            && let Err(e) = d.set_link(own_link())
-        {
-            tracing::warn!(error = %e, "announcing the node's link");
-        }
-    }
     let nodes = node
         .discovery
         .as_ref()
         .map(|d| d.nodes())
         .unwrap_or_default();
+    if state
+        .network_checked
+        .is_none_or(|t| t.elapsed() >= NETWORK_CHECK)
+    {
+        state.network_checked = Some(Instant::now());
+        if let Some(d) = &node.discovery
+            && let Err(e) = d.set_link(own_link())
+        {
+            tracing::warn!(error = %e, "announcing the node's link");
+        }
+        state.power_save = power_save(node);
+    }
     let mut found = clock(node, state);
     found.extend(receivers(node, state, &nodes));
     found.extend(senders(node, &nodes));
     found.extend(held(node));
     found.extend(clipping(node));
+    found.extend(state.power_save.iter().cloned());
 
     let mut health = node.health.lock().unwrap();
     for w in &found {
@@ -236,6 +254,7 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
         sender: None,
         receiver: None,
         output: None,
+        interface: None,
         message,
     };
     if !s.running {
@@ -320,6 +339,40 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
     found
 }
 
+/// Wi-Fi interfaces the node uses, PTP's and the default route's, with
+/// power saving on. Checked again and again: laptops often turn it on when
+/// they go on battery.
+fn power_save(node: &Node) -> Vec<Warning> {
+    let mut interfaces: Vec<String> = node
+        .ptp
+        .as_ref()
+        .map(|p| p.status().interface)
+        .into_iter()
+        .chain(network::default_interface())
+        .filter(|i| !i.is_empty() && network::is_wireless(i))
+        .collect();
+    interfaces.sort();
+    interfaces.dedup();
+    interfaces
+        .into_iter()
+        .filter(|i| network::power_save(i) == Some(true))
+        .map(|i| Warning {
+            kind: WarningKind::PowerSave,
+            on: Subject::Interface,
+            sender: None,
+            receiver: None,
+            output: None,
+            message: format!(
+                "Wi-Fi power saving is on for {i}: the access point holds this node's packets \
+                 until it wakes, up to 100 ms and more, so the clock and streams stutter; \
+                 turn it off (NetworkManager: wifi.powersave = 2, or `iw dev {i} set \
+                 power_save off`)"
+            ),
+            interface: Some(i),
+        })
+        .collect()
+}
+
 /// The node `ip` belongs to, if discovery sees it.
 fn node_at(nodes: &[orpheus_discovery::Node], ip: IpAddr) -> Option<&orpheus_discovery::Node> {
     let ip = ip.to_canonical();
@@ -359,6 +412,7 @@ fn receivers(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) 
             sender: None,
             receiver: Some(id),
             output: None,
+            interface: None,
             message,
         };
         let from = name.unwrap_or_else(|| "the sender".into());
@@ -436,6 +490,7 @@ fn held(node: &Node) -> Vec<Warning> {
             sender: None,
             receiver: Some(id),
             output: None,
+            interface: None,
             message: format!(
                 "receiver {id} plays nowhere: the default output is a sink to another node, \
                  and streams are passed on only when told; choose an output with \
@@ -473,6 +528,7 @@ fn clipping(node: &Node) -> Vec<Warning> {
                      play, and clips; turn its wires down (`orpheusctl wire-gain`)"
                 ),
                 output: Some(o.name),
+                interface: None,
             }
         })
         .collect()
@@ -495,6 +551,7 @@ fn senders(node: &Node, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
             sender: Some(id),
             receiver: None,
             output: None,
+            interface: None,
             message,
         };
         match links.get(&id).map(|l| l.state) {

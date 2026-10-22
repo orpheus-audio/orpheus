@@ -494,7 +494,10 @@ warnings, which the status shows and the log follows. Wi-Fi is seen on
 this node's own interfaces (`network.rs`: the route the kernel picks for
 a peer, a multicast group or PTP, and whether that interface is wireless)
 and, for the other end, in the link each node announces over mDNS
-(`x-orpheus-link`, that of its default route, checked every 5 s).
+(`x-orpheus-link`, that of its default route). Every 30 s the loop
+looks at the network again: the node's own link, and whether power saving
+is on for the Wi-Fi interfaces it uses (`network.rs` asks nl80211, as `iw`
+does).
 
 The receiver measures, per second, the spread of the packets' arrival
 margins: the latest minus the earliest relative to their timestamps. That
