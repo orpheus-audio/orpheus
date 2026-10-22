@@ -31,7 +31,7 @@
 //! `CAP_NET_BIND_SERVICE`.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
@@ -56,7 +56,8 @@ use statime::{OverlayClock, PtpInstance, PtpInstanceState};
 use timestamped_socket::interface::{ChangeDetector, InterfaceName, interfaces};
 use timestamped_socket::networkaddress::MulticastJoinable;
 use timestamped_socket::socket::{
-    InterfaceTimestampMode, Open, Socket, Timestamp, open_interface_udp4, open_interface_udp6,
+    InterfaceTimestampMode, Open, RecvResult, Socket, Timestamp, open_interface_udp4,
+    open_interface_udp6,
 };
 use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep, sleep_until};
@@ -120,6 +121,25 @@ pub enum PtpTransport {
     Auto,
     Ipv4,
     Ipv6,
+}
+
+/// Where PTP messages go besides the multicast group: other nodes on
+/// Wi-Fi. An access point holds multicast back while any client dozes, up
+/// to a beacon interval (about 100 ms), and sends it at its lowest rate
+/// without retries; unicast it sends at once, acknowledged. Every node
+/// sends both, so wired nodes and other PTP devices keep multicast; a node
+/// on Wi-Fi takes a sender's messages by unicast once it heard it that way.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Unicast {
+    /// The nodes, on the port's transport; link-local IPv6 addresses are
+    /// taken on the port's interface.
+    pub peers: Vec<IpAddr>,
+    /// The port's interface is on Wi-Fi. The node then drops multicast
+    /// from senders that also reach it by unicast, and sends its unicast
+    /// copies first: a message's send time is that of the first copy, and
+    /// the others leave a few µs later. A wired node sends multicast first,
+    /// for the wired nodes that follow it.
+    pub wireless: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -258,6 +278,7 @@ struct Shared {
     frequency_ppm: AtomicU64,
     /// The clock has followed a grandmaster since the start.
     followed: AtomicBool,
+    unicast: Mutex<Unicast>,
 }
 
 impl Shared {
@@ -284,6 +305,7 @@ impl Shared {
             steps: AtomicU64::new(0),
             frequency_ppm: AtomicU64::new(0f64.to_bits()),
             followed: AtomicBool::new(false),
+            unicast: Mutex::new(Unicast::default()),
         }
     }
 
@@ -390,6 +412,11 @@ impl PtpClock {
 
     pub fn status(&self) -> PtpStatus {
         self.shared.status.lock().unwrap().clone()
+    }
+
+    /// Sets where PTP messages go besides the multicast group.
+    pub fn set_unicast(&self, unicast: Unicast) {
+        *self.shared.unicast.lock().unwrap() = unicast;
     }
 }
 
@@ -719,9 +746,15 @@ async fn at(deadline: Option<Instant>) {
 }
 
 /// A UDP transport for PTP: IPv4 or IPv6.
-trait Transport: MulticastJoinable {
+trait Transport: MulticastJoinable + std::fmt::Display {
     /// The primary or the peer-delay multicast group.
     fn group(link_local: bool, port: u16) -> Self;
+
+    /// `ip` at `port`, if it is of this transport; `scope` is the
+    /// interface's index, for link-local addresses.
+    fn unicast(ip: IpAddr, port: u16, scope: u32) -> Option<Self>;
+
+    fn ip(&self) -> IpAddr;
 
     fn open(
         interface: InterfaceName,
@@ -733,6 +766,17 @@ trait Transport: MulticastJoinable {
 impl Transport for SocketAddrV4 {
     fn group(link_local: bool, port: u16) -> Self {
         Self::new(if link_local { PDELAY_V4 } else { PRIMARY_V4 }, port)
+    }
+
+    fn unicast(ip: IpAddr, port: u16, _: u32) -> Option<Self> {
+        match ip.to_canonical() {
+            IpAddr::V4(ip) => Some(Self::new(ip, port)),
+            IpAddr::V6(_) => None,
+        }
+    }
+
+    fn ip(&self) -> IpAddr {
+        IpAddr::V4(*SocketAddrV4::ip(self))
     }
 
     fn open(
@@ -749,6 +793,20 @@ impl Transport for SocketAddrV6 {
         Self::new(if link_local { PDELAY_V6 } else { PRIMARY_V6 }, port, 0, 0)
     }
 
+    fn unicast(ip: IpAddr, port: u16, scope: u32) -> Option<Self> {
+        match ip {
+            IpAddr::V6(ip) if ip.to_ipv4_mapped().is_none() => {
+                let scope = if ip.is_unicast_link_local() { scope } else { 0 };
+                Some(Self::new(ip, port, 0, scope))
+            }
+            _ => None,
+        }
+    }
+
+    fn ip(&self) -> IpAddr {
+        IpAddr::V6(*SocketAddrV6::ip(self))
+    }
+
     fn open(
         interface: InterfaceName,
         port: u16,
@@ -760,6 +818,8 @@ impl Transport for SocketAddrV6 {
 
 struct Sockets<A: Transport> {
     interface: InterfaceName,
+    /// The interface's index, for link-local unicast.
+    scope: u32,
     event: Socket<A, Open>,
     general: Socket<A, Open>,
     /// Send timestamps missing in a row.
@@ -805,8 +865,13 @@ fn open_sockets<A: Transport>(interface: InterfaceName) -> io::Result<Sockets<A>
         open_socket(interface, EVENT_PORT, timestamping).map_err(|e| context("event", e))?;
     let general = open_socket(interface, GENERAL_PORT, InterfaceTimestampMode::None)
         .map_err(|e| context("general", e))?;
+    let scope = fs::read_to_string(format!("/sys/class/net/{interface}/ifindex"))
+        .ok()
+        .and_then(|i| i.trim().parse().ok())
+        .unwrap_or(0);
     Ok(Sockets {
         interface,
+        scope,
         event,
         general,
         missing: 0,
@@ -1078,6 +1143,8 @@ async fn run<A: Transport>(
     let mut settle = Settle::default();
     let mut event_buf = [0u8; MAX_DATA_LEN];
     let mut general_buf = [0u8; 2048];
+    let mut seen = Seen::default();
+    let mut heard = Heard::default();
     let mut bmca_at = Instant::now();
     loop {
         instance.bmca(&mut [&mut port]);
@@ -1102,8 +1169,9 @@ async fn run<A: Transport>(
                 result = sockets.event.recv(&mut event_buf) => match result {
                     Ok(packet) => {
                         let data = &event_buf[..packet.bytes_read];
+                        let take = heard.take(&packet, wireless(&clock)) && seen.first(data);
                         match packet.timestamp_data.selected_timestamp() {
-                            Some(ts) if is_message_buffer_compatible(data) => {
+                            Some(ts) if is_message_buffer_compatible(data) && take => {
                                 running.handle_event_receive(data, clock.time_of(ts))
                             }
                             _ => PortActionIterator::empty(),
@@ -1115,7 +1183,14 @@ async fn run<A: Transport>(
                     }
                 },
                 result = sockets.general.recv(&mut general_buf) => match result {
-                    Ok(packet) => running.handle_general_receive(&general_buf[..packet.bytes_read]),
+                    Ok(packet) => {
+                        let data = &general_buf[..packet.bytes_read];
+                        if heard.take(&packet, wireless(&clock)) && seen.first(data) {
+                            running.handle_general_receive(data)
+                        } else {
+                            PortActionIterator::empty()
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "PTP receive failed");
                         PortActionIterator::empty()
@@ -1154,6 +1229,91 @@ async fn run<A: Transport>(
     }
 }
 
+/// How long [`Heard`] counts a sender as reaching the node by unicast:
+/// some announce intervals.
+const HEARD_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the port's interface is on Wi-Fi, as the node last said.
+fn wireless(clock: &PortClock) -> bool {
+    clock.0.unicast.lock().unwrap().wireless
+}
+
+/// The senders the node lately heard by unicast. On Wi-Fi it takes their
+/// messages only that way: a multicast copy may have waited for the next
+/// beacon. Senders that never send unicast, such as other PTP devices,
+/// it keeps hearing by multicast.
+#[derive(Default)]
+struct Heard {
+    unicast: HashMap<IpAddr, Instant>,
+}
+
+impl Heard {
+    /// Whether to take `packet`.
+    fn take<A: Transport>(&mut self, packet: &RecvResult<A>, wireless: bool) -> bool {
+        self.take_from(
+            packet.remote_addr.ip(),
+            packet.local_addr.ip().is_multicast(),
+            wireless,
+            Instant::now(),
+        )
+    }
+
+    fn take_from(&mut self, from: IpAddr, multicast: bool, wireless: bool, now: Instant) -> bool {
+        if !multicast {
+            if self.unicast.insert(from, now).is_none() && wireless {
+                tracing::debug!(%from, "PTP from this sender by unicast only");
+            }
+            return true;
+        }
+        self.unicast.retain(|from, t| {
+            let keep = now.duration_since(*t) <= HEARD_FOR;
+            if !keep && wireless {
+                tracing::debug!(%from, "PTP from this sender by multicast again");
+            }
+            keep
+        });
+        !(wireless && self.unicast.contains_key(&from))
+    }
+}
+
+/// How long [`Seen`] remembers a message.
+const SEEN_FOR: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The messages received lately, to drop the second copy of one that came
+/// both by multicast and by [`Unicast`]. A message is told by its type,
+/// domain, sender and sequence number.
+#[derive(Default)]
+struct Seen {
+    recent: VecDeque<(Instant, [u8; 14])>,
+}
+
+impl Seen {
+    /// Whether `message` is the first copy; too short to tell counts as
+    /// first, for statime to reject.
+    fn first(&mut self, message: &[u8]) -> bool {
+        let Some(header) = message.get(..34) else {
+            return true;
+        };
+        let mut key = [0; 14];
+        key[0] = header[0] & 0x0f;
+        key[1] = header[4];
+        key[2..].copy_from_slice(&header[20..32]);
+        let now = Instant::now();
+        while self
+            .recent
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > SEEN_FOR)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.iter().any(|(_, k)| *k == key) {
+            return false;
+        }
+        self.recent.push_back((now, key));
+        true
+    }
+}
+
 /// Send timestamps missing in a row before the interface counts as giving
 /// none. Each one costs timestamped-socket a 200 ms wait.
 const MAX_MISSING_SEND_TIMESTAMPS: u32 = 3;
@@ -1174,6 +1334,23 @@ async fn handle_actions<A: Transport>(
     clock: &PortClock,
 ) -> Option<(TimestampContext, Time)> {
     let mut pending = None;
+    let unicast = clock.0.unicast.lock().unwrap().clone();
+    let scope = sockets.scope;
+    // The group first, then the peers, or the other way round. Peer
+    // delay messages stay on the link, multicast only.
+    let destinations = |link_local: bool, port: u16| -> Vec<A> {
+        let peers = unicast
+            .peers
+            .iter()
+            .filter(|_| !link_local)
+            .filter_map(|ip| A::unicast(*ip, port, scope));
+        let group = std::iter::once(A::group(link_local, port));
+        if unicast.wireless {
+            peers.chain(group).collect()
+        } else {
+            group.chain(peers).collect()
+        }
+    };
     for action in actions {
         match action {
             PortAction::SendEvent {
@@ -1181,12 +1358,10 @@ async fn handle_actions<A: Transport>(
                 data,
                 link_local,
             } => {
+                let mut to = destinations(link_local, EVENT_PORT).into_iter();
+                let first = to.next().expect("the group is always there");
                 let before = statime::Clock::now(clock);
-                match sockets
-                    .event
-                    .send_to(data, A::group(link_local, EVENT_PORT))
-                    .await
-                {
+                match sockets.event.send_to(data, first).await {
                     Ok(ts) => match ts.selected_timestamp() {
                         Some(ts) => {
                             sockets.missing = 0;
@@ -1201,11 +1376,18 @@ async fn handle_actions<A: Transport>(
                     },
                     Err(e) => tracing::warn!(error = %e, "PTP send failed"),
                 }
+                // Copies: their send times don't count.
+                for addr in to {
+                    if let Err(e) = sockets.event.send_to(data, addr).await {
+                        tracing::debug!(error = %e, %addr, "PTP unicast send failed");
+                    }
+                }
             }
             PortAction::SendGeneral { data, link_local } => {
-                let to = A::group(link_local, GENERAL_PORT);
-                if let Err(e) = sockets.general.send_to(data, to).await {
-                    tracing::warn!(error = %e, "PTP send failed");
+                for addr in destinations(link_local, GENERAL_PORT) {
+                    if let Err(e) = sockets.general.send_to(data, addr).await {
+                        tracing::warn!(error = %e, %addr, "PTP send failed");
+                    }
                 }
             }
             PortAction::ResetAnnounceTimer { duration } => {
@@ -1443,6 +1625,67 @@ mod tests {
     fn identity_format() {
         let id = eui64([0x4c, 0xb0, 0x4a, 0x50, 0xa5, 0x82]);
         assert_eq!(format_identity(id), "4cb04a.fffe.50a582");
+    }
+
+    #[test]
+    fn seen_drops_second_copies() {
+        // A PTP header: type, domain, sender port identity, sequence.
+        let message = |kind: u8, sender: u8, sequence: u16| {
+            let mut m = vec![0u8; 44];
+            m[0] = 0x10 | kind;
+            m[20..30].fill(sender);
+            m[30..32].copy_from_slice(&sequence.to_be_bytes());
+            m
+        };
+        let mut seen = Seen::default();
+        assert!(seen.first(&message(0, 1, 7)));
+        assert!(!seen.first(&message(0, 1, 7)));
+        // The follow-up of that sync, the next sync, another sender.
+        assert!(seen.first(&message(8, 1, 7)));
+        assert!(seen.first(&message(0, 1, 8)));
+        assert!(seen.first(&message(0, 2, 7)));
+        // Too short to tell.
+        assert!(seen.first(&[0; 10]));
+        assert!(seen.first(&[0; 10]));
+    }
+
+    #[test]
+    fn heard_prefers_unicast_on_wifi() {
+        let gm: IpAddr = "10.0.0.2".parse().unwrap();
+        let other: IpAddr = "10.0.0.9".parse().unwrap();
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + std::time::Duration::from_secs(s);
+        let mut heard = Heard::default();
+        // Multicast counts until the sender is heard by unicast.
+        assert!(heard.take_from(gm, true, true, at(0)));
+        assert!(heard.take_from(gm, false, true, at(1)));
+        assert!(!heard.take_from(gm, true, true, at(2)));
+        // Wired, multicast always counts.
+        assert!(heard.take_from(gm, true, false, at(2)));
+        // Senders that never send unicast keep their multicast.
+        assert!(heard.take_from(other, true, true, at(2)));
+        // Once unicast stops, multicast counts again.
+        assert!(heard.take_from(gm, true, true, at(12)));
+    }
+
+    #[test]
+    fn unicast_addresses() {
+        let ip = |a: &str| a.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            SocketAddrV4::unicast(ip("10.0.0.2"), 319, 5),
+            Some("10.0.0.2:319".parse().unwrap())
+        );
+        assert_eq!(SocketAddrV4::unicast(ip("fe80::2"), 319, 5), None);
+        assert_eq!(SocketAddrV6::unicast(ip("10.0.0.2"), 319, 5), None);
+        // Link-local addresses take the interface's scope.
+        assert_eq!(
+            SocketAddrV6::unicast(ip("fe80::2"), 319, 5),
+            Some(SocketAddrV6::new("fe80::2".parse().unwrap(), 319, 0, 5))
+        );
+        assert_eq!(
+            SocketAddrV6::unicast(ip("2001:db8::2"), 320, 5),
+            Some(SocketAddrV6::new("2001:db8::2".parse().unwrap(), 320, 0, 0))
+        );
     }
 
     #[test]

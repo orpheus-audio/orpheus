@@ -135,6 +135,27 @@ not see each other, and AES67 and Dante devices only speak IPv4.
 The node measures the path delay end to end (delay request/response), as
 AES67 requires.
 
+**Unicast on Wi-Fi.** An access point sends multicast at its lowest rate,
+without acknowledging or repeating it, and holds it back until the next
+beacon while any client dozes. Unicast it sends at once and repeats when
+lost. So every node sends PTP by multicast, as usual, and also by unicast
+to the Orpheus nodes that announce Wi-Fi in discovery (looked at every
+30 s). A wired node needs no copy: a node on Wi-Fi sends its multicast to
+the access point like unicast, and the access point passes it on to the
+wire at once.
+
+A node whose PTP interface is on Wi-Fi takes a sender's messages by
+unicast only, once it heard that sender by unicast, and drops its
+multicast copies: they may have waited for the next beacon. If no unicast
+comes from that sender for 10 s, its multicast counts again. So a
+grandmaster that is not an Orpheus node, or one that doesn't know this
+node is on Wi-Fi yet, still reaches it. Should a message arrive twice
+anyway, the node takes the first copy, told apart by type, sender and
+sequence number. A node on Wi-Fi sends the unicast copies first and a wired
+node the multicast one, because a message's send time is that of its first
+copy and the other copies leave a few µs later. AES67 and Dante devices get
+multicast only, as before.
+
 RTP and the HTTP API listen on IPv4 and IPv6 regardless of the PTP
 transport.
 

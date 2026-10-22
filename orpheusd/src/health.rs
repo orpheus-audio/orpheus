@@ -45,7 +45,8 @@ const STEPS_WINDOW: Duration = Duration::from_secs(60);
 /// An output warns for this long after it last reached full scale.
 const CLIP_WINDOW: Duration = Duration::from_secs(10);
 /// How often the network is looked at again: the node's own link, which it
-/// announces, and Wi-Fi power saving. Neither is urgent.
+/// announces, PTP's unicast peers and Wi-Fi power saving. None of them is
+/// urgent; PTP keeps its multicast meanwhile.
 const NETWORK_CHECK: Duration = Duration::from_secs(30);
 
 /// What is wrong.
@@ -178,7 +179,8 @@ struct State {
 }
 
 /// Checks once a second, logs warnings as they come and go, and keeps the
-/// node's announced link current, every [`NETWORK_CHECK`].
+/// node's announced link and PTP's unicast peers current, every
+/// [`NETWORK_CHECK`].
 pub async fn watch(node: Arc<Node>) {
     let mut state = State::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -213,6 +215,11 @@ fn check(node: &Node, state: &mut State) {
             && let Err(e) = d.set_link(own_link())
         {
             tracing::warn!(error = %e, "announcing the node's link");
+        }
+        if let Some(ptp) = &node.ptp {
+            let s = ptp.status();
+            let wireless = !s.interface.is_empty() && network::is_wireless(&s.interface);
+            ptp.set_unicast(network::ptp_unicast(wireless, s.transport, &nodes));
         }
         state.power_save = power_save(node);
     }

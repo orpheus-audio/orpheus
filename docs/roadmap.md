@@ -192,7 +192,12 @@ network delay, and no jitter or loss. Expected problems on real networks:
   saving, hold it back until the next DTIM beacon (100 to 300 ms). PTP may
   never settle, and sync between rooms suffers. The servo's gate keeps held
   messages out of the clock, and nodes warn about their own power saving
-  (`power_save`). Neither has been measured on a real Wi-Fi network yet.
+  (`power_save`). PTP messages also go by unicast to the other Orpheus
+  nodes on Wi-Fi, which take them only that way: the access point neither
+  holds unicast back for dozing clients nor sends it at its lowest rate;
+  see [clock](clock.md#ipv4-and-ipv6).
+  None of this has been measured on a real Wi-Fi network yet. A grandmaster
+  that is not an Orpheus node still reaches Wi-Fi nodes by multicast only.
   Planned: the Wi-Fi profile.
 - **IGMP/MLD snooping without a querier.** Managed switches, and some routers
   and access points, silently stop forwarding PTP multicast after a few
