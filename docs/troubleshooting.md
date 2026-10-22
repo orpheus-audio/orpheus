@@ -75,7 +75,8 @@ and it follows the grandmaster again within seconds, without a restart.
   grandmaster; if all nodes start at once, the election adds about 10 s.
 - **Wi-Fi.** PTP over Wi-Fi is unreliable. Access points send multicast at a
   low rate, and with power saving they hold it back for 100 to 300 ms. Use
-  Ethernet; a Wi-Fi profile is planned. The node warns about it (`wifi`,
+  Ethernet if you can; the servo keeps held messages out of the clock
+  ([clock](clock.md#ptp)). The node warns about it (`wifi`,
   `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)).
 - **Unsteady path.** If `steps` keeps rising (warning `ptp_steps`), the
   delay to the grandmaster jumps by more than `step_threshold_us`, as on

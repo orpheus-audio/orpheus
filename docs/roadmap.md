@@ -105,12 +105,21 @@ and Bluetooth inputs.
 - One interface and one transport per node, end-to-end delay only. The AES67
   message rates are fixed.
 - The PTP clock sits on the system clock, so an NTP step disturbs it.
-- Jitter above the step threshold (1 ms), as on Wi-Fi, makes the clock
-  step over and over, and a sudden change of the path delay makes it step
-  for a few seconds; see [clock](clock.md#ptp). The node warns
-  (`ptp_steps`). A larger `step_threshold_us` helps; the planned Wi-Fi
-  profile should set it, or the servo should step only on offsets that
-  persist.
+- The servo's gate against held messages (Wi-Fi) has been tested only in
+  a simulation; its margin (0.5 ms) and windows (8 and 16 s) are guesses
+  until measured on a real Wi-Fi network. A sudden change of the path delay
+  still makes the clock step for a few seconds; see [clock](clock.md#ptp).
+  The node warns (`ptp_steps`). Jitter above the step threshold (1 ms)
+  outside the held bursts still needs a larger `step_threshold_us`; the
+  planned Wi-Fi profile should set it.
+- Over Wi-Fi, with software timestamps, two nodes can be expected to agree
+  within 0.1 to 1 ms at best, plus a constant error where the access point
+  is slower one way than the other. That is fine between rooms, but not
+  for the two speakers of one stereo pair: the ear hears time differences
+  between left and right from about 20 µs, and around 1 ms the image moves
+  to the earlier speaker. A stereo pair needs both speakers wired, or both
+  channels from one node, until better timestamps (in the driver, in
+  hardware, or Wi-Fi FTM) are available.
 - PTP needs `CAP_NET_BIND_SERVICE`, which has to be set again after every
   build.
 
@@ -181,8 +190,9 @@ network delay, and no jitter or loss. Expected problems on real networks:
 
 - **Wi-Fi.** Access points send multicast at low rates and, with power
   saving, hold it back until the next DTIM beacon (100 to 300 ms). PTP may
-  never settle, and sync between rooms suffers. The planned Wi-Fi profile
-  addresses this.
+  never settle, and sync between rooms suffers. The servo's gate keeps held
+  messages out of the clock; it has not been measured on a real Wi-Fi
+  network yet. Planned: the Wi-Fi profile.
 - **IGMP/MLD snooping without a querier.** Managed switches, and some routers
   and access points, silently stop forwarding PTP multicast after a few
   minutes. Plan: detect it (no announce from the grandmaster for a while) and

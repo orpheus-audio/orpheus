@@ -86,6 +86,19 @@ const DELAY_SAMPLES: usize = 15;
 /// the clock's frequency error between them would bias the delay.
 const DELAY_PAIR_NS: f64 = 250_000_000.0;
 
+/// The gate passes a measurement that arrived at most this much later than
+/// the fastest of its direction in the window. A wired path stays well
+/// within it, so the gate only acts on Wi-Fi.
+const GATE_MARGIN_S: f64 = 500e-6;
+/// The windows the gate takes the fastest measurement from: 8 s of syncs,
+/// 16 s of delay requests. A real change of offset or path passes once the
+/// faster measurements from before it have left the window.
+const GATE_SYNC_SAMPLES: usize = 64;
+const GATE_DELAY_SAMPLES: usize = 16;
+/// Measurements the filter takes after a start or a step before the gate
+/// trusts its prediction.
+const GATE_WARMUP: u32 = 8;
+
 /// How long to wait before trying again to start PTP, unless the
 /// interfaces change first.
 const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -455,12 +468,55 @@ type BmcaPort<'a> =
 /// measurements close together (the offset cancels), and hands the filter
 /// only what is left of it. The estimate survives steps, which don't change
 /// the path.
+///
+/// A [`Gate`] in front of both keeps out measurements that waited on the
+/// way. Waiting only ever adds time, so the fastest measurements are the
+/// truthful ones. On Wi-Fi the access point holds multicast for up to a
+/// beacon interval (about 100 ms) while any client dozes; a single held
+/// sync or delay request would otherwise make the filter reset and step,
+/// and the next one step back.
 struct Servo {
     config: KalmanConfiguration,
     filter: KalmanFilter,
     /// Time of the last step; measurements shortly after it are dropped.
     stepped_at: Option<Time>,
     delay: DelayEstimate,
+    sync_gate: Gate,
+    delay_gate: Gate,
+    /// Measurements the filter took since it started afresh.
+    taken: u32,
+}
+
+/// Passes the measurements of one direction that arrived about as early as
+/// the earliest in a window. How late a measurement is, its excess, is
+/// taken against the filter's prediction, which follows the clock's drift,
+/// so the window may be seconds long.
+struct Gate {
+    excess: VecDeque<f64>,
+    len: usize,
+}
+
+impl Gate {
+    fn new(len: usize) -> Self {
+        Self {
+            excess: VecDeque::with_capacity(len + 1),
+            len,
+        }
+    }
+
+    /// Whether a measurement `excess` seconds later than predicted passes.
+    fn pass(&mut self, excess: f64) -> bool {
+        self.excess.push_back(excess);
+        if self.excess.len() > self.len {
+            self.excess.pop_front();
+        }
+        let fastest = self.excess.iter().copied().fold(f64::INFINITY, f64::min);
+        excess <= fastest + GATE_MARGIN_S
+    }
+
+    fn clear(&mut self) {
+        self.excess.clear();
+    }
 }
 
 /// The path delay, as the median of recent samples.
@@ -509,6 +565,9 @@ impl Filter for Servo {
             config,
             stepped_at: None,
             delay: DelayEstimate::default(),
+            sync_gate: Gate::new(GATE_SYNC_SAMPLES),
+            delay_gate: Gate::new(GATE_DELAY_SAMPLES),
+            taken: 0,
         }
     }
 
@@ -523,6 +582,12 @@ impl Filter for Servo {
             }
             self.stepped_at = None;
             self.filter = KalmanFilter::new(self.config);
+            self.taken = 0;
+            self.sync_gate.clear();
+            self.delay_gate.clear();
+        }
+        if !self.gate(&mut m) {
+            return FilterUpdate::default();
         }
         if let Some(sync) = m.raw_sync_offset {
             self.delay.sync(m.event_time, sync.seconds());
@@ -543,6 +608,7 @@ impl Filter for Servo {
             stepped_at: None,
         };
         let update = self.filter.measurement(m, &mut watch);
+        self.taken = self.taken.saturating_add(1);
         self.stepped_at = watch.stepped_at;
         if self.stepped_at.is_some() {
             self.delay.stepped();
@@ -570,6 +636,32 @@ impl Filter for Servo {
 }
 
 impl Servo {
+    /// Takes out of `m` what waited on the way; whether anything is left.
+    /// Until the filter has taken a few measurements it predicts nothing,
+    /// and everything passes.
+    fn gate(&mut self, m: &mut Measurement) -> bool {
+        let Some(bulk) = self.delay.value.filter(|_| self.taken >= GATE_WARMUP) else {
+            return true;
+        };
+        let e = self.filter.current_estimates();
+        let (offset, delay) = (e.offset_from_master.seconds(), e.mean_delay.seconds());
+        // A sync sees offset + delay, a delay request offset - delay;
+        // waiting raises the one and lowers the other.
+        if let Some(s) = m.raw_sync_offset
+            && !self.sync_gate.pass(s.seconds() - bulk - (offset + delay))
+        {
+            m.raw_sync_offset = None;
+        }
+        if let Some(d) = m.raw_delay_offset
+            && !self
+                .delay_gate
+                .pass((offset - delay) - (d.seconds() + bulk))
+        {
+            m.raw_delay_offset = None;
+        }
+        m.raw_sync_offset.is_some() || m.raw_delay_offset.is_some()
+    }
+
     /// The part of the delay taken out before the filter.
     fn bulk_delay(&self) -> Duration {
         Duration::from_seconds(self.delay.value.unwrap_or(0.0))
@@ -1481,5 +1573,167 @@ mod tests {
         assert!(off.abs() < Duration::from_micros(200), "{off:?}");
         let d = e.mean_delay - delay;
         assert!(d.abs() < Duration::from_micros(50), "{d:?}");
+    }
+
+    /// A follower's clock with a drifting crystal, whose error from the
+    /// grandmaster the servo's steps and frequency changes act on.
+    struct SimClock {
+        now: Time,
+        /// This clock minus the grandmaster's, in seconds.
+        error: f64,
+        crystal_ppm: f64,
+        steering_ppm: f64,
+        steps: u32,
+    }
+
+    impl SimClock {
+        fn advance(&mut self, seconds: f64) {
+            self.now += Duration::from_seconds(seconds);
+            self.error += seconds * (self.crystal_ppm + self.steering_ppm) * 1e-6;
+        }
+    }
+
+    impl statime::Clock for SimClock {
+        type Error = io::Error;
+
+        fn now(&self) -> Time {
+            self.now
+        }
+
+        fn step_clock(&mut self, offset: Duration) -> Result<Time, io::Error> {
+            self.now += offset;
+            self.error += offset.seconds();
+            self.steps += 1;
+            Ok(self.now)
+        }
+
+        fn set_frequency(&mut self, ppm: f64) -> Result<Time, io::Error> {
+            self.steering_ppm = ppm;
+            Ok(self.now)
+        }
+
+        fn set_properties(&mut self, _: &TimePropertiesDS) -> Result<(), io::Error> {
+            Ok(())
+        }
+    }
+
+    /// What a run of [`simulate`] saw after its first minute.
+    #[derive(Debug)]
+    struct Run {
+        steps: u32,
+        /// The largest error from the grandmaster, in seconds.
+        worst: f64,
+        /// The largest change of the steering between two syncs, in ppm.
+        worst_jump_ppm: f64,
+        /// The error at the end, in seconds.
+        last: f64,
+    }
+
+    /// `seconds` of AES67 rates (8 syncs, 1 delay request a second) over a
+    /// 3 ms path, starting 50 ms off with a 30 ppm crystal. `wait` gives
+    /// how long a message waited on the way at a time, in seconds; `jump`
+    /// when and by how much the grandmaster's time jumps.
+    fn simulate(seconds: u32, mut wait: impl FnMut(f64) -> f64, jump: Option<(f64, f64)>) -> Run {
+        let mut clock = SimClock {
+            now: Time::from_secs(1000),
+            error: 0.05,
+            crystal_ppm: 30.0,
+            steering_ppm: 0.0,
+            steps: 0,
+        };
+        let mut servo = Servo::new(KalmanConfiguration {
+            step_threshold: Duration::from_millis(20),
+            ..KalmanConfiguration::default()
+        });
+        let path = 0.003;
+        let mut run = Run {
+            steps: 0,
+            worst: 0.0,
+            worst_jump_ppm: 0.0,
+            last: 0.0,
+        };
+        let mut update_at: Option<f64> = None;
+        let mut last_ppm = 0.0;
+        for i in 0..seconds * 8 {
+            let t = i as f64 / 8.0;
+            clock.advance(0.125);
+            if let Some((at, by)) = jump
+                && t == at
+            {
+                clock.error -= by;
+            }
+            if update_at.is_some_and(|u| u <= t) {
+                update_at = None;
+                let u = servo.update(&mut clock);
+                update_at = u.next_update.map(|d| t + d.as_secs_f64()).or(update_at);
+            }
+            let mut m = Measurement {
+                event_time: clock.now,
+                raw_sync_offset: Some(Duration::from_seconds(clock.error + path + wait(t))),
+                ..Default::default()
+            };
+            let u = servo.measurement(m, &mut clock);
+            update_at = u.next_update.map(|d| t + d.as_secs_f64()).or(update_at);
+            if i % 8 == 4 {
+                m = Measurement {
+                    event_time: clock.now,
+                    raw_delay_offset: Some(Duration::from_seconds(clock.error - path - wait(t))),
+                    ..Default::default()
+                };
+                let u = servo.measurement(m, &mut clock);
+                update_at = u.next_update.map(|d| t + d.as_secs_f64()).or(update_at);
+            }
+            if t >= 60.0 {
+                if run.steps == 0 && t < 60.2 {
+                    run.steps = clock.steps;
+                }
+                run.worst = run.worst.max(clock.error.abs());
+                run.worst_jump_ppm = run
+                    .worst_jump_ppm
+                    .max((clock.steering_ppm - last_ppm).abs());
+            }
+            last_ppm = clock.steering_ppm;
+        }
+        run.steps = clock.steps - run.steps;
+        run.last = clock.error;
+        run
+    }
+
+    /// Wi-Fi with a client dozing now and then: for a burst of 0.5 to 5 s
+    /// every 5 to 20 s, the access point holds every message until the next
+    /// beacon (0 to 102.4 ms); otherwise up to 300 µs of jitter.
+    fn dtim_bursts(seed: u64) -> impl FnMut(f64) -> f64 {
+        use rand::Rng;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut burst = (0.0, 0.0);
+        move |t| {
+            if t >= burst.1 {
+                let start = t + rng.gen_range(5.0..20.0);
+                burst = (start, start + rng.gen_range(0.5..5.0));
+            }
+            if t >= burst.0 {
+                rng.gen_range(0.0..0.1024)
+            } else {
+                rng.gen_range(0.0..300e-6)
+            }
+        }
+    }
+
+    #[test]
+    fn servo_rides_out_wifi_bursts() {
+        for seed in 1..=5 {
+            let run = simulate(600, dtim_bursts(seed), None);
+            assert_eq!(run.steps, 0, "seed {seed}: {run:?}");
+            assert!(run.worst < 0.001, "seed {seed}: {run:?}");
+        }
+    }
+
+    #[test]
+    fn servo_follows_a_real_jump() {
+        // After 2 minutes the grandmaster's time jumps by 30 ms; the
+        // follower steps once, after the gate's window, and settles again.
+        let run = simulate(240, |_| 0.0, Some((120.0, 0.03)));
+        assert_eq!(run.steps, 1, "{run:?}");
+        assert!(run.last.abs() < 100e-6, "{run:?}");
     }
 }

@@ -42,8 +42,8 @@ the virtual clock:
   until it catches up. `orpheusctl status` shows this rate as `frequency`
   in ppm (parts per million; 1 ppm is 1 µs per second, or 3.6 ms per hour).
 
-**Servo.** Three changes to statime's defaults make a cold start fast and
-let the clock settle behind a slow path:
+**Servo.** Four changes to statime's defaults make a cold start fast and
+let the clock settle behind a slow or unsteady path:
 
 - After a step, measurements are dropped for 0.5 s and the filter starts
   afresh. statime keeps its estimate of the measurement noise across a step,
@@ -60,14 +60,30 @@ let the clock settle behind a slow path:
   way it stepped over and over and never settled. The servo waits for the
   first pair before it steers, about a second at most, and keeps the
   estimate across steps, which don't change the path.
+- A gate keeps out measurements that waited on the way. Waiting only ever
+  adds time, so the fastest measurements are the truthful ones. For each
+  direction the gate compares a measurement with what the filter predicts
+  and passes it only if it arrived at most 0.5 ms later than the fastest
+  of the last 8 s of syncs, or 16 s of delay requests. On Wi-Fi the access
+  point holds multicast until the next beacon, up to about 100 ms, while
+  any client dozes; without the gate a single held message made the filter
+  start over and step, and the next one step back. A wired path stays
+  within the margin, so there the gate passes everything. A real change of
+  offset or path passes once the faster measurements from before it have
+  left the window, after 8 to 16 s. The gate waits until the filter has
+  taken 8 measurements after a start or a step.
 
 With a path delay that changes suddenly by more than the step threshold
-the clock steps a few times until the median follows (about 8 s). Jitter
-beyond the step threshold, as on Wi-Fi, still makes it start over on
-single measurements; raising `step_threshold_us` (for example to 20000)
-lets it settle there, at the cost of slewing instead of stepping offsets
-below that on a cold start. Measured with 4 ms ± 2 ms each way, a node
-settled after about 35 s without stepping.
+the clock steps a few times until the median follows (about 8 s), after
+the gate let the change through. In a simulation of Wi-Fi (a 3 ms path,
+300 µs of jitter, and bursts of 0.5 to 5 s every 5 to 20 s in which each
+message waits 0 to 102 ms), the clock stayed within 50 µs of the
+grandmaster for 10 minutes without a step; without the gate it stepped
+194 times and was up to 100 ms off. Raising `step_threshold_us` (for
+example to 20000) still helps on Wi-Fi, where the jitter outside the
+bursts can exceed the default 1 ms; it costs slewing instead of stepping
+offsets below that on a cold start. Measured with 4 ms ± 2 ms each way,
+a node settled after about 35 s without stepping.
 
 Measured between two nodes on one machine (network namespaces, 50 µs of
 added jitter, clock skews up to ±200 ppm), a node that joins a running
