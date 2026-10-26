@@ -500,7 +500,7 @@ mod tests {
         let c: Config = toml::from_str("[ptp]\ninterface = \"enp3s0\"\ndomain = 1").unwrap();
         assert_eq!(c.ptp.interface.as_deref(), Some("enp3s0"));
         assert_eq!(c.ptp.domain, 1);
-        assert_eq!(c.ptp.step_threshold_us, 1000);
+        assert_eq!(c.ptp.step_threshold_us, 2000);
         assert_eq!(c.ptp.transport, PtpTransport::Auto);
         let c: Config = toml::from_str("[ptp]\ntransport = \"ipv6\"").unwrap();
         assert_eq!(c.ptp.transport, PtpTransport::Ipv6);

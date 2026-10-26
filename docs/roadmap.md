@@ -105,13 +105,12 @@ and Bluetooth inputs.
 - One interface and one transport per node, end-to-end delay only. The AES67
   message rates are fixed.
 - The PTP clock sits on the system clock, so an NTP step disturbs it.
-- The servo's gate against held messages (Wi-Fi) has been tested only in
-  a simulation; its margin (0.5 ms) and windows (8 and 16 s) are guesses
-  until measured on a real Wi-Fi network. A sudden change of the path delay
-  still makes the clock step for a few seconds; see [clock](clock.md#ptp).
-  The node warns (`ptp_steps`). Jitter above the step threshold (1 ms)
-  outside the held bursts still needs a larger `step_threshold_us`; the
-  planned Wi-Fi profile should set it.
+- The servo's gate against held messages and its hold-back of single far
+  measurements have been measured on one home Wi-Fi network only (2 nodes,
+  one access point; see [clock](clock.md#ptp)). The gate's margin (0.5 ms)
+  and windows (8 and 16 s) are still guesses. A sudden change of the path
+  delay still makes the clock step for a few seconds. The node warns
+  (`ptp_steps`).
 - Over Wi-Fi, with software timestamps, two nodes can be expected to agree
   within 0.1 to 1 ms at best, plus a constant error where the access point
   is slower one way than the other. That is fine between rooms, but not
@@ -196,15 +195,20 @@ network delay, and no jitter or loss. Expected problems on real networks:
   nodes on Wi-Fi, which take them only that way: the access point neither
   holds unicast back for dozing clients nor sends it at its lowest rate;
   see [clock](clock.md#ipv4-and-ipv6).
-  None of this has been measured on a real Wi-Fi network yet. A grandmaster
-  that is not an Orpheus node still reaches Wi-Fi nodes by multicast only.
-  Planned: the Wi-Fi profile.
+  On a home network (2026-10-26) the clock settled within 40 s and stayed
+  within 13 µs. Held multicast did not show there; what delayed messages
+  by up to 120 ms were the background scans of a node with a weak signal,
+  every 5 minutes. They also make audio late; see
+  [troubleshooting](troubleshooting.md#dropouts-every-few-minutes-on-wi-fi).
+  A grandmaster that is not an Orpheus node still reaches Wi-Fi nodes by
+  multicast only. Planned: the Wi-Fi profile; maybe a warning when the
+  node's Wi-Fi interface scans in the background.
 - **IGMP/MLD snooping without a querier.** Managed switches, and some routers
   and access points, silently stop forwarding PTP multicast after a few
   minutes. Plan: detect it (no announce from the grandmaster for a while) and
   warn; it is described in [troubleshooting](troubleshooting.md).
 - **Host firewalls.** firewalld and ufw block UDP 319, 320 and 5004 and TCP
-  7480 by default, while mDNS often gets through, so peers show up but PTP
+  7480 by default, ufw also IGMP (so snooping stops multicast to the node), while mDNS often gets through, so peers show up but PTP
   and routes stay silent (seen in the first two-box test). The node can't
   read the rules without root. Plan:
   - Detect the symptoms: as grandmaster, followers but no delay requests;

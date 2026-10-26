@@ -84,7 +84,7 @@ domain = 0
 priority1 = 250
 priority2 = 128
 slave_only = false
-step_threshold_us = 1000
+step_threshold_us = 2000
 settle_threshold_us = 100
 
 [aes70]
@@ -240,7 +240,7 @@ Clock synchronization with the other nodes and with AES67 devices. See
 | `priority1` | `250` | Grandmaster election; lower wins. The default lets dedicated grandmasters (usually 128 or less) take precedence over nodes. |
 | `priority2` | `128` | Tie-breaker in the election. |
 | `slave_only` | `false` | Never become the grandmaster. |
-| `step_threshold_us` | `1000` | Offsets above this are corrected in one step, smaller ones gradually. |
+| `step_threshold_us` | `2000` | Offsets above this are corrected in one step, smaller ones gradually. |
 | `settle_threshold_us` | `100` | The clock counts as settled once its offset from the grandmaster stays below this. |
 
 The PTP message rates follow the AES67 media profile and cannot be configured

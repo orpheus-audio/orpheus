@@ -36,13 +36,13 @@ NTP. It keeps a virtual clock on top of the system clock instead.
 statime's Kalman filter estimates the offset to the grandmaster and adjusts
 the virtual clock:
 
-- Offsets above `step_threshold_us` (1 ms) are stepped in one go. This
+- Offsets above `step_threshold_us` (2 ms) are stepped in one go. This
   happens on a cold start.
 - Smaller offsets are slewed: the virtual clock runs slightly fast or slow
   until it catches up. `orpheusctl status` shows this rate as `frequency`
   in ppm (parts per million; 1 ppm is 1 µs per second, or 3.6 ms per hour).
 
-**Servo.** Four changes to statime's defaults make a cold start fast and
+**Servo.** Five changes to statime's defaults make a cold start fast and
 let the clock settle behind a slow or unsteady path:
 
 - After a step, measurements are dropped for 0.5 s and the filter starts
@@ -72,6 +72,12 @@ let the clock settle behind a slow or unsteady path:
   offset or path passes once the faster measurements from before it have
   left the window, after 8 to 16 s. The gate waits until the filter has
   taken 8 measurements after a start or a step.
+- A measurement further from the filter's estimate than
+  `step_threshold_us` is held back until 8 in a row are. statime starts
+  over and steps on a single one, and right after a step, while the gate
+  still passes everything, on Wi-Fi that was usually the next one, and
+  the next: a node stepped 40 to 120 times before it settled. A real
+  change of offset persists and is stepped 1 s later.
 
 With a path delay that changes suddenly by more than the step threshold
 the clock steps a few times until the median follows (about 8 s), after
@@ -79,11 +85,17 @@ the gate let the change through. In a simulation of Wi-Fi (a 3 ms path,
 300 µs of jitter, and bursts of 0.5 to 5 s every 5 to 20 s in which each
 message waits 0 to 102 ms), the clock stayed within 50 µs of the
 grandmaster for 10 minutes without a step; without the gate it stepped
-194 times and was up to 100 ms off. Raising `step_threshold_us` (for
-example to 20000) still helps on Wi-Fi, where the jitter outside the
-bursts can exceed the default 1 ms; it costs slewing instead of stepping
-offsets below that on a cold start. Measured with 4 ms ± 2 ms each way,
-a node settled after about 35 s without stepping.
+194 times and was up to 100 ms off.
+
+Measured on Wi-Fi at home (two nodes on one access point, one of them
+with a weak signal of about −75 dBm), messages waited about 1 ms, often
+several, and up to 120 ms every 5 minutes while that node scanned for
+other access points. With the defaults a node settled 30 to 40 s after it
+started, stepping once or twice, and then stayed within 13 µs of the
+grandmaster for 40 minutes without a step. With a 1 ms threshold and
+without holding back single measurements it stepped 40 to 120 times
+first. Replaying the 56 minutes of recorded waits from 11 starting
+points, the clock stepped twice in all and was at worst 3 ms off.
 
 Measured between two nodes on one machine (network namespaces, 50 µs of
 added jitter, clock skews up to ±200 ppm), a node that joins a running

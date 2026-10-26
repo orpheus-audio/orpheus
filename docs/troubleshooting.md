@@ -61,6 +61,8 @@ and it follows the grandmaster again within seconds, without a restart.
   `sudo ufw allow 5353/udp`, `sudo ufw allow 7480:7481/tcp`. To open them to the
   home network only, name it, as in
   `sudo ufw allow from 192.168.0.0/16 to any port 319:320 proto udp`.
+  Both firewalls also need IGMP let in; see
+  [below](#ptp-works-for-a-few-minutes-then-stops).
 
   mDNS often gets through where the other ports don't, so `orpheusctl
   nodes` lists the peer all the same. If a follower's `delay` stays `-`
@@ -80,18 +82,33 @@ and it follows the grandmaster again within seconds, without a restart.
   `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)). Turn
   off [power saving](#wi-fi-power-saving) on every node on Wi-Fi.
 - **Unsteady path.** If `steps` keeps rising (warning `ptp_steps`), the
-  delay to the grandmaster jumps by more than `step_threshold_us`, as on
-  Wi-Fi. Set `[ptp] step_threshold_us = 20000`; see
-  [clock](clock.md#ptp).
+  delay to the grandmaster jumps by more than `step_threshold_us` for
+  seconds at a time. Raise it, for example `[ptp] step_threshold_us =
+  5000`; a cold start then slews offsets below that instead of stepping
+  them. See [clock](clock.md#ptp).
 
 ## Wi-Fi power saving
 
 A Wi-Fi client with power saving on dozes between beacons, and the access
 point holds its packets until it wakes, 100 ms and more. Clocks then step and
-streams drop out, whatever the buffer. The node warns (`power_save`). Turn it
-off on every node on Wi-Fi.
+streams drop out, whatever the buffer.
 
-With NetworkManager, for the connection in use:
+The node turns power saving off by itself, on PTP's interface and on that
+of the default route, and looks again every 30 seconds. That needs
+`CAP_NET_ADMIN` (`sudo setcap cap_net_bind_service,cap_net_admin=ep
+path/to/orpheusd`; `just build` sets it on machines with Wi-Fi). It warns
+(`power_save`) when
+
+- it may not: the capability is missing;
+- it can't: the driver doesn't let power saving be turned off. Use a wired
+  link or another Wi-Fi adapter;
+- something turns it on again: NetworkManager when it connects, TLP when
+  the laptop goes on battery. The node turns it off again within 30
+  seconds, but until then packets wait; the warning stays for 10 minutes
+  after the last time.
+
+To turn it off for good, so that nothing turns it on again: with
+NetworkManager, for the connection in use:
 
 ```sh
 nmcli connection modify <connection> 802-11-wireless.powersave 2
@@ -126,6 +143,30 @@ reaching the nodes.
 Fix it on the switch or router: enable an IGMP querier (MLD querier for
 IPv6), or disable snooping. Unmanaged switches don't snoop and are not
 affected.
+
+If it happens on one node only, its **firewall drops IGMP**. The querier
+asks, but the node never hears the question, so it never renews its join.
+ufw does this by default (IGMP is IP protocol 2; the kernel log shows
+`[UFW BLOCK] … PROTO=2` from the router about every two minutes). mDNS
+keeps working, because switches and access points send link-local groups
+(224.0.0.x) to every port anyway, so `orpheusctl nodes` still lists the
+others. On Wi-Fi the node then gets PTP only by unicast from other
+Orpheus nodes, and nothing from a grandmaster that is not one.
+
+With ufw, add to `/etc/ufw/before.rules`, above the `COMMIT` line:
+
+```
+# allow IGMP, so that snooping switches and access points keep sending multicast
+-A ufw-before-input -p igmp -j ACCEPT
+```
+
+and run `sudo ufw reload`. ufw already lets MLD in for IPv6
+(`before6.rules`). With firewalld:
+
+```sh
+sudo firewall-cmd --permanent --add-protocol=igmp
+sudo firewall-cmd --reload
+```
 
 ## `connect` fails
 
@@ -206,6 +247,8 @@ affected.
 
 - **Warnings** in `orpheusctl status` name Wi-Fi or a jittery path on
   either end; see [warnings](usage.md#warnings).
+- **Bursts of `late` every 5 minutes on Wi-Fi:** background scans; see
+  [below](#dropouts-every-few-minutes-on-wi-fi).
 - **`late` rises, `margin` near zero:** packets arrive too close to their
   playout time. Raise `link_offset_ms`, or make sure both nodes are settled
   on PTP. On the system clock, NTP decides how well the nodes agree.
@@ -217,6 +260,34 @@ affected.
   `cycle_ms`) helps.
 - **`realigns` rise:** a thread stalled for more than 100 ms, or the clock
   jumped. Look for steps in the PTP status, or NTP stepping the system clock.
+
+## Dropouts every few minutes on Wi-Fi
+
+Bursts of `late` packets every 5 minutes, or every 30 seconds, lasting a few
+seconds each, come from **background scans**. To find a better access point
+to roam to, NetworkManager has the Wi-Fi interface scan every channel: every
+5 minutes where it sees more than one access point for the network, and
+every 30 seconds while the signal is below −65 dBm. A scan takes the
+interface off its channel for about 3.5 s, and packets wait up to 120 ms
+meanwhile. The PTP clock rides it out; audio does only with a link offset
+above that.
+
+`iw event -t` shows the scans as they happen (`scan started`, `new scan
+results`). Opening the desktop's network menu starts one too.
+
+NetworkManager doesn't scan in the background while a connection is locked
+to one access point. For a node that doesn't move:
+
+```sh
+nmcli -f IN-USE,BSSID,SSID,CHAN,SIGNAL dev wifi   # the BSSID marked *
+nmcli connection modify <connection> 802-11-wireless.bssid <BSSID>
+nmcli connection up <connection>
+```
+
+The node then no longer roams: if that access point goes away, or you lock
+it to the 2.4 GHz one of a router, it stays there. Undo it with
+`802-11-wireless.bssid ""`. Moving the node or the access point so that the
+signal is above −65 dBm at least stops the scans every 30 seconds.
 
 ## The system clock jumps
 

@@ -40,6 +40,16 @@ The PipeWire bindings need the PipeWire development headers and clang.
 
 - `orpheusd/src/api.rs` checks that the OpenAPI document lists every route and
   that every schema reference resolves.
+- The servo tests in `orpheus-clock/src/ptp.rs` run the PTP filter against a
+  simulated clock and path. `servo_replays_recorded_wifi`, ignored by
+  default, replays waits recorded on a real network instead: a directory
+  with `trace-sync.txt` and `trace-delay.txt`, one `time wait` in seconds
+  per line (the wait being how much later than the fastest the message
+  arrived):
+
+  ```sh
+  ORPHEUS_TRACE=path/to/traces cargo test -p orpheus-clock servo_replays -- --ignored --nocapture
+  ```
 
 ## Examples
 

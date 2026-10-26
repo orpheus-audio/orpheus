@@ -99,6 +99,9 @@ const GATE_DELAY_SAMPLES: usize = 16;
 /// Measurements the filter takes after a start or a step before the gate
 /// trusts its prediction.
 const GATE_WARMUP: u32 = 8;
+/// Measurements in a row further off than the step threshold before the
+/// filter takes them and steps; fewer in a row waited on the way.
+const STEP_PERSIST: u32 = 8;
 
 /// How long to wait before trying again to start PTP, unless the
 /// interfaces change first.
@@ -169,7 +172,7 @@ impl Default for PtpConfig {
             priority1: 250,
             priority2: 128,
             slave_only: false,
-            step_threshold_us: 1000,
+            step_threshold_us: 2000,
             settle_threshold_us: 100,
         }
     }
@@ -512,6 +515,9 @@ struct Servo {
     delay_gate: Gate,
     /// Measurements the filter took since it started afresh.
     taken: u32,
+    /// Measurements in a row that were further from the filter's
+    /// estimate than a step.
+    far: u32,
 }
 
 /// Passes the measurements of one direction that arrived about as early as
@@ -595,6 +601,7 @@ impl Filter for Servo {
             sync_gate: Gate::new(GATE_SYNC_SAMPLES),
             delay_gate: Gate::new(GATE_DELAY_SAMPLES),
             taken: 0,
+            far: 0,
         }
     }
 
@@ -612,6 +619,7 @@ impl Filter for Servo {
             self.taken = 0;
             self.sync_gate.clear();
             self.delay_gate.clear();
+            self.far = 0;
         }
         if !self.gate(&mut m) {
             return FilterUpdate::default();
@@ -630,6 +638,26 @@ impl Filter for Servo {
         let delay = Duration::from_seconds(delay);
         m.raw_sync_offset = m.raw_sync_offset.map(|o| o - delay);
         m.raw_delay_offset = m.raw_delay_offset.map(|o| o + delay);
+        // statime starts over and steps on any measurement further off
+        // than the step threshold. Right after a start or a step the gate
+        // passes everything, so on Wi-Fi one that waited made it step
+        // again, over and over. A real change of offset persists.
+        if self.taken > 0 {
+            let estimate = self.filter.current_estimates().offset_from_master.seconds();
+            let step = self.config.step_threshold.seconds();
+            let far = [m.raw_sync_offset, m.raw_delay_offset]
+                .into_iter()
+                .flatten()
+                .any(|o| (o.seconds() - estimate).abs() > step);
+            if far {
+                self.far += 1;
+                if self.far < STEP_PERSIST {
+                    return FilterUpdate::default();
+                }
+            } else {
+                self.far = 0;
+            }
+        }
         let mut watch = StepWatch {
             clock,
             stepped_at: None,
@@ -1877,6 +1905,29 @@ mod tests {
     /// how long a message waited on the way at a time, in seconds; `jump`
     /// when and by how much the grandmaster's time jumps.
     fn simulate(seconds: u32, mut wait: impl FnMut(f64) -> f64, jump: Option<(f64, f64)>) -> Run {
+        let wait = std::cell::RefCell::new(&mut wait);
+        simulate_paths(
+            seconds,
+            default_step_threshold(),
+            |t| (wait.borrow_mut())(t),
+            |t| (wait.borrow_mut())(t),
+            jump,
+        )
+    }
+
+    fn default_step_threshold() -> Duration {
+        Duration::from_nanos(PtpConfig::default().step_threshold_us as i64 * 1000)
+    }
+
+    /// [`simulate`] with its own step threshold and a wait for each
+    /// direction.
+    fn simulate_paths(
+        seconds: u32,
+        step_threshold: Duration,
+        mut sync_wait: impl FnMut(f64) -> f64,
+        mut delay_wait: impl FnMut(f64) -> f64,
+        jump: Option<(f64, f64)>,
+    ) -> Run {
         let mut clock = SimClock {
             now: Time::from_secs(1000),
             error: 0.05,
@@ -1885,7 +1936,7 @@ mod tests {
             steps: 0,
         };
         let mut servo = Servo::new(KalmanConfiguration {
-            step_threshold: Duration::from_millis(20),
+            step_threshold,
             ..KalmanConfiguration::default()
         });
         let path = 0.003;
@@ -1912,7 +1963,7 @@ mod tests {
             }
             let mut m = Measurement {
                 event_time: clock.now,
-                raw_sync_offset: Some(Duration::from_seconds(clock.error + path + wait(t))),
+                raw_sync_offset: Some(Duration::from_seconds(clock.error + path + sync_wait(t))),
                 ..Default::default()
             };
             let u = servo.measurement(m, &mut clock);
@@ -1920,7 +1971,9 @@ mod tests {
             if i % 8 == 4 {
                 m = Measurement {
                     event_time: clock.now,
-                    raw_delay_offset: Some(Duration::from_seconds(clock.error - path - wait(t))),
+                    raw_delay_offset: Some(Duration::from_seconds(
+                        clock.error - path - delay_wait(t),
+                    )),
                     ..Default::default()
                 };
                 let u = servo.measurement(m, &mut clock);
@@ -1968,6 +2021,85 @@ mod tests {
             let run = simulate(600, dtim_bursts(seed), None);
             assert_eq!(run.steps, 0, "seed {seed}: {run:?}");
             assert!(run.worst < 0.001, "seed {seed}: {run:?}");
+        }
+    }
+
+    /// Wi-Fi at home as measured: messages wait about 1 ms (`median`
+    /// seconds) and up to several, and every 5 minutes the client scans
+    /// all channels for 3.5 s, during which they wait up to 120 ms.
+    fn home_wifi(seed: u64, median: f64, spread: f64) -> impl FnMut(f64) -> f64 {
+        use rand::Rng;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let scan = rng.gen_range(0.0..300.0);
+        move |t| {
+            if (t - scan).rem_euclid(300.0) < 3.5 {
+                return rng.gen_range(0.0..0.12);
+            }
+            // Box-Muller: a log-normal wait.
+            let (u, v): (f64, f64) = (rng.gen_range(f64::EPSILON..1.0), rng.r#gen());
+            let normal = (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos();
+            median * (spread * normal).exp()
+        }
+    }
+
+    #[test]
+    fn servo_settles_on_home_wifi() {
+        // With a 1 ms step threshold and no persistence it stepped 250 to
+        // 720 times in 4 of 5 runs and was up to 115 ms off.
+        for seed in 1..=5 {
+            let run = simulate_paths(
+                600,
+                default_step_threshold(),
+                home_wifi(seed, 0.0011, 0.6),
+                home_wifi(seed + 100, 0.0018, 0.8),
+                None,
+            );
+            assert_eq!(run.steps, 0, "seed {seed}: {run:?}");
+            assert!(run.worst < 0.001, "seed {seed}: {run:?}");
+        }
+    }
+
+    /// A recorded wait, `t wait` in seconds per line, from `at` seconds
+    /// into it, looping.
+    fn recorded(path: &str, at: f64) -> impl FnMut(f64) -> f64 {
+        let trace: Vec<(f64, f64)> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|l| {
+                let mut f = l.split(' ').map(|x| x.parse::<f64>().unwrap());
+                (f.next().unwrap(), f.next().unwrap())
+            })
+            .collect();
+        let span = trace.last().unwrap().0;
+        let mut i = 0;
+        move |t| {
+            let t = (t + at) % span;
+            if trace[i].0 > t {
+                i = 0;
+            }
+            while i + 1 < trace.len() && trace[i + 1].0 <= t {
+                i += 1;
+            }
+            trace[i].1
+        }
+    }
+
+    /// Replays waits recorded on Wi-Fi from the directory in
+    /// `ORPHEUS_TRACE` (`trace-sync.txt` and `trace-delay.txt`, one `time
+    /// wait` in seconds per line), starting every 5 minutes into them.
+    #[test]
+    #[ignore]
+    fn servo_replays_recorded_wifi() {
+        let dir = std::env::var("ORPHEUS_TRACE").unwrap();
+        for at in (0..11).map(|i| i as f64 * 300.0) {
+            let run = simulate_paths(
+                600,
+                default_step_threshold(),
+                recorded(&format!("{dir}/trace-sync.txt"), at),
+                recorded(&format!("{dir}/trace-delay.txt"), at),
+                None,
+            );
+            println!("from {at:>4} s: {run:?}");
         }
     }
 
