@@ -105,7 +105,14 @@ path/to/orpheusd`; `just build` sets it on machines with Wi-Fi). It warns
 - something turns it on again: NetworkManager when it connects, TLP when
   the laptop goes on battery. The node turns it off again within 30
   seconds, but until then packets wait; the warning stays for 10 minutes
-  after the last time.
+  after the last time;
+- the setting leaves it on, see below.
+
+On a laptop, power saving saves battery. `[wifi] power_save = "auto"`
+turns it off on mains power and on on battery; `"leave"` leaves it to the
+system, `"ignore"` too, without the warning (see
+[configuration](configuration.md#wifi)). Both can also be set while the
+node runs: `orpheusctl set wifi.power_save=auto`.
 
 To turn it off for good, so that nothing turns it on again: with
 NetworkManager, for the connection in use:

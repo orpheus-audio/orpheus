@@ -2,7 +2,7 @@
 //! driver, whatever manages the network: power saving, and the signal and
 //! rate of the link to the access point.
 //!
-//! Reading needs no privileges. Turning power saving off needs
+//! Reading needs no privileges. Turning power saving on or off needs
 //! `CAP_NET_ADMIN`.
 
 use std::io;
@@ -29,22 +29,57 @@ pub fn power_save(interface: &str) -> Option<bool> {
     Some(u32::from_ne_bytes(state.try_into().ok()?) != 0)
 }
 
-/// Turns power saving off for the wireless `interface` (`iw dev <if> set
-/// power_save off`), until something turns it on again: NetworkManager
-/// when it connects, TLP when the laptop goes on battery. Fails with
-/// [`io::ErrorKind::PermissionDenied`] without `CAP_NET_ADMIN`, and with
-/// [`io::ErrorKind::Unsupported`] where the driver can't.
-pub fn power_save_off(interface: &str) -> io::Result<()> {
+/// Turns power saving on or off for the wireless `interface` (`iw dev <if>
+/// set power_save on|off`), until something changes it again:
+/// NetworkManager when it connects, TLP when the laptop changes power
+/// source. Fails with [`io::ErrorKind::PermissionDenied`] without
+/// `CAP_NET_ADMIN`, and with [`io::ErrorKind::Unsupported`] where the
+/// driver can't.
+pub fn set_power_save(interface: &str, on: bool) -> io::Result<()> {
     let index = ifindex(interface)?;
+    let state = if on {
+        NL80211_PS_ENABLED
+    } else {
+        NL80211_PS_DISABLED
+    };
     Nl80211::open()?.request(
         NL80211_CMD_SET_POWER_SAVE,
         0,
         &[
             (NL80211_ATTR_IFINDEX, &index.to_ne_bytes()),
-            (NL80211_ATTR_PS_STATE, &NL80211_PS_DISABLED.to_ne_bytes()),
+            (NL80211_ATTR_PS_STATE, &state.to_ne_bytes()),
         ],
     )?;
     Ok(())
+}
+
+/// Whether the machine runs on battery: none of its power supplies
+/// (`/sys/class/power_supply`) is mains power that is online, and it has
+/// a battery of its own, not a mouse's. A machine without a battery is on
+/// mains.
+pub fn on_battery() -> bool {
+    on_battery_in(Path::new("/sys/class/power_supply"))
+}
+
+fn on_battery_in(supplies: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(supplies) else {
+        return false;
+    };
+    let read = |dir: &Path, name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .map(|s| s.trim().to_owned())
+            .unwrap_or_default()
+    };
+    let mut battery = false;
+    for dir in entries.flatten().map(|e| e.path()) {
+        match read(&dir, "type").as_str() {
+            // USB-C chargers show as USB.
+            "Mains" | "USB" if read(&dir, "online") == "1" => return false,
+            "Battery" if read(&dir, "scope") != "Device" => battery = true,
+            _ => {}
+        }
+    }
+    battery
 }
 
 /// The link of a Wi-Fi client to its access point.
@@ -129,6 +164,7 @@ const NL80211_ATTR_IFINDEX: u16 = 3;
 const NL80211_ATTR_STA_INFO: u16 = 21;
 const NL80211_ATTR_PS_STATE: u16 = 93;
 const NL80211_PS_DISABLED: u32 = 0;
+const NL80211_PS_ENABLED: u32 = 1;
 const NL80211_STA_INFO_SIGNAL: u16 = 7;
 const NL80211_STA_INFO_TX_BITRATE: u16 = 8;
 const NL80211_STA_INFO_SIGNAL_AVG: u16 = 13;
@@ -286,9 +322,44 @@ mod tests {
         assert_eq!(power_save("no-such-interface"), None);
         assert_eq!(station("lo"), None);
         assert_eq!(
-            power_save_off("no-such-interface").unwrap_err().kind(),
+            set_power_save("no-such-interface", false)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::NotFound
         );
+    }
+
+    #[test]
+    fn tells_battery_from_mains() {
+        let root = tempfile::tempdir().unwrap();
+        let supply = |name: &str, files: &[(&str, &str)]| {
+            let dir = root.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            for (file, value) in files {
+                std::fs::write(dir.join(file), format!("{value}\n")).unwrap();
+            }
+        };
+        // A desktop: nothing, or only a wireless mouse's battery.
+        assert!(!on_battery_in(root.path()));
+        supply(
+            "hidpp_battery_0",
+            &[("type", "Battery"), ("scope", "Device")],
+        );
+        assert!(!on_battery_in(root.path()));
+        // A laptop unplugged, then plugged in.
+        supply("BAT0", &[("type", "Battery"), ("status", "Discharging")]);
+        supply("AC", &[("type", "Mains"), ("online", "0")]);
+        assert!(on_battery_in(root.path()));
+        supply("AC", &[("online", "1")]);
+        assert!(!on_battery_in(root.path()));
+        // Charging over USB-C.
+        supply("AC", &[("online", "0")]);
+        supply(
+            "ucsi-source-psy-USBC000:001",
+            &[("type", "USB"), ("online", "1")],
+        );
+        assert!(!on_battery_in(root.path()));
+        assert!(!on_battery_in(&root.path().join("missing")));
     }
 
     fn wifi_interfaces() -> Vec<String> {

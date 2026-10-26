@@ -29,6 +29,7 @@ pub struct Config {
     pub loopback: LoopbackConfig,
     pub aes70: Aes70Config,
     pub ui: UiConfig,
+    pub wifi: WifiConfig,
     /// Icon names for other nodes' outputs, by output type, replacing the
     /// defaults (Linux: XDG icon names).
     pub icons: BTreeMap<OutputType, String>,
@@ -243,6 +244,32 @@ impl Default for UiConfig {
             language: i18n::AUTO.into(),
         }
     }
+}
+
+/// The node's Wi-Fi interfaces.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WifiConfig {
+    pub power_save: PowerSave,
+}
+
+/// What the node does with Wi-Fi power saving on the interfaces it uses
+/// (PTP's and the default route's). A dozing client gets its packets only
+/// when it wakes, every 100 ms or so, so clocks step and streams stutter;
+/// awake, a laptop's Wi-Fi draws more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerSave {
+    /// Turns it off, again whenever something turns it on.
+    #[default]
+    Off,
+    /// Turns it off on mains power and on on battery. A machine without a
+    /// battery is always on mains.
+    Auto,
+    /// Leaves it as it is, and warns while it is on.
+    Leave,
+    /// Leaves it as it is, without a warning.
+    Ignore,
 }
 
 /// The routes this node sends: when they hold a receiver on the peer.

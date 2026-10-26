@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
 
-use crate::config::{Accept, Claim, Config, Policy, WhenLost};
+use crate::config::{Accept, Claim, Config, Policy, PowerSave, WhenLost};
 use crate::i18n::Text;
 
 /// The settings in effect.
@@ -28,6 +28,7 @@ pub struct Settings {
     pub receiver: ReceiverSettings,
     pub sender: SenderSettings,
     pub ui: UiSettings,
+    pub wifi: WifiSettings,
 }
 
 /// Clock synchronization. A change restarts PTP; the clock keeps running.
@@ -98,6 +99,16 @@ pub struct UiSettings {
     pub language: String,
 }
 
+/// The node's Wi-Fi interfaces. A change takes effect within a second.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WifiSettings {
+    /// Power saving on the interfaces the node uses: `off`, `auto` (off on
+    /// mains power, on on battery), `leave` or `ignore` (as it is, with or
+    /// without a warning while it is on).
+    pub power_save: PowerSave,
+}
+
 /// The longest fade-in.
 const MAX_FADE_IN_MS: u32 = 1000;
 
@@ -165,6 +176,9 @@ impl Settings {
             },
             ui: UiSettings {
                 language: config.ui.language.clone(),
+            },
+            wifi: WifiSettings {
+                power_save: config.wifi.power_save,
             },
         }
     }
@@ -444,6 +458,8 @@ mod tests {
         assert!(s.patch(&json!({"ui": {"language": "de_"}})).is_err());
         assert!(s.patch(&json!({"ui": {"language": "de-AT"}})).is_ok());
         assert!(s.patch(&json!({"ui": {"language": "auto"}})).is_ok());
+        assert!(s.patch(&json!({"wifi": {"power_save": "on"}})).is_err());
+        assert!(s.patch(&json!({"wifi": {"power_save": "auto"}})).is_ok());
     }
 
     #[test]

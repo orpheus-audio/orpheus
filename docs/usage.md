@@ -888,7 +888,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `wifi_grandmaster` | clock | PTP runs over Wi-Fi on a node that does not follow another clock, so it is or may become the grandmaster. That does not hurt this node, but nodes that follow its clock may not settle. Give a wired node a lower `ptp.priority1` so that it becomes the grandmaster. |
 | `multicast_wifi` | receiver, sender | A [multicast](#multicast-interop) stream goes over Wi-Fi, where the access point sends it at its lowest rate to every client. |
 | `peer_wifi` | receiver, sender | The node at the other end is on Wi-Fi, as it announces. |
-| `power_save` | interface | Power saving is on for a Wi-Fi interface the node uses (PTP's or the default route's), and the node may not turn it off (no `CAP_NET_ADMIN`) or the driver can't; or something turned it on again within the last 10 minutes and the node had to turn it off again. The access point holds a dozing node's packets until it wakes, 100 ms and more, which no buffer or clock filter makes up for. See [troubleshooting](troubleshooting.md#wi-fi-power-saving). The warning names the interface in `interface`. |
+| `power_save` | interface | Power saving is on for a Wi-Fi interface the node uses (PTP's or the default route's), and the node may not turn it off (no `CAP_NET_ADMIN`) or the driver can't; or something turned it on again within the last 10 minutes and the node had to turn it off again; or `[wifi] power_save` leaves it on (`leave`, or `auto` on battery). The access point holds a dozing node's packets until it wakes, 100 ms and more, which no buffer or clock filter makes up for. See [troubleshooting](troubleshooting.md#wi-fi-power-saving). The warning names the interface in `interface`. |
 | `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). If the stream comes in over this node's Wi-Fi, the message names its signal and rate, and calls it weak below −70 dBm. |
 | `peer_jitter` | sender | The peer's receiver warns about `jitter` for this sender. |
 | `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. On Wi-Fi the message names the signal, as for `jitter`. |
@@ -910,7 +910,7 @@ that a user interface can offer the fitting remedy. So far only
 `power_save` does: `no_capability` (the node may not turn it off),
 `unsupported` (the driver can't), `failed` (turning it off failed
 otherwise), `turned_on_again` (something turned it on again and the node
-turned it off again).
+turned it off again), `configured` (`[wifi] power_save` leaves it on).
 
 Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
 the stream or PTP takes. Each node also announces its own link, that of its

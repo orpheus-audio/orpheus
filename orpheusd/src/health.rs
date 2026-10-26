@@ -3,8 +3,9 @@
 //! a wide spread, and a slow path to the PTP grandmaster; and outputs whose
 //! wires add up to more than they can play.
 //!
-//! Wi-Fi power saving the node turns off itself where it may and can; it
-//! warns where it can't, or where something keeps turning it on again.
+//! Wi-Fi power saving the node turns off itself where it may and can
+//! (`[wifi] power_save`); it warns where it can't, where something keeps
+//! turning it on again, or where the setting leaves it on.
 //!
 //! Wi-Fi is seen directly on this node's own interfaces and through the
 //! link each peer announces over mDNS. Spread is measured by the receiver;
@@ -26,6 +27,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::api::Node;
+use crate::config::PowerSave;
 use crate::connection::PeerState;
 use crate::i18n::{self, Arg, Text};
 use crate::network::{self, own_link, wireless_to};
@@ -73,7 +75,8 @@ pub enum WarningKind {
     PeerWifi,
     /// Power saving is on for a Wi-Fi interface the node uses, so the
     /// access point holds its packets until it wakes, and the node can't
-    /// turn it off; or something keeps turning it on again.
+    /// turn it off; or something keeps turning it on again; or the setting
+    /// leaves it on.
     PowerSave,
     /// The receiver's packets arrive with a wide spread.
     Jitter,
@@ -113,6 +116,9 @@ pub enum Reason {
     /// `power_save`: something turned it on again, and the node turned it
     /// off again.
     TurnedOnAgain,
+    /// `power_save`: `[wifi] power_save` leaves it on (`leave`, or `auto`
+    /// on battery).
+    Configured,
 }
 
 /// What a warning is about.
@@ -211,6 +217,9 @@ struct State {
     network_checked: Option<Instant>,
     /// The power saving warnings of the last network check.
     power_save: Vec<Warning>,
+    /// `[wifi] power_save` and whether the machine was on battery, as of
+    /// the last power saving check.
+    power_save_mode: Option<(PowerSave, bool)>,
     /// Per Wi-Fi interface, when the node turned power saving off, and when
     /// it last had to do so again.
     power_save_off: BTreeMap<String, (Instant, Option<Instant>)>,
@@ -244,10 +253,10 @@ fn check(node: &Node, state: &mut State) {
         .as_ref()
         .map(|d| d.nodes())
         .unwrap_or_default();
-    if state
+    let network_due = state
         .network_checked
-        .is_none_or(|t| t.elapsed() >= NETWORK_CHECK)
-    {
+        .is_none_or(|t| t.elapsed() >= NETWORK_CHECK);
+    if network_due {
         state.network_checked = Some(Instant::now());
         if let Some(d) = &node.discovery
             && let Err(e) = d.set_link(own_link())
@@ -259,7 +268,13 @@ fn check(node: &Node, state: &mut State) {
             let wireless = !s.interface.is_empty() && network::is_wireless(&s.interface);
             ptp.set_unicast(network::ptp_unicast(wireless, s.transport, &nodes));
         }
-        state.power_save = power_save(node, &mut state.power_save_off);
+    }
+    // A change of the setting or of the power source counts at once.
+    let setting = node.settings().wifi.power_save;
+    let mode = (setting, setting == PowerSave::Auto && wifi::on_battery());
+    if network_due || state.power_save_mode != Some(mode) {
+        state.power_save_mode = Some(mode);
+        state.power_save = power_save(node, mode, &mut state.power_save_off);
     }
     let mut found = clock(node, state);
     found.extend(receivers(node, state, &nodes));
@@ -391,12 +406,14 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
     found
 }
 
-/// Turns power saving off on the Wi-Fi interfaces the node uses, PTP's
-/// and the default route's, and warns where it can't or where something
-/// keeps turning it on again. Checked again and again: laptops often turn
+/// Turns power saving off or on on the Wi-Fi interfaces the node uses,
+/// PTP's and the default route's, as `[wifi] power_save` says, and warns
+/// where it can't, where something keeps turning it on again, or where
+/// the setting leaves it on. Checked again and again: laptops often turn
 /// it on when they go on battery, NetworkManager when it reconnects.
 fn power_save(
     node: &Node,
+    (setting, battery): (PowerSave, bool),
     turned_off: &mut BTreeMap<String, (Instant, Option<Instant>)>,
 ) -> Vec<Warning> {
     let mut interfaces: Vec<String> = node
@@ -409,54 +426,43 @@ fn power_save(
         .collect();
     interfaces.sort();
     interfaces.dedup();
-    turned_off.retain(|i, _| interfaces.contains(i));
+    let keep_off = match setting {
+        PowerSave::Off => true,
+        PowerSave::Auto => !battery,
+        PowerSave::Leave | PowerSave::Ignore => false,
+    };
+    // Turned on by the node or left alone, it counts anew when kept off
+    // again.
+    turned_off.retain(|i, _| keep_off && interfaces.contains(i));
     let mut found = vec![];
     for i in interfaces {
-        let warning = if wifi::power_save(&i) == Some(true) {
-            match wifi::power_save_off(&i) {
-                Ok(()) => {
-                    let now = Instant::now();
-                    match turned_off.get_mut(&i) {
-                        Some((_, again)) => *again = Some(now),
-                        None => {
-                            turned_off.insert(i.clone(), (now, None));
-                        }
-                    }
-                    tracing::info!(interface = %i, "turned Wi-Fi power saving off");
-                    None
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-                    let exe = std::env::current_exe()
-                        .map_or_else(|_| "path/to/orpheusd".into(), |p| p.display().to_string());
-                    Some((
-                        Reason::NoCapability,
-                        Text::new("warning-power-save-no-capability").arg("exe", exe),
-                    ))
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => Some((
-                    Reason::Unsupported,
-                    Text::new("warning-power-save-unsupported"),
-                )),
-                Err(e) => Some((
-                    Reason::Failed,
-                    Text::new("warning-power-save-failed").arg("error", e.to_string()),
-                )),
-            }
+        let warning = if keep_off {
+            keep_power_save_off(&i, turned_off)
         } else {
-            None
-        };
-        let back = turned_off
-            .get(&i)
-            .and_then(|(_, again)| *again)
-            .filter(|t| t.elapsed() < POWER_SAVE_BACK);
-        let warning = warning.or_else(|| {
-            back.map(|_| {
+            let mut on = wifi::power_save(&i);
+            if setting == PowerSave::Auto && on == Some(false) {
+                match wifi::set_power_save(&i, true) {
+                    Ok(()) => {
+                        tracing::info!(interface = %i, "turned Wi-Fi power saving on, on battery");
+                        on = Some(true);
+                    }
+                    // Off is better for audio anyway.
+                    Err(e) => {
+                        tracing::debug!(interface = %i, error = %e, "turning Wi-Fi power saving on")
+                    }
+                }
+            }
+            (on == Some(true) && setting != PowerSave::Ignore).then(|| {
+                let value = match setting {
+                    PowerSave::Auto => "auto",
+                    _ => "leave",
+                };
                 (
-                    Reason::TurnedOnAgain,
-                    Text::new("warning-power-save-turned-on-again"),
+                    Reason::Configured,
+                    Text::new("warning-power-save-configured").arg("setting", value),
                 )
             })
-        });
+        };
         if let Some((reason, text)) = warning {
             found.push(Warning {
                 kind: WarningKind::PowerSave,
@@ -472,6 +478,58 @@ fn power_save(
         }
     }
     found
+}
+
+/// Turns power saving off on the Wi-Fi `interface` if it is on; what to
+/// warn about if it can't, or if it had to again lately.
+fn keep_power_save_off(
+    interface: &str,
+    turned_off: &mut BTreeMap<String, (Instant, Option<Instant>)>,
+) -> Option<(Reason, Text)> {
+    if wifi::power_save(interface) == Some(true) {
+        match wifi::set_power_save(interface, false) {
+            Ok(()) => {
+                let now = Instant::now();
+                match turned_off.get_mut(interface) {
+                    Some((_, again)) => *again = Some(now),
+                    None => {
+                        turned_off.insert(interface.to_owned(), (now, None));
+                    }
+                }
+                tracing::info!(interface, "turned Wi-Fi power saving off");
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                let exe = std::env::current_exe()
+                    .map_or_else(|_| "path/to/orpheusd".into(), |p| p.display().to_string());
+                return Some((
+                    Reason::NoCapability,
+                    Text::new("warning-power-save-no-capability").arg("exe", exe),
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Some((
+                    Reason::Unsupported,
+                    Text::new("warning-power-save-unsupported"),
+                ));
+            }
+            Err(e) => {
+                return Some((
+                    Reason::Failed,
+                    Text::new("warning-power-save-failed").arg("error", e.to_string()),
+                ));
+            }
+        }
+    }
+    turned_off
+        .get(interface)
+        .and_then(|(_, again)| *again)
+        .filter(|t| t.elapsed() < POWER_SAVE_BACK)
+        .map(|_| {
+            (
+                Reason::TurnedOnAgain,
+                Text::new("warning-power-save-turned-on-again"),
+            )
+        })
 }
 
 /// The likely cause of a slow or unsteady path when this node's end of it

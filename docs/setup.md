@@ -69,7 +69,8 @@ with dropouts.
 
 8. **Power saving off for good.** The node turns it off itself, but
    NetworkManager or TLP may turn it on again; it then warns
-   (`power_save`). See
+   (`power_save`). On a laptop that should save battery, set
+   `[wifi] power_save = "auto"` instead. See
    [troubleshooting](troubleshooting.md#wi-fi-power-saving).
 9. **No background scans.** NetworkManager scans all channels every 5
    minutes, and every 30 s while the signal is weak, so that it can roam.

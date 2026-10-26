@@ -47,7 +47,7 @@ restarts.
 Some keys can also be changed while the node runs, over the API or with
 `orpheusctl set` (see [settings](#settings-changed-over-the-api)): those
 of `[ptp]` except `enabled`, `[receiver]` except `enabled`, `port` and
-`max`, and all of `[sender]` and `[ui]`.
+`max`, and all of `[sender]`, `[ui]` and `[wifi]`.
 
 ### Example
 
@@ -93,6 +93,9 @@ port = 7481
 
 [ui]
 language = "auto"
+
+[wifi]
+power_save = "off"
 ```
 
 ### Top level
@@ -254,6 +257,14 @@ What Orpheus shows in the audio system's mixers.
 |---|---|---|
 | `language` | `auto` | The language of the names Orpheus gives, such as a sink's `TV (unavailable)`, of its [warnings](usage.md#warnings) and of errors in settings, as a language tag: `de`, `de-AT`. The log stays in English. `auto` takes the environment's (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`): for a systemd user unit that is the session's, which `systemctl --user show-environment` shows. The loopback and the wire and meter nodes keep the names they got at the start. Orpheus speaks English and German; other languages get English. `orpheusctl` goes by its own environment. See [languages](architecture.md#languages). |
 
+### `[wifi]`
+
+The node's Wi-Fi interfaces: PTP's and the default route's.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `power_save` | `off` | Wi-Fi power saving. `off`: the node turns it off, and again whenever something turns it on. `auto`: off on mains power, on on battery, where it saves power and streams may stutter; a machine without a battery is always on mains. `leave`: the node leaves it as it is and warns while it is on. `ignore`: the same without the warning. Turning it on or off needs `CAP_NET_ADMIN`; see [troubleshooting](troubleshooting.md#wi-fi-power-saving). A change takes effect within a second. |
+
 ### `[icons]`
 
 Linux only. Icons for other nodes' outputs, by output type, as XDG icon
@@ -326,6 +337,7 @@ set over the API stays until it is reset.
 | `receiver` | `link_offset_ms` | at once; streams that play restart, with a short gap |
 | `sender` | `claim`, `release_after_s`, `fade_in_ms` | at once |
 | `ui` | `language` | within a second |
+| `wifi` | `power_save` | within a second |
 
 The values are checked as in `config.toml`; a change with an unknown key
 or a value out of range is refused as a whole. The HTTP form is

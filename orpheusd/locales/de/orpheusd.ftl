@@ -49,6 +49,10 @@ warning-power-save-no-capability = WLAN-Energiesparen ist an für { $interface }
 warning-power-save-unsupported = WLAN-Energiesparen ist an für { $interface }, und sein Treiber kann es nicht ausschalten: { -power-save-holds }; nimm ein Kabel oder einen anderen WLAN-Adapter
 warning-power-save-failed = WLAN-Energiesparen ist an für { $interface }, und es auszuschalten schlug fehl ({ $error }): { -power-save-holds }; { -power-save-for-good }
 warning-power-save-turned-on-again = etwas schaltet WLAN-Energiesparen für { $interface } immer wieder ein (NetworkManager beim Verbinden, TLP im Akkubetrieb); der Knoten schaltet es binnen 30 s wieder aus, aber bis dahin gilt: { -power-save-holds }; { -power-save-for-good }
+warning-power-save-configured = { $setting ->
+        [auto] WLAN-Energiesparen ist an für { $interface }, da [wifi] power_save = "auto" es im Akkubetrieb einschaltet: { -power-save-holds }
+       *[leave] WLAN-Energiesparen ist an für { $interface }, und [wifi] power_save = "leave" lässt es so: { -power-save-holds }
+    }
 
 ## Fehler in Einstellungen.
 

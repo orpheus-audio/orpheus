@@ -58,6 +58,11 @@ warning-power-save-no-capability = Wi-Fi power saving is on for { $interface }: 
 warning-power-save-unsupported = Wi-Fi power saving is on for { $interface }, and its driver can't turn it off: { -power-save-holds }; use a wired link or another Wi-Fi adapter
 warning-power-save-failed = Wi-Fi power saving is on for { $interface }, and turning it off failed ({ $error }): { -power-save-holds }; { -power-save-for-good }
 warning-power-save-turned-on-again = something keeps turning Wi-Fi power saving on for { $interface } (NetworkManager when it connects, TLP on battery); the node turns it off again within 30 s, but meanwhile { -power-save-holds }; { -power-save-for-good }
+# $setting: the value of [wifi] power_save that leaves it on, auto or leave.
+warning-power-save-configured = { $setting ->
+        [auto] Wi-Fi power saving is on for { $interface }, as [wifi] power_save = "auto" turns it on on battery: { -power-save-holds }
+       *[leave] Wi-Fi power saving is on for { $interface }, and [wifi] power_save = "leave" leaves it so: { -power-save-holds }
+    }
 
 ## Errors in settings: in config.toml as the node starts, and in changes
 ## over the API (`orpheusctl set`), in the node's language.
