@@ -220,9 +220,10 @@ struct State {
     /// `[wifi] power_save` and whether the machine was on battery, as of
     /// the last power saving check.
     power_save_mode: Option<(PowerSave, bool)>,
-    /// Per Wi-Fi interface, when the node turned power saving off, and when
-    /// it last had to do so again.
-    power_save_off: BTreeMap<String, (Instant, Option<Instant>)>,
+    /// The Wi-Fi interfaces the node has seen power saving off on, or
+    /// turned it off on, while keeping it off; with when it last had to
+    /// turn it off again.
+    power_save_off: BTreeMap<String, Option<Instant>>,
 }
 
 /// Checks once a second, logs warnings as they come and go, and keeps the
@@ -414,7 +415,7 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
 fn power_save(
     node: &Node,
     (setting, battery): (PowerSave, bool),
-    turned_off: &mut BTreeMap<String, (Instant, Option<Instant>)>,
+    turned_off: &mut BTreeMap<String, Option<Instant>>,
 ) -> Vec<Warning> {
     let mut interfaces: Vec<String> = node
         .ptp
@@ -431,7 +432,7 @@ fn power_save(
         PowerSave::Auto => !battery,
         PowerSave::Leave | PowerSave::Ignore => false,
     };
-    // Turned on by the node or left alone, it counts anew when kept off
+    // Turned on by the node or left alone, it counts anew once kept off
     // again.
     turned_off.retain(|i, _| keep_off && interfaces.contains(i));
     let mut found = vec![];
@@ -484,16 +485,21 @@ fn power_save(
 /// warn about if it can't, or if it had to again lately.
 fn keep_power_save_off(
     interface: &str,
-    turned_off: &mut BTreeMap<String, (Instant, Option<Instant>)>,
+    turned_off: &mut BTreeMap<String, Option<Instant>>,
 ) -> Option<(Reason, Text)> {
-    if wifi::power_save(interface) == Some(true) {
-        match wifi::set_power_save(interface, false) {
+    // The first time it is found on is no news: NetworkManager turns it on
+    // whenever it connects. Once it was off, whoever turns it on again
+    // should know.
+    match wifi::power_save(interface) {
+        Some(false) => {
+            turned_off.entry(interface.to_owned()).or_insert(None);
+        }
+        Some(true) => match wifi::set_power_save(interface, false) {
             Ok(()) => {
-                let now = Instant::now();
                 match turned_off.get_mut(interface) {
-                    Some((_, again)) => *again = Some(now),
+                    Some(again) => *again = Some(Instant::now()),
                     None => {
-                        turned_off.insert(interface.to_owned(), (now, None));
+                        turned_off.insert(interface.to_owned(), None);
                     }
                 }
                 tracing::info!(interface, "turned Wi-Fi power saving off");
@@ -518,11 +524,13 @@ fn keep_power_save_off(
                     Text::new("warning-power-save-failed").arg("error", e.to_string()),
                 ));
             }
-        }
+        },
+        None => {}
     }
     turned_off
         .get(interface)
-        .and_then(|(_, again)| *again)
+        .copied()
+        .flatten()
         .filter(|t| t.elapsed() < POWER_SAVE_BACK)
         .map(|_| {
             (
