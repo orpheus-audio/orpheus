@@ -9,7 +9,8 @@ cargo test --workspace
 
 The [justfile](../justfile) has shortcuts. `just build [profile]` builds
 `orpheusd` and `orpheusctl` and runs `setcap` on `orpheusd` if it needs it
-(asking for sudo); `just run [profile]` also starts it. `just check` runs
+(asking for sudo: `cap_net_bind_service` for PTP's ports, and on a machine
+with Wi-Fi `cap_net_admin` to turn power saving off); `just run [profile]` also starts it. `just check` runs
 rustfmt, clippy and the tests. The profiles:
 
 - `dev`: a debug build, the fastest to rebuild; for trying out changes.

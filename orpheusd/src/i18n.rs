@@ -1,5 +1,5 @@
 //! The texts orpheusd shows to people: names in the audio system,
-//! setting errors, in `[ui] language` or the environment's
+//! warnings and setting errors, in `[ui] language` or the environment's
 //! (see [`orpheus_i18n`]). Logs stay in English.
 
 use std::sync::Arc;
@@ -45,17 +45,16 @@ mod tests {
 
     #[test]
     fn formats_arguments() {
-        let t = Text::new("setting-block")
-            .arg("min", 16)
-            .arg("max", 4800)
-            .arg("min_ms", Arg::Decimal(16.0 / 48.0, 2))
-            .arg("max_ms", Arg::Decimal(100.0, 0))
-            .arg("frames", 8);
+        let t = Text::new("warning-ptp-delay")
+            .arg("ms", Arg::Decimal(1.26, 1))
+            .arg("limit", Arg::Decimal(0.5, 1))
+            .arg("cause", Text::new("cause-unknown"));
         assert_eq!(
             texts("en").text(&t),
-            "the block must be 16 to 4800 frames (at 48 kHz 0.33 to 100 ms), not 8"
+            "the path to the PTP grandmaster takes 1.3 ms, wired it is well below 0.5 ms: \
+             Wi-Fi or a congested link on the way"
         );
-        assert!(texts("de").text(&t).contains("0,33"));
+        assert!(texts("de").text(&t).contains("1,3 ms"));
     }
 
     /// Every text the code asks for is in the English file.

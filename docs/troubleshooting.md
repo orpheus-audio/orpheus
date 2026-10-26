@@ -34,8 +34,8 @@ trying by itself (see [clock](clock.md#when-ptp-cant-run)); fix the cause
 and it follows the grandmaster again within seconds, without a restart.
 
 - **Permission denied:** the binary lacks `CAP_NET_BIND_SERVICE` for ports
-  319 and 320. Run `sudo setcap cap_net_bind_service=+ep path/to/orpheusd`
-  again; every rebuild removes it. `getcap path/to/orpheusd` shows whether it
+  319 and 320. Run `sudo setcap cap_net_bind_service,cap_net_admin=ep
+  path/to/orpheusd` again; every rebuild removes it. `getcap path/to/orpheusd` shows whether it
   is set. This one needs a restart of `orpheusd`.
 - **Interface has no MAC address:** the default route goes through a VPN or
   another tunnel (WireGuard, OpenVPN tun). Set the LAN interface:
@@ -122,11 +122,10 @@ or for all connections, in `/etc/NetworkManager/conf.d/wifi-powersave.conf`:
 wifi.powersave = 2
 ```
 
-followed by `sudo systemctl restart NetworkManager`. Without
-NetworkManager, `sudo iw dev <interface> set power_save off` turns it off
-until the next restart; `iw dev <interface> get power_save` shows it.
-Some laptops turn it on again on battery (TLP does by default), so
-the node checks again every 30 seconds.
+followed by `sudo systemctl restart NetworkManager`. With TLP, set
+`WIFI_PWR_ON_BAT=off` in `/etc/tlp.conf`. `sudo iw dev <interface> set
+power_save off` turns it off until the next reconnect;
+`iw dev <interface> get power_save` shows it.
 
 Power saving on other devices (phones, tablets) still makes the access point
 hold back multicast for everyone, PTP included. That is not something a

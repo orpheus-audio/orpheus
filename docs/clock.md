@@ -122,13 +122,18 @@ end stamps this way, as an offset error of about half of it. On Wi-Fi the
 network jitter is far larger anyway.
 
 **Privileges.** PTP uses UDP ports 319 (event messages) and 320 (general
-messages). Binding ports below 1024 needs `CAP_NET_BIND_SERVICE`:
+messages). Binding ports below 1024 needs `CAP_NET_BIND_SERVICE`. On
+Wi-Fi the node also turns power saving off, which needs `CAP_NET_ADMIN`
+(see [troubleshooting](troubleshooting.md#wi-fi-power-saving)):
 
 ```sh
-sudo setcap cap_net_bind_service=+ep target/release/orpheusd
+sudo setcap cap_net_bind_service,cap_net_admin=ep target/release/orpheusd
 ```
 
-The capability is lost whenever the binary is rebuilt or replaced.
+`CAP_NET_ADMIN` lets a program change any network setting, firewall
+included; the node uses it for nothing else. Leave it out on a wired
+machine. The capabilities are lost whenever the binary is rebuilt or
+replaced.
 
 ## IPv4 and IPv6
 

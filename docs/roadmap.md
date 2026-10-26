@@ -239,8 +239,10 @@ network delay, and no jitter or loss. Expected problems on real networks:
   machines, network jitter and loss on real hardware, and runs of several
   hours.
 - **Packaging.** `setcap` has to be redone after every build. Packages can set
-  the capability on install; a system service could use systemd's
-  `AmbientCapabilities`.
+  the capabilities on install; a system service could use systemd's
+  `AmbientCapabilities`. `CAP_NET_ADMIN`, to turn Wi-Fi power saving off,
+  allows far more than that; a small helper with only that job would be
+  safer.
 
 ### Control plane and configuration
 

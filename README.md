@@ -29,8 +29,9 @@ clang (for the PipeWire bindings).
 
 ```sh
 cargo build --release
-# PTP uses the privileged ports 319 and 320. Redo this after every build.
-sudo setcap cap_net_bind_service=+ep target/release/orpheusd
+# PTP uses the privileged ports 319 and 320, and on Wi-Fi the node turns
+# power saving off. Redo this after every build.
+sudo setcap cap_net_bind_service,cap_net_admin=ep target/release/orpheusd
 target/release/orpheusd
 ```
 
@@ -73,8 +74,12 @@ To start the node with your session, install the systemd user unit from
 [`orpheusd/dist/orpheusd.service`](orpheusd/dist/orpheusd.service); adjust
 `ExecStart` if the binary is not in `/usr/bin`.
 
+Before you rely on it, go through the [first setup](docs/setup.md)
+checklist on each machine: firewall, grandmaster, and Wi-Fi.
+
 ## Documentation
 
+- [First setup](docs/setup.md): a checklist for each new node, firewall and Wi-Fi
 - [Configuration](docs/configuration.md): files, `~/.config/orpheus/config.toml`, settings changed over the API
 - [Usage](docs/usage.md): `orpheusctl`, the HTTP API and its WebSocket, reading the status
 - [Clock](docs/clock.md): PTP, TAI, settling, when PTP can't run, IPv4 and IPv6

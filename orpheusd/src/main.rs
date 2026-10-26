@@ -18,6 +18,7 @@ mod players;
 mod policy;
 mod settings;
 mod sources;
+mod wifi;
 mod wires;
 
 use std::net::SocketAddr;

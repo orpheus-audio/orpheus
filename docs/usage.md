@@ -888,16 +888,29 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `wifi_grandmaster` | clock | PTP runs over Wi-Fi on a node that does not follow another clock, so it is or may become the grandmaster. That does not hurt this node, but nodes that follow its clock may not settle. Give a wired node a lower `ptp.priority1` so that it becomes the grandmaster. |
 | `multicast_wifi` | receiver, sender | A [multicast](#multicast-interop) stream goes over Wi-Fi, where the access point sends it at its lowest rate to every client. |
 | `peer_wifi` | receiver, sender | The node at the other end is on Wi-Fi, as it announces. |
-| `power_save` | interface | Power saving is on for a Wi-Fi interface the node uses (PTP's or the default route's). The access point then holds the node's packets until it wakes, 100 ms and more, which no buffer or clock filter makes up for. Turn it off; see [troubleshooting](troubleshooting.md#wi-fi-power-saving). The warning names the interface in `interface`. Laptops often turn power saving on when they go on battery, so the node checks again every 30 seconds. |
-| `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). |
+| `power_save` | interface | Power saving is on for a Wi-Fi interface the node uses (PTP's or the default route's), and the node may not turn it off (no `CAP_NET_ADMIN`) or the driver can't; or something turned it on again within the last 10 minutes and the node had to turn it off again. The access point holds a dozing node's packets until it wakes, 100 ms and more, which no buffer or clock filter makes up for. See [troubleshooting](troubleshooting.md#wi-fi-power-saving). The warning names the interface in `interface`. |
+| `jitter` | receiver | The packets' transit times spread by more than 3 ms in 3 of the last 10 seconds: Wi-Fi or a congested link somewhere on the way, also where neither node is on Wi-Fi itself (a wireless bridge, a mesh). If the stream comes in over this node's Wi-Fi, the message names its signal and rate, and calls it weak below −70 dBm. |
 | `peer_jitter` | sender | The peer's receiver warns about `jitter` for this sender. |
-| `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. |
+| `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. On Wi-Fi the message names the signal, as for `jitter`. |
 | `ptp_down` | clock | PTP is not running, so the node plays out of step with the other nodes: on the system clock, or holding over the grandmaster's last time and rate. It tries again by itself; see [clock](clock.md#when-ptp-cant-run). |
-| `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. |
+| `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. On Wi-Fi the message names the signal, as for `jitter`. |
 | `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
 | `peer_busy` | sender | The route wants a receiver on the peer, but all of the peer's receivers play other senders; it tries again every 5 seconds. Raise `[receiver] max` on the peer, or let other routes [claim on play](#claiming-a-receiver-on-play). |
 | `peer_incompatible` | sender | None of the peer's receivers can play the route's stream; it tries again when the peer's receivers change. |
 | `clipping` | output | What plays on an output reached full scale within the last 10 seconds: its wires, and anything else on it, add up to more than it can play. Turn the wires down; see [levels](#levels). The warning names the output in `output`. |
+
+The `message` is in the node's language (`[ui] language`), the log in
+English. The texts are in `orpheusd/locales/<language>/orpheusd.ftl`
+([Fluent](https://projectfluent.org); see
+[languages](architecture.md#languages)); a client that wants its own
+wording can go by `kind`, `reason` and the other fields instead.
+
+Some kinds have several reasons, which a warning names in `reason`, so
+that a user interface can offer the fitting remedy. So far only
+`power_save` does: `no_capability` (the node may not turn it off),
+`unsupported` (the driver can't), `failed` (turning it off failed
+otherwise), `turned_on_again` (something turned it on again and the node
+turned it off again).
 
 Wi-Fi is recognized on Linux by the interface (`/sys/class/net/<if>/wireless`)
 the stream or PTP takes. Each node also announces its own link, that of its
