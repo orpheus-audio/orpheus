@@ -101,28 +101,28 @@ pub(crate) mod state;
 /// ```no_run
 /// # mod system {
 /// #     pub struct Clock;
-/// #     impl statime::Clock for Clock {
+/// #     impl orpheus_ptp::Clock for Clock {
 /// #         type Error = ();
-/// #         fn now(&self) -> statime::time::Time {
+/// #         fn now(&self) -> orpheus_ptp::time::Time {
 /// #             unimplemented!()
 /// #         }
-/// #         fn step_clock(&mut self, _: statime::time::Duration) -> Result<statime::time::Time, Self::Error> {
+/// #         fn step_clock(&mut self, _: orpheus_ptp::time::Duration) -> Result<orpheus_ptp::time::Time, Self::Error> {
 /// #             unimplemented!()
 /// #         }
-/// #         fn set_frequency(&mut self, _: f64) -> Result<statime::time::Time, Self::Error> {
+/// #         fn set_frequency(&mut self, _: f64) -> Result<orpheus_ptp::time::Time, Self::Error> {
 /// #             unimplemented!()
 /// #         }
-/// #         fn set_properties(&mut self, _: &statime::config::TimePropertiesDS) -> Result<(), Self::Error> {
+/// #         fn set_properties(&mut self, _: &orpheus_ptp::config::TimePropertiesDS) -> Result<(), Self::Error> {
 /// #             unimplemented!()
 /// #         }
 /// #     }
 /// # }
 /// # let (instance_config, time_properties_ds) = unimplemented!();
 /// use rand::thread_rng;
-/// use statime::config::{AcceptAnyMaster, DelayMechanism, PortConfig, PtpMinorVersion};
-/// use statime::filters::BasicFilter;
-/// use statime::PtpInstance;
-/// use statime::time::Interval;
+/// use orpheus_ptp::config::{AcceptAnyMaster, DelayMechanism, PortConfig, PtpMinorVersion};
+/// use orpheus_ptp::filters::BasicFilter;
+/// use orpheus_ptp::PtpInstance;
+/// use orpheus_ptp::time::Interval;
 ///
 /// let mut instance = PtpInstance::<BasicFilter>::new(instance_config, time_properties_ds);
 ///
@@ -160,8 +160,8 @@ pub(crate) mod state;
 /// handling these events in their system specific way.
 ///
 /// ```no_run
-/// use statime::port::{PortAction, PortActionIterator, TimestampContext};
-/// use statime::time::Time;
+/// use orpheus_ptp::port::{PortAction, PortActionIterator, TimestampContext};
+/// use orpheus_ptp::time::Time;
 ///
 /// # mod system {
 /// #     pub struct Timer;
@@ -170,7 +170,7 @@ pub(crate) mod state;
 /// #     }
 /// #     pub struct UdpSocket;
 /// #     impl UdpSocket {
-/// #         pub fn send(&mut self, buf: &[u8], link_local: bool) -> statime::time::Time { unimplemented!() }
+/// #         pub fn send(&mut self, buf: &[u8], link_local: bool) -> orpheus_ptp::time::Time { unimplemented!() }
 /// #     }
 /// # }
 /// struct MyPortResources {
@@ -226,7 +226,7 @@ pub(crate) mod state;
 /// #    }
 /// #    pub struct UdpSocket;
 /// #    impl UdpSocket {
-/// #         pub fn recv(&mut self) -> Option<(&'static [u8], statime::time::Time)> { unimplemented!() }
+/// #         pub fn recv(&mut self) -> Option<(&'static [u8], orpheus_ptp::time::Time)> { unimplemented!() }
 /// #    }
 /// # }
 /// # struct MyPortResources {
@@ -237,14 +237,14 @@ pub(crate) mod state;
 /// #     filter_update_timer: system::Timer,
 /// #     time_critical_socket: system::UdpSocket,
 /// #     general_socket: system::UdpSocket,
-/// #     send_timestamp: Option<(statime::port::TimestampContext, statime::time::Time)>
+/// #     send_timestamp: Option<(orpheus_ptp::port::TimestampContext, orpheus_ptp::time::Time)>
 /// # }
 ///
 /// use rand::Rng;
-/// use statime::Clock;
-/// use statime::config::AcceptableMasterList;
-/// use statime::filters::Filter;
-/// use statime::port::{NoForwardedTLVs, Port, PortActionIterator, Running};
+/// use orpheus_ptp::Clock;
+/// use orpheus_ptp::config::AcceptableMasterList;
+/// use orpheus_ptp::filters::Filter;
+/// use orpheus_ptp::port::{NoForwardedTLVs, Port, PortActionIterator, Running};
 ///
 /// fn something_happend(resources: &mut MyPortResources, running_port: &mut Port<Running, impl AcceptableMasterList, impl Rng, impl Clock, impl Filter>) {
 ///     let actions = if resources.announce_timer.has_expired() {
@@ -414,7 +414,7 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
     }
 
     /// Handle the filter update timer going off
-    pub fn handle_filter_update_timer(&mut self) -> PortActionIterator {
+    pub fn handle_filter_update_timer(&mut self) -> PortActionIterator<'_> {
         let update = self.filter.update(&mut self.clock);
         if update.mean_delay.is_some() {
             self.mean_delay = update.mean_delay;
@@ -778,7 +778,7 @@ mod tests {
         port_identity: PortIdentity,
     ) -> Port<'_, Running, AcceptAnyMaster, rand::rngs::mock::StepRng, TestClock, BasicFilter> {
         let port = Port::<_, _, _, _, BasicFilter>::new(
-            &state,
+            state,
             PortConfig {
                 acceptable_master_list: AcceptAnyMaster,
                 delay_mechanism: DelayMechanism::E2E {
@@ -842,13 +842,12 @@ mod tests {
 
         let parent_ds = InternalParentDS::new(default_ds);
 
-        let state = RefCell::new(PtpInstanceState {
+        RefCell::new(PtpInstanceState {
             default_ds,
             current_ds: Default::default(),
             parent_ds,
             time_properties_ds: Default::default(),
             path_trace_ds: PathTraceDS::new(false),
-        });
-        state
+        })
     }
 }

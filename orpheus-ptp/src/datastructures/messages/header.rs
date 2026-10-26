@@ -145,7 +145,7 @@ impl Header {
 ///
 /// # Example
 /// ```
-/// # use statime::config::SdoId;
+/// # use orpheus_ptp::config::SdoId;
 /// assert_eq!(SdoId::default(), SdoId::try_from(0x000).unwrap());
 ///
 /// let sdo_id = SdoId::try_from(0x100).unwrap();

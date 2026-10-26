@@ -92,3 +92,6 @@ checklist on each machine: firewall, grandmaster, and Wi-Fi.
 
 The GNU General Public License, version 3 only (`GPL-3.0-only`): see
 [LICENCE.md](LICENCE.md).
+
+[`orpheus-ptp`](orpheus-ptp/README.md) is based on statime, whose code in it
+stays under the MIT licence as well.

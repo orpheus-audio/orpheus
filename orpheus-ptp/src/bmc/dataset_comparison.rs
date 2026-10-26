@@ -75,8 +75,16 @@ impl ComparisonDataset {
         let ordering = (self.gm_priority_1.cmp(&other.gm_priority_1))
             .then_with(|| self_quality.clock_class.cmp(&other_quality.clock_class))
             // The spec assumes numerical ordering (which is the reverse of the semantic ordering)
-            .then_with(|| self_quality.clock_accuracy.cmp_numeric(&other_quality.clock_accuracy))
-            .then_with(|| self_quality.offset_scaled_log_variance.cmp(&other_quality.offset_scaled_log_variance))
+            .then_with(|| {
+                self_quality
+                    .clock_accuracy
+                    .cmp_numeric(&other_quality.clock_accuracy)
+            })
+            .then_with(|| {
+                self_quality
+                    .offset_scaled_log_variance
+                    .cmp(&other_quality.offset_scaled_log_variance)
+            })
             .then_with(|| self.gm_priority_2.cmp(&other.gm_priority_2))
             .then_with(|| self.gm_identity.cmp(&other.gm_identity));
 

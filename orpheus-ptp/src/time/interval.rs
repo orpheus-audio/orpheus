@@ -27,7 +27,7 @@ impl Interval {
     /// # Example
     /// ```
     /// # use std::time::Duration;
-    /// # use statime::time::Interval;
+    /// # use orpheus_ptp::time::Interval;
     /// assert_eq!(Interval::from_log_2(2).as_core_duration(), Duration::from_secs(4));
     /// assert_eq!(Interval::from_log_2(-2).as_core_duration(), Duration::from_millis(250));
     /// ```
@@ -39,7 +39,7 @@ impl Interval {
     ///
     /// # Example
     /// ```
-    /// # use statime::time::Interval;
+    /// # use orpheus_ptp::time::Interval;
     /// assert_eq!(Interval::from_log_2(1).seconds(), 2.0);
     /// assert_eq!(Interval::from_log_2(-1).seconds(), 0.5);
     /// ```
@@ -47,11 +47,11 @@ impl Interval {
         self.as_f64()
     }
 
-    /// Turn this into a [`statime::time::Duration`](`crate::time::Duration`)
+    /// Turn this into a [`orpheus_ptp::time::Duration`](`crate::time::Duration`)
     ///
     /// # Example
     /// ```
-    /// # use statime::time::{Duration, Interval};
+    /// # use orpheus_ptp::time::{Duration, Interval};
     /// assert_eq!(Interval::from_log_2(3).as_duration(), Duration::from_secs(8));
     /// assert_eq!(Interval::from_log_2(-3).as_duration(), Duration::from_millis(125));
     /// ```
@@ -63,7 +63,7 @@ impl Interval {
     ///
     /// # Example
     /// ```
-    /// # use statime::time::{Interval};
+    /// # use orpheus_ptp::time::{Interval};
     /// use core::time::Duration;
     /// assert_eq!(Interval::from_log_2(3).as_core_duration(), Duration::from_secs(8));
     /// assert_eq!(Interval::from_log_2(-3).as_core_duration(), Duration::from_millis(125));
@@ -80,7 +80,7 @@ impl Interval {
     ///
     /// # Example
     /// ```
-    /// # use statime::time::{Interval};
+    /// # use orpheus_ptp::time::{Interval};
     /// use core::time::Duration;
     /// assert_eq!(Interval::ONE_SECOND.as_log_2(), 0);
     /// assert_eq!(Interval::TWO_SECONDS.as_log_2(), 1);

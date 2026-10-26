@@ -74,7 +74,7 @@
 //!   [`libm`]
 //!
 //! The `fuzz` feature exposes internal types for fuzzing implementations in the
-//! `statime::fuzz` module.
+//! `orpheus_ptp::fuzz` module.
 
 #![no_std]
 #![deny(missing_docs)]

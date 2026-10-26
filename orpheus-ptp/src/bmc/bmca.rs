@@ -295,7 +295,6 @@ pub(crate) enum RecommendedState {
 }
 
 #[cfg(test)]
-
 mod tests {
     use super::*;
     use crate::{
@@ -595,8 +594,6 @@ mod tests {
         );
 
         // D0 is NOT better than E_rbest; P1 is expected
-        let mut own_data = own_data;
-
         let mut port_message = default_best_announce_message();
 
         own_data.clock_identity = ClockIdentity([0; 8]);
@@ -672,8 +669,6 @@ mod tests {
         );
 
         // D0 is NOT better than E_best
-        let mut own_data = own_data;
-
         let mut global_message = default_best_announce_message();
 
         own_data.clock_identity = ClockIdentity([0; 8]);

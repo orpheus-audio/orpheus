@@ -57,7 +57,7 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMu
                         .find(|tlv| tlv.tlv_type == TlvType::PathTrace)
                     {
                         let clock_identity = state.default_ds.clock_identity;
-                        if tlv.value.chunks_exact(8).any(|ci| ci == clock_identity.0) {
+                        if tlv.value.as_chunks::<8>().0.contains(&clock_identity.0) {
                             log::warn!("Clock loop detected");
                             return true;
                         }
@@ -65,8 +65,10 @@ impl<A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMu
                         // Cannot panic as `list` is large enough to contain up to a whole message
                         path_trace_ds.list = tlv
                             .value
-                            .chunks_exact(8)
-                            .map(|ci| ClockIdentity(<[u8; 8]>::try_from(ci).unwrap()))
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|&ci| ClockIdentity(ci))
                             .collect();
                     }
                 }

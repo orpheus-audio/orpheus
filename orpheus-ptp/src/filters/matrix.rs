@@ -63,6 +63,7 @@ impl Matrix<1, 1> {
 }
 
 impl<const N: usize, const M: usize> core::fmt::Display for Matrix<N, M> {
+    #[allow(clippy::needless_range_loop)]
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         for i in 0..N {
             for j in 0..M {

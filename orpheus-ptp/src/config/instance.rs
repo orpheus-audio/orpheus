@@ -7,7 +7,7 @@ use crate::PtpInstance;
 /// # Example
 /// A configuration with common default values:
 /// ```
-/// # use statime::config::{ClockIdentity, InstanceConfig, SdoId};
+/// # use orpheus_ptp::config::{ClockIdentity, InstanceConfig, SdoId};
 /// let config = InstanceConfig {
 ///     clock_identity: ClockIdentity::from_mac_address([1,2,3,4,5,6]),
 ///     priority_1: 128,

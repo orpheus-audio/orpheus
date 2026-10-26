@@ -349,5 +349,5 @@ journal.
 
 ### Dependencies
 
-`rand` stays at 0.8 because statime 0.4 expects a random number generator
-implementing rand 0.8's `Rng`. Upgrade both together.
+`rand` stays at 0.8 because `orpheus-ptp` (statime 0.4) expects a random
+number generator implementing rand 0.8's `Rng`. Upgrade both together.

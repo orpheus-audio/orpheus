@@ -22,7 +22,8 @@ chrony's `leapsectz` do), otherwise it assumes 37 s.
 ## PTP
 
 Each node runs a PTP (IEEE 1588-2019) instance with one port on its LAN
-interface, using [statime](https://github.com/pendulum-project/statime).
+interface, using `orpheus-ptp`, a copy of
+[statime](https://github.com/pendulum-project/statime) 0.4.0.
 
 **Grandmaster election.** The best master clock algorithm elects one
 grandmaster per domain. A dedicated AES67 or Dante grandmaster wins if there

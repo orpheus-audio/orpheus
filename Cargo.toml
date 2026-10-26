@@ -5,6 +5,7 @@ members = [
     "orpheus-aes70",
     "orpheus-nmos",
     "orpheus-clock",
+    "orpheus-ptp",
     "orpheus-discovery",
     "orpheus-engine",
     "orpheus-i18n",

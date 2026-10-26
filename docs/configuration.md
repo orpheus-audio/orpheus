@@ -349,7 +349,7 @@ or a value out of range is refused as a whole. The HTTP form is
 |---|---|
 | `ORPHEUS_HOME` | One directory for config, state and cache; see [files](#files). |
 | `ORPHEUS_STATE`, `ORPHEUS_CACHE` | State and cache directory; they win over `ORPHEUS_HOME`. |
-| `RUST_LOG` | Log levels, for example `debug` or `info,orpheus_clock=debug`. Default `info,statime=warn`. See [logs](troubleshooting.md#logs). |
+| `RUST_LOG` | Log levels, for example `debug` or `info,orpheus_clock=debug`. Default `info,orpheus_ptp=warn`. See [logs](troubleshooting.md#logs). |
 | `ORPHEUS_NODE` | Node URL for `orpheusctl`; default `http://localhost:7480`. |
 | `ORPHEUS_DEBUG_CLOCK_SKEW_PPM` | Testing only: run this node's clock fast by this many ppm. |
 | `ORPHEUS_DEBUG_CLOCK_OFFSET_MS` | Testing only: offset this node's clock by this many milliseconds. |

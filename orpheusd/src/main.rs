@@ -209,13 +209,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Logs to stderr, `info` and above (statime only warnings, as it logs
+/// Logs to stderr, `info` and above (orpheus-ptp only warnings, as it logs
 /// every PTP measurement at `info`) unless `RUST_LOG` says otherwise. Under
 /// systemd, where stderr goes to the journal, each line starts with its
 /// syslog priority (`<4>` for warnings) instead of a timestamp, so that
 /// `journalctl -p` can filter by level.
 fn init_logging() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,statime=warn".into());
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,orpheus_ptp=warn".into());
     let fmt = tracing_subscriber::fmt().with_env_filter(filter);
     if stderr_is_journal() {
         fmt.with_ansi(false).event_format(JournalFormat).init();

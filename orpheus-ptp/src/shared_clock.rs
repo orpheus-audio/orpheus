@@ -5,7 +5,7 @@ use crate::{
     Clock,
 };
 
-/// A wrapper for stateful `statime::Clock` implementations to make them behave
+/// A wrapper for stateful `orpheus_ptp::Clock` implementations to make them behave
 /// like e.g. `statime_linux::LinuxClock` - clones share state with each other
 #[derive(Debug)]
 pub struct SharedClock<C>(pub Arc<Mutex<C>>)

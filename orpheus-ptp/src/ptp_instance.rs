@@ -33,15 +33,15 @@ use crate::{
 ///
 /// ```no_run
 /// # struct MockClock;
-/// # impl statime::Clock for MockClock {
+/// # impl orpheus_ptp::Clock for MockClock {
 /// #     type Error = ();
-/// #     fn now(&self) -> statime::time::Time {
+/// #     fn now(&self) -> orpheus_ptp::time::Time {
 /// #         unimplemented!()
 /// #     }
-/// #     fn step_clock(&mut self, _: statime::time::Duration) -> Result<statime::time::Time, Self::Error> {
+/// #     fn step_clock(&mut self, _: orpheus_ptp::time::Duration) -> Result<orpheus_ptp::time::Time, Self::Error> {
 /// #         unimplemented!()
 /// #     }
-/// #     fn set_frequency(&mut self, _: f64) -> Result<statime::time::Time, Self::Error> {
+/// #     fn set_frequency(&mut self, _: f64) -> Result<orpheus_ptp::time::Time, Self::Error> {
 /// #         unimplemented!()
 /// #     }
 /// #     fn set_properties(&mut self, _: &TimePropertiesDS) -> Result<(), Self::Error> {
@@ -52,14 +52,14 @@ use crate::{
 /// #     pub fn get_mac() -> [u8; 6] { unimplemented!() }
 /// #     pub fn sleep(time: core::time::Duration) { unimplemented!() }
 /// # }
-/// # let port_config: statime::config::PortConfig<AcceptAnyMaster> = unimplemented!();
+/// # let port_config: orpheus_ptp::config::PortConfig<AcceptAnyMaster> = unimplemented!();
 /// # let filter_config = unimplemented!();
 /// # let clock: MockClock = unimplemented!();
 /// # let rng: rand::rngs::mock::StepRng = unimplemented!();
 /// #
-/// use statime::PtpInstance;
-/// use statime::config::{AcceptAnyMaster, ClockIdentity, InstanceConfig, TimePropertiesDS, TimeSource};
-/// use statime::filters::BasicFilter;
+/// use orpheus_ptp::PtpInstance;
+/// use orpheus_ptp::config::{AcceptAnyMaster, ClockIdentity, InstanceConfig, TimePropertiesDS, TimeSource};
+/// use orpheus_ptp::filters::BasicFilter;
 ///
 /// let instance_config = InstanceConfig {
 ///     clock_identity: ClockIdentity::from_mac_address(system::get_mac()),

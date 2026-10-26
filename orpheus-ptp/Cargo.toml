@@ -1,15 +1,11 @@
 [package]
-name = "statime"
-readme = "README.md"
-description = "Precision Time Protocol implementation library for embedded and desktops"
-authors.workspace = true
+name = "orpheus-ptp"
 version.workspace = true
-edition.workspace = true
-license.workspace = true
+edition = "2021"
+license = "GPL-3.0-only AND MIT"
 repository.workspace = true
-homepage.workspace = true
-publish.workspace = true
-rust-version.workspace = true
+description = "PTP (IEEE 1588-2019) for Orpheus, based on statime"
+publish = false
 
 [features]
 default = ["std", "serde"]
@@ -18,13 +14,17 @@ fuzz = ["std"]
 serde = ["dep:serde", "arrayvec/serde"]
 
 [dependencies]
-arrayvec.workspace = true
-az.workspace = true
-fixed.workspace = true
-libm.workspace = true
-log = { workspace = true, default-features = false}
-rand = { workspace = true, default-features = false }
+arrayvec = { version = "0.7.4", default-features = false }
+az = "1.2.1"
+fixed = "1.24"
+libm = "0.2.15"
+log = { version = "0.4.27", default-features = false }
+rand = { version = "0.8.5", default-features = false }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-serde_test.workspace = true
+serde_test = "1.0.176"
+
+[lints.cargo]
+# libm, which builds with `std` don't use.
+unused_dependencies = "allow"

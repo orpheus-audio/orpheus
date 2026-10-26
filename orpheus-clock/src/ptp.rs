@@ -1,4 +1,4 @@
-//! PTP (IEEE 1588-2019) on top of statime.
+//! PTP (IEEE 1588-2019) on top of orpheus-ptp, our copy of statime.
 //!
 //! Every node runs a PTP instance with one port on its LAN interface. The
 //! best master clock algorithm elects one grandmaster: a dedicated AES67 or
@@ -39,20 +39,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 
-use rand::SeedableRng;
-use rand::rngs::StdRng;
-use statime::config::{
+use orpheus_ptp::config::{
     AcceptAnyMaster, ClockIdentity, DelayMechanism, InstanceConfig, LeapIndicator, PortConfig,
     PtpMinorVersion, SdoId, TimePropertiesDS, TimeSource,
 };
-use statime::filters::{Filter, FilterEstimate, FilterUpdate, KalmanConfiguration, KalmanFilter};
-use statime::observability::port::PortState;
-use statime::port::{
+use orpheus_ptp::filters::{
+    Filter, FilterEstimate, FilterUpdate, KalmanConfiguration, KalmanFilter,
+};
+use orpheus_ptp::observability::port::PortState;
+use orpheus_ptp::port::{
     InBmca, MAX_DATA_LEN, Measurement, NoForwardedTLVs, Port, PortAction, PortActionIterator,
     TimestampContext, is_message_buffer_compatible,
 };
-use statime::time::{Duration, Interval, Time};
-use statime::{OverlayClock, PtpInstance, PtpInstanceState};
+use orpheus_ptp::time::{Duration, Interval, Time};
+use orpheus_ptp::{OverlayClock, PtpInstance, PtpInstanceState};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use timestamped_socket::interface::{ChangeDetector, InterfaceName, interfaces};
 use timestamped_socket::networkaddress::MulticastJoinable;
 use timestamped_socket::socket::{
@@ -254,7 +256,7 @@ pub struct PtpStatus {
 #[derive(Debug, Clone, Copy)]
 struct Base(Timescale);
 
-impl statime::Clock for Base {
+impl orpheus_ptp::Clock for Base {
     type Error = io::Error;
 
     fn now(&self) -> Time {
@@ -313,7 +315,7 @@ impl Shared {
     }
 
     fn now(&self) -> Time {
-        statime::Clock::now(&*self.clock.lock().unwrap())
+        orpheus_ptp::Clock::now(&*self.clock.lock().unwrap())
     }
 }
 
@@ -331,7 +333,7 @@ impl PortClock {
     }
 }
 
-impl statime::Clock for PortClock {
+impl orpheus_ptp::Clock for PortClock {
     type Error = io::Error;
 
     fn now(&self) -> Time {
@@ -605,7 +607,7 @@ impl Filter for Servo {
         }
     }
 
-    fn measurement<C: statime::Clock>(
+    fn measurement<C: orpheus_ptp::Clock>(
         &mut self,
         mut m: Measurement,
         clock: &mut C,
@@ -671,12 +673,12 @@ impl Filter for Servo {
         self.with_delay(update)
     }
 
-    fn update<C: statime::Clock>(&mut self, clock: &mut C) -> FilterUpdate {
+    fn update<C: orpheus_ptp::Clock>(&mut self, clock: &mut C) -> FilterUpdate {
         let update = self.filter.update(clock);
         self.with_delay(update)
     }
 
-    fn demobilize<C: statime::Clock>(self, clock: &mut C) {
+    fn demobilize<C: orpheus_ptp::Clock>(self, clock: &mut C) {
         self.filter.demobilize(clock);
     }
 
@@ -734,7 +736,7 @@ struct StepWatch<'a, C> {
     stepped_at: Option<Time>,
 }
 
-impl<C: statime::Clock> statime::Clock for StepWatch<'_, C> {
+impl<C: orpheus_ptp::Clock> orpheus_ptp::Clock for StepWatch<'_, C> {
     type Error = C::Error;
 
     fn now(&self) -> Time {
@@ -1388,7 +1390,7 @@ async fn handle_actions<A: Transport>(
             } => {
                 let mut to = destinations(link_local, EVENT_PORT).into_iter();
                 let first = to.next().expect("the group is always there");
-                let before = statime::Clock::now(clock);
+                let before = orpheus_ptp::Clock::now(clock);
                 match sockets.event.send_to(data, first).await {
                     Ok(ts) => match ts.selected_timestamp() {
                         Some(ts) => {
@@ -1731,9 +1733,9 @@ mod tests {
         let system = crate::SystemClock::new();
         let diff = |ptp: &PtpClock| ptp.now_ns() as i64 - system.now_ns() as i64;
         assert!(diff(&ptp).abs() < 1_000_000);
-        statime::Clock::step_clock(&mut clock, Duration::from_nanos(500_000_000)).unwrap();
+        orpheus_ptp::Clock::step_clock(&mut clock, Duration::from_nanos(500_000_000)).unwrap();
         assert!((diff(&ptp) - 500_000_000).abs() < 1_000_000);
-        statime::Clock::set_frequency(&mut clock, 100.0).unwrap();
+        orpheus_ptp::Clock::set_frequency(&mut clock, 100.0).unwrap();
         assert_eq!(shared.steps.load(Relaxed), 1);
         assert_eq!(f64::from_bits(shared.frequency_ppm.load(Relaxed)), 100.0);
         // A socket timestamp of "now" maps to about the virtual time now.
@@ -1754,7 +1756,7 @@ mod tests {
         steps: u32,
     }
 
-    impl statime::Clock for TestClock {
+    impl orpheus_ptp::Clock for TestClock {
         type Error = io::Error;
 
         fn now(&self) -> Time {
@@ -1864,7 +1866,7 @@ mod tests {
         }
     }
 
-    impl statime::Clock for SimClock {
+    impl orpheus_ptp::Clock for SimClock {
         type Error = io::Error;
 
         fn now(&self) -> Time {

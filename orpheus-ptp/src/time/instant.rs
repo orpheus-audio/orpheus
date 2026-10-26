@@ -62,7 +62,7 @@ impl Time {
     /// ```
     /// use az::Az;
     /// use fixed::types::I96F32;
-    /// # use statime::time::Time;
+    /// # use orpheus_ptp::time::Time;
     /// assert_eq!(Time::from_nanos_subnanos(0, 1 << 31), Time::from_fixed_nanos(0.5.az::<I96F32>()))
     /// ```
     pub fn from_nanos_subnanos(nanos: u64, subnanos: u32) -> Self {

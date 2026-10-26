@@ -9,11 +9,11 @@ publish = false
 
 [dependencies]
 libc = "0.2"
-# 0.8 because statime 0.4 takes an RNG implementing rand 0.8's `Rng`; upgrade
-# together with statime.
+orpheus-ptp = { path = "../orpheus-ptp", default-features = false, features = ["std"] }
+# 0.8 because orpheus-ptp takes an RNG implementing rand 0.8's `Rng`; upgrade
+# both together.
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 serde = { workspace = true, optional = true }
-statime = { version = "0.4", default-features = false, features = ["std"] }
 timestamped-socket = { version = "0.3", default-features = false }
 tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
 tracing = "0.1"

@@ -5,14 +5,14 @@ Start with `orpheusctl status` on both nodes and the `orpheusd` log.
 ## Logs
 
 `orpheusd` logs to stderr at the levels error, warn, info and debug; by
-default it shows info and above, from statime (the PTP stack) only
+default it shows info and above, from `orpheus_ptp` (the PTP stack) only
 warnings, because it logs every measurement. `RUST_LOG` changes that, also
 per module:
 
 ```sh
 RUST_LOG=debug orpheusd
 RUST_LOG=info,orpheus_clock=debug orpheusd
-RUST_LOG=info,statime=info orpheusd   # every PTP measurement
+RUST_LOG=info,orpheus_ptp=info orpheusd   # every PTP measurement
 ```
 
 As a systemd service its log goes to the journal, with each line's level as

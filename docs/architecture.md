@@ -39,7 +39,8 @@ Linux.
 | Crate | Role |
 |---|---|
 | `orpheus-core` | Platform-independent types shared by all nodes, including the planned ESP32 firmware: device ID, audio format, channel layouts, RTP packets, jitter buffer, media-clock arithmetic. |
-| `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of statime. |
+| `orpheus-clock` | The `Clock` trait, the system clock on the TAI timescale, and PTP on top of `orpheus-ptp`. |
+| `orpheus-ptp` | The PTP protocol: ports, the best master clock algorithm, messages, the Kalman filter. A copy of [statime](https://github.com/pendulum-project/statime) 0.4.0 that Orpheus changes; `GPL-3.0-only AND MIT`, see [its README](../orpheus-ptp/README.md). |
 | `orpheus-engine` | The media engine: ports between realtime audio and the network, senders, receivers with their level meters and gains, ASRC, the `AudioBackend` trait. |
 | `orpheus-pipewire` | The PipeWire implementation of `AudioBackend`. |
 | `orpheusd` | The node daemon: config, home directory, HTTP API, NMOS APIs, connecting to other nodes. |
@@ -112,7 +113,7 @@ time instead of catching up ("realign").
 | main | tokio runtime: HTTP, NMOS and AES70 APIs, the NMOS refresh, the peer watch, the policy, the health check, scheduled activations, signals; blocking work (engine, peers' APIs) on tokio's blocking pool |
 | PipeWire | PipeWire main loop; owns all PipeWire objects, which are not `Send`, and follows the default output and its type and can set the default output, as the desktop does. The engine talks to it through a channel. |
 | PipeWire data (RT) | Process callbacks: copy between PipeWire buffers and ports; play the wires at their gains; measure the wires and the outputs they play on |
-| `orpheus-ptp` | PTP: sockets, timers, statime; restarts the port when its interface changes or the settings do, and retries while it can't start |
+| `orpheus-ptp` | PTP: sockets, timers, the `orpheus-ptp` port; restarts the port when its interface changes or the settings do, and retries while it can't start |
 | TX, one per sender | Pacing, ASRC, RTP send |
 | RX, one per running receiver | RTP receive, jitter buffer, level meter and gain, ASRC |
 | mDNS | mdns-sd's daemon, plus `mdns-monitor` (renames on name conflicts) and `mdns-browse` (the node list) |
