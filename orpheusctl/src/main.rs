@@ -6,18 +6,20 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{FromArgMatches, Parser, Subcommand};
 use orpheus_core::Layout;
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{num, t};
+
+mod i18n;
+
+// The help is in `locales/*/orpheusctl.ftl`; see `i18n::command`.
 #[derive(Parser)]
-#[command(version, about)]
+#[command(version)]
 struct Cli {
-    /// The node to talk to: a host name or address (API on port 7480) or
-    /// the URL of its API.
     #[arg(long, global = true, default_value = "localhost", env = "ORPHEUS_NODE")]
     node: String,
-    /// Print the node's JSON responses instead of text.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -26,220 +28,109 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the node's ID, name, version and streams.
     Status {
-        /// Follow the node: refresh as it changes, at most every SECONDS
-        /// (default 1), with counters as rates.
         #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1")]
         watch: Option<f64>,
     },
-    /// Send the node's audio to a peer: creates a sink "<name>" whose
-    /// audio is streamed to a free receiver of the peer, and connects that
-    /// receiver to it. A route to the peer with the same priority from
-    /// before comes back as it was.
     Connect {
-        /// Peer: its name or ID (see `nodes`), host name or address, or the
-        /// URL of its API. With --send-only: host name or address,
-        /// optionally with :port (default 5004); IPv6 with a port as
-        /// [addr]:port.
         peer: String,
-        /// Name shown in the sink; defaults to the route's name from
-        /// before, else the peer's name.
         #[arg(long)]
         name: Option<String>,
-        /// Only send; don't connect a receiver on the peer (for receivers
-        /// without an NMOS API, or set to accept any stream).
         #[arg(long)]
         send_only: bool,
-        /// Take over the peer's receiver even if another sender is
-        /// connected to it.
         #[arg(long)]
         force: bool,
-        /// `high` plays over the peer's other streams and turns them down
-        /// meanwhile, whatever the peer's policy (for announcements).
         #[arg(long, value_parser = ["normal", "high"], default_value = "normal")]
         priority: String,
-        /// What the sink's channels carry, and with them the stream's: ST
-        /// 2110-30 groups (`51`, `71`, `U16`) or channel symbols (`"L R
-        /// C"`); defaults to the route's layout from before, else stereo.
         #[arg(long)]
         layout: Option<String>,
     },
-    /// List the other nodes on the network.
     Nodes,
-    /// Give another node a name of your own, shown here instead of the
-    /// one it announces: in `nodes`, in sinks to it and in streams from it.
     Alias {
-        /// The node: its name, alias or ID (see `nodes`).
         node: String,
-        /// The new alias.
         #[arg(required_unless_present = "remove", conflicts_with = "remove")]
         alias: Option<String>,
-        /// Remove the alias and show the announced name again.
         #[arg(long)]
         remove: bool,
     },
-    /// Keep another node listed while it is offline, also after a restart.
     Pin {
-        /// The node: its name, alias or ID (see `nodes`).
         node: String,
     },
-    /// Stop keeping a node listed while it is offline.
     Unpin {
-        /// The node: its name, alias or ID (see `nodes`).
         node: String,
     },
-    /// List the node's outputs, their types and channels.
     Outputs,
-    /// List the node's inputs: the receivers' streams and the audio
-    /// system's inputs, such as microphones.
     Inputs,
-    /// Create or remove outputs made of channels of another.
     Output {
         #[command(subcommand)]
         action: OutputAction,
     },
-    /// Set what kind of device an output is, which other nodes show.
     SetType {
-        /// The output: its name or description, or a unique part of either.
         output: String,
-        /// speaker, headphones, headset, tv, hifi, computer, portable,
-        /// phone or generic; `auto` goes back to the detected type.
         #[arg(name = "TYPE")]
         kind: String,
     },
-    /// Play a receiver's stream on another output, in place of any wires
-    /// of its source; also one that is parked. The node remembers it for
-    /// what is sent, and plays it there again later.
     Play {
-        /// Receiver ID, as shown by `status`.
         receiver: u32,
-        /// The output: its name or description, or a unique part of either;
-        /// `default` goes back to the default output.
         output: String,
     },
-    /// Make an output the default one: applications play there, and so
-    /// do received streams that have no output of their own. Another
-    /// node's sink is fine too. For nodes without a desktop.
     Default {
-        /// The output: its name or description, or a unique part of either.
         output: String,
     },
-    /// Show the settings that can change while the node runs, and where
-    /// each comes from: the default, config.toml, or `set`.
     Settings,
-    /// Change settings, kept across restarts (config.toml is not touched).
     Set {
-        /// SECTION.KEY=VALUE, e.g. receiver.policy=mix or ptp.domain=1.
         #[arg(required = true, value_name = "SECTION.KEY=VALUE")]
         settings: Vec<String>,
     },
-    /// Undo `set`: go back to config.toml or the default.
     Reset {
-        /// SECTION.KEY, or SECTION for all of its keys.
         #[arg(required = true, value_name = "SECTION[.KEY]")]
         keys: Vec<String>,
     },
-    /// List the routes that run and the ones remembered from before.
     Routes,
-    /// Stop a route started with `connect` and disconnect the peer's
-    /// receiver. The route is remembered for the next `connect`.
     Disconnect {
-        /// The route: its name, or its ID or the start of it (see
-        /// `routes`).
         route: String,
     },
-    /// Forget a route, so that the next `connect` starts a new one;
-    /// disconnects it first if it runs.
     Forget {
-        /// The route: its name, or its ID or the start of it (see
-        /// `routes`).
         route: String,
     },
-    /// Set what the channels of a route's sink carry, and with them how
-    /// many channels its stream has; the sink starts again, and so does
-    /// the peer's receiver.
     RouteLayout {
-        /// The route: its name, or its ID or the start of it (see
-        /// `routes`).
         route: String,
-        /// ST 2110-30 groups (`ST`, `51`, `71`, `U16`) or channel symbols
-        /// (`L R C`).
         #[arg(required = true, num_args = 1..)]
         layout: Vec<String>,
     },
-    /// List the sources the receivers remember: where each plays and how
-    /// loud.
     Sources,
-    /// Set what the channels of a source carry, for senders that say
-    /// nothing or say it wrong; a stream playing it restarts.
     Layout {
-        /// The source: its name, or its ID or the start of it (see
-        /// `sources`).
         source: String,
-        /// ST 2110-30 groups (`51`, `ST,M`, `DM`, `U02`), channel symbols
-        /// (`L R`, `M1 M2`), or `auto` for what the stream says.
         #[arg(required = true, num_args = 1..)]
         layout: Vec<String>,
     },
-    /// Play channels of a source or an input on an output, replacing the
-    /// wire between them. A source with wires plays only on them; what
-    /// several wires bring into one channel is summed.
     Wire {
-        /// The source or input: its name, or a source's ID or the start
-        /// of it (see `sources` and `inputs`).
         from: String,
-        /// The output: its name or description, or a unique part of either.
         output: String,
-        /// Output channel = input channel, each by number (from 1),
-        /// symbol or label, with a gain in dB after `@` if wanted:
-        /// `L=R R=L`, `1=U03@-6`, `2=1`. Without any, all channels go
-        /// where they belong, those folded onto others at -3 dB.
         #[arg(value_name = "OUT=IN[@DB]")]
         channels: Vec<String>,
-        /// The wire's gain in dB, from -90 to +12; 0 plays the channels
-        /// as they are.
         #[arg(long, value_name = "DB", allow_hyphen_values = true)]
         gain: Option<f32>,
-        /// Make it silent.
         #[arg(long)]
         mute: bool,
     },
-    /// Change the gain of a wire, keeping its channels; the change ramps
-    /// over 20 ms.
     WireGain {
-        /// The source or input, as for `wire`.
         from: String,
-        /// The output, as for `wire`.
         output: String,
-        /// A gain in dB from -90 to +12 (`-6`, `0`), `mute` or `unmute`.
         #[arg(allow_hyphen_values = true)]
         gain: String,
     },
-    /// Remove a wire, or some of its channels. A source left without
-    /// wires is parked until played with `play` or wired again.
     Unwire {
-        /// The source or input, as for `wire`.
         from: String,
-        /// The output, as for `wire`.
         output: String,
-        /// The channel pairs to remove, as for `wire`; all if none.
         #[arg(value_name = "OUT=IN")]
         channels: Vec<String>,
     },
-    /// Show the wires: what plays on each output channel, and how loud:
-    /// the peak over the last second of each output channel and of what
-    /// each wire brings to it.
     Patch {
-        /// Refresh every SECONDS (default 1), as a meter.
         #[arg(long, value_name = "SECONDS", num_args = 0..=1, default_missing_value = "1")]
         watch: Option<f64>,
     },
-    /// Forget where a source plays and how loud; if it plays now, it goes
-    /// to the default output at full volume.
     ForgetSource {
-        /// The source: its name, or its ID or the start of it (see
-        /// `sources`).
         source: String,
     },
 }
@@ -379,27 +270,15 @@ struct Stream {
 
 #[derive(Subcommand)]
 enum OutputAction {
-    /// Create an output that plays on chosen channels of another, such as
-    /// channels 3 and 4 of an audio interface. Applications and receivers
-    /// play into it like into any output; kept across restarts.
     Create {
-        /// Its name, e.g. Kitchen.
         name: String,
-        /// The output to play on: its name or description, or a unique
-        /// part of either.
         device: String,
-        /// That output's channels, counted from 1, one per channel of the
-        /// new output: `3 4`.
         #[arg(required = true, num_args = 1..)]
         channels: Vec<usize>,
-        /// What the channels carry, as ST 2110-30 groups or symbols; by
-        /// default stereo for two, and so on.
         #[arg(long)]
         layout: Option<String>,
     },
-    /// Remove a created output.
     Remove {
-        /// The output: its name or description, or a unique part of either.
         output: String,
     },
 }
@@ -578,7 +457,7 @@ impl Buffer {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = Cli::from_arg_matches(&i18n::command().get_matches()).unwrap_or_else(|e| e.exit());
     let base = node_url(&cli.node);
     match run(cli, &base) {
         Ok(()) => ExitCode::SUCCESS,
@@ -607,7 +486,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             }
         }
         Command::Status { watch: Some(secs) } => {
-            anyhow::ensure!(secs >= 0.1, "--watch needs at least 0.1 seconds");
+            anyhow::ensure!(secs >= 0.1, t!("watch-too-short"));
             watch(base, Duration::from_secs_f64(secs), cli.json)?;
         }
         Command::Connect {
@@ -633,20 +512,21 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     layout,
                 },
             )
-            .with_context(|| format!("connecting to {peer} via {url}"))?;
+            .with_context(|| t!("connecting-via", peer = &peer, url = &url))?;
             if cli.json {
                 println!("{}", raw.trim_end());
             } else {
-                let c: Created = serde_json::from_str(&raw)
-                    .with_context(|| format!("reading the reply from {url}"))?;
-                let name = c.name.as_deref().unwrap_or(&peer);
-                let to = c.destination.as_deref().unwrap_or(&peer);
-                let how = if c.receiver.is_some() {
-                    "receiver connected"
-                } else {
-                    "send only"
-                };
-                println!("route {} \"{name}\" → {to} ({how})", c.id);
+                let c: Created =
+                    serde_json::from_str(&raw).with_context(|| t!("reading-reply", url = &url))?;
+                let receiver = if c.receiver.is_some() { "yes" } else { "no" };
+                let created = t!(
+                    "route-created",
+                    id = &c.id,
+                    name = c.name.as_deref().unwrap_or(&peer),
+                    to = c.destination.as_deref().unwrap_or(&peer),
+                    receiver = receiver,
+                );
+                println!("{created}");
             }
         }
         Command::Nodes => {
@@ -656,7 +536,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 println!("{}", raw.trim_end());
             } else {
                 let nodes: Vec<Node> = serde_json::from_str(&raw)
-                    .with_context(|| format!("reading nodes from {url}"))?;
+                    .with_context(|| t!("reading-from", what = "nodes", url = &url))?;
                 print!("{}", render_nodes(&nodes, Paint::detect()));
             }
         }
@@ -666,7 +546,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 println!("{}", raw.trim_end());
             } else {
                 let outputs: Vec<Output> =
-                    serde_json::from_str(&raw).context("reading the outputs")?;
+                    serde_json::from_str(&raw).with_context(|| t!("reading", what = "outputs"))?;
                 print!("{}", render_outputs(&outputs, Paint::detect()));
             }
         }
@@ -676,7 +556,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 println!("{}", raw.trim_end());
             } else {
                 let inputs: Vec<InputEntry> =
-                    serde_json::from_str(&raw).context("reading the inputs")?;
+                    serde_json::from_str(&raw).with_context(|| t!("reading", what = "inputs"))?;
                 print!("{}", render_inputs(&inputs, Paint::detect()));
             }
         }
@@ -691,7 +571,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
         } => {
             let outputs: Vec<Output> =
                 serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
-                    .context("reading the outputs")?;
+                    .with_context(|| t!("reading", what = "outputs"))?;
             let device = find_output(&outputs, &device)?;
             let mut body = serde_json::json!({
                 "name": name, "device": device.name, "channels": channels,
@@ -702,10 +582,10 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             }
             let url = format!("{base}/x-orpheus/v1/outputs");
             let raw = reply(agent().post(&url).send_json(body)?)
-                .with_context(|| format!("creating {name} via {url}"))?;
+                .with_context(|| t!("creating-via", name = &name, url = &url))?;
             let created: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
             if let Some(name) = created["name"].as_str() {
-                println!("output {name}");
+                println!("{}", t!("output-created", name = name));
             }
         }
         Command::Output {
@@ -713,55 +593,55 @@ fn run(cli: Cli, base: &str) -> Result<()> {
         } => {
             let outputs: Vec<Output> =
                 serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
-                    .context("reading the outputs")?;
+                    .with_context(|| t!("reading", what = "outputs"))?;
             let o = find_output(&outputs, &output)?;
             let url = format!("{base}/x-orpheus/v1/outputs/{}", encode(&o.name));
             reply(agent().delete(&url).call()?)
-                .with_context(|| format!("removing {output} via {url}"))?;
+                .with_context(|| t!("removing-via", what = &output, url = &url))?;
         }
         Command::SetType { output, kind } => {
             let outputs: Vec<Output> =
                 serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
-                    .context("reading the outputs")?;
+                    .with_context(|| t!("reading", what = "outputs"))?;
             let o = find_output(&outputs, &output)?;
             let url = format!("{base}/x-orpheus/v1/outputs/{}/type", encode(&o.name));
             if kind == "auto" {
                 let r = agent().delete(&url).call()?;
                 // Nothing to reset.
                 if r.status() != 404 {
-                    reply(r).with_context(|| format!("resetting via {url}"))?;
+                    reply(r).with_context(|| t!("resetting-via", url = &url))?;
                 }
             } else {
                 let r = agent()
                     .put(&url)
                     .send_json(serde_json::json!({ "type": kind }))?;
-                reply(r).with_context(|| format!("setting {kind} via {url}"))?;
+                reply(r).with_context(|| t!("setting-via", what = &kind, url = &url))?;
             }
         }
         Command::Play { receiver, output } => {
             let url = format!("{base}/x-orpheus/v1/receivers/{receiver}/output");
             if output == "default" {
                 let r = agent().delete(&url).call()?;
-                reply(r).with_context(|| format!("moving via {url}"))?;
+                reply(r).with_context(|| t!("moving-via", url = &url))?;
             } else {
                 let outputs: Vec<Output> =
                     serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
-                        .context("reading the outputs")?;
+                        .with_context(|| t!("reading", what = "outputs"))?;
                 let o = find_output(&outputs, &output)?;
                 let r = agent()
                     .put(&url)
                     .send_json(serde_json::json!({ "output": o.name }))?;
-                reply(r).with_context(|| format!("moving via {url}"))?;
+                reply(r).with_context(|| t!("moving-via", url = &url))?;
             }
         }
         Command::Default { output } => {
             let outputs: Vec<Output> =
                 serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
-                    .context("reading the outputs")?;
+                    .with_context(|| t!("reading", what = "outputs"))?;
             let o = find_output(&outputs, &output)?;
             let url = format!("{base}/x-orpheus/v1/outputs/{}/default", encode(&o.name));
             let r = agent().put(&url).send_empty()?;
-            reply(r).with_context(|| format!("setting the default via {url}"))?;
+            reply(r).with_context(|| t!("setting-default-via", url = &url))?;
         }
         Command::Alias {
             node,
@@ -789,10 +669,10 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             for s in &settings {
                 let (path, value) = s
                     .split_once('=')
-                    .with_context(|| format!("{s}: expected SECTION.KEY=VALUE"))?;
+                    .with_context(|| t!("expected-setting", arg = s))?;
                 let (section, key) = path
                     .split_once('.')
-                    .with_context(|| format!("{path}: expected SECTION.KEY"))?;
+                    .with_context(|| t!("expected-key", arg = path))?;
                 // Numbers and booleans as such, anything else as a string.
                 let value = match serde_json::from_str::<serde_json::Value>(value) {
                     Ok(v @ (serde_json::Value::Number(_) | serde_json::Value::Bool(_))) => v,
@@ -826,7 +706,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 println!("{}", raw.trim_end());
             } else {
                 let routes: Vec<RouteEntry> = serde_json::from_str(&raw)
-                    .with_context(|| format!("reading routes from {url}"))?;
+                    .with_context(|| t!("reading-from", what = "routes", url = &url))?;
                 print!("{}", render_routes(&routes, Paint::detect(), unix_now()));
             }
         }
@@ -834,13 +714,13 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             let id = find_route(base, &route)?;
             let url = format!("{base}/x-orpheus/v1/routes/{id}");
             reply(agent().delete(&url).call()?)
-                .with_context(|| format!("disconnecting {route} via {url}"))?;
+                .with_context(|| t!("disconnecting-via", route = &route, url = &url))?;
         }
         Command::Forget { route } => {
             let id = find_route(base, &route)?;
             let url = format!("{base}/x-orpheus/v1/routes/{id}?forget=true");
             reply(agent().delete(&url).call()?)
-                .with_context(|| format!("forgetting {route} via {url}"))?;
+                .with_context(|| t!("forgetting-via", what = &route, url = &url))?;
         }
         Command::RouteLayout { route, layout } => {
             let layout = Layout::parse(&layout.join(" ")).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -851,7 +731,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     .put(&url)
                     .send_json(serde_json::json!({ "layout": layout }))?,
             )
-            .with_context(|| format!("setting the layout of {route} via {url}"))?;
+            .with_context(|| t!("setting-layout-via", what = &route, url = &url))?;
         }
         Command::Sources => {
             let url = format!("{base}/x-orpheus/v1/sources");
@@ -860,7 +740,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 println!("{}", raw.trim_end());
             } else {
                 let sources: Vec<SourceEntry> = serde_json::from_str(&raw)
-                    .with_context(|| format!("reading sources from {url}"))?;
+                    .with_context(|| t!("reading-from", what = "sources", url = &url))?;
                 // Only to show their names.
                 let outputs: Vec<Output> = get(&format!("{base}/x-orpheus/v1/outputs"))
                     .ok()
@@ -884,7 +764,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     .put(&url)
                     .send_json(serde_json::json!({ "layout": layout }))?
             };
-            reply(r).with_context(|| format!("setting the layout of {source} via {url}"))?;
+            reply(r).with_context(|| t!("setting-layout-via", what = &source, url = &url))?;
         }
         Command::Wire {
             from,
@@ -909,11 +789,12 @@ fn run(cli: Cli, base: &str) -> Result<()> {
             }
             let url = format!("{base}/x-orpheus/v1/wires");
             let raw = reply(agent().put(&url).send_json(&body)?)
-                .with_context(|| format!("wiring {from} to {output} via {url}"))?;
+                .with_context(|| t!("wiring-via", from = &from, output = &output, url = &url))?;
             if cli.json {
                 println!("{}", raw.trim_end());
             } else {
-                let wire: WireEntry = serde_json::from_str(&raw).context("reading the wire")?;
+                let wire: WireEntry =
+                    serde_json::from_str(&raw).with_context(|| t!("reading", what = "wire"))?;
                 print!("{}", render_wire_set(&wire, Paint::detect()));
             }
         }
@@ -922,10 +803,11 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 "mute" => serde_json::json!({ "mute": true }),
                 "unmute" => serde_json::json!({ "mute": false }),
                 db => {
-                    let db: f32 =
-                        db.trim_end_matches("dB").trim().parse().with_context(|| {
-                            format!("{gain:?} is no gain: give dB, mute or unmute")
-                        })?;
+                    let db: f32 = db
+                        .trim_end_matches("dB")
+                        .trim()
+                        .parse()
+                        .with_context(|| t!("not-a-gain", gain = &gain))?;
                     serde_json::json!({ "gain_db": db })
                 }
             };
@@ -939,12 +821,19 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                     req = req.query(key, v);
                 }
             }
-            let raw = reply(req.send_json(&body)?)
-                .with_context(|| format!("setting the gain of {from} → {output} via {url}"))?;
+            let raw = reply(req.send_json(&body)?).with_context(|| {
+                t!(
+                    "setting-gain-via",
+                    from = &from,
+                    output = &output,
+                    url = &url
+                )
+            })?;
             if cli.json {
                 println!("{}", raw.trim_end());
             } else {
-                let wire: WireEntry = serde_json::from_str(&raw).context("reading the wire")?;
+                let wire: WireEntry =
+                    serde_json::from_str(&raw).with_context(|| t!("reading", what = "wire"))?;
                 print!("{}", render_wire_set(&wire, Paint::detect()));
             }
         }
@@ -966,11 +855,12 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 for (k, v) in query {
                     req = req.query(k, v);
                 }
-                reply(req.call()?).with_context(|| format!("unwiring {from} from {output}"))?;
+                reply(req.call()?)
+                    .with_context(|| t!("unwiring", from = &from, output = &output))?;
                 return Ok(());
             }
             let wires: Vec<WireEntry> =
-                serde_json::from_str(&get(&url)?).context("reading the wires")?;
+                serde_json::from_str(&get(&url)?).with_context(|| t!("reading", what = "wires"))?;
             let wire = wires
                 .iter()
                 .find(|w| {
@@ -978,11 +868,9 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                         && (w.source.as_deref() == ends["source"].as_str())
                         && (w.input.as_deref() == ends["input"].as_str())
                 })
-                .with_context(|| format!("no wire from {from} to {output}"))?;
+                .with_context(|| t!("no-wire", from = &from, output = &output))?;
             let Some(have) = &wire.channels else {
-                anyhow::bail!(
-                    "the wire plays all channels; `orpheusctl unwire {from:?} {output:?}` removes it"
-                );
+                anyhow::bail!(t!("wire-plays-all", from = &from, output = &output));
             };
             let mut keep = have.clone();
             for c in &channels {
@@ -996,7 +884,7 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 let before = keep.len();
                 keep.retain(|p| !same(p));
                 if keep.len() == before {
-                    anyhow::bail!("the wire has no {c}");
+                    anyhow::bail!(t!("wire-lacks", pair = c));
                 }
             }
             if keep.is_empty() {
@@ -1004,24 +892,25 @@ fn run(cli: Cli, base: &str) -> Result<()> {
                 for (k, v) in query {
                     req = req.query(k, v);
                 }
-                reply(req.call()?).with_context(|| format!("unwiring {from} from {output}"))?;
+                reply(req.call()?)
+                    .with_context(|| t!("unwiring", from = &from, output = &output))?;
             } else {
                 let mut body = ends.clone();
                 body["channels"] = serde_json::Value::Array(keep);
                 reply(agent().put(&url).send_json(&body)?)
-                    .with_context(|| format!("unwiring channels via {url}"))?;
+                    .with_context(|| t!("unwiring-channels-via", url = &url))?;
             }
         }
         Command::Patch { watch: None } => print!("{}", patch(base, cli.json, Paint::detect())?),
         Command::Patch { watch: Some(secs) } => {
-            anyhow::ensure!(secs >= 0.1, "--watch needs at least 0.1 seconds");
+            anyhow::ensure!(secs >= 0.1, t!("watch-too-short"));
             watch_patch(base, Duration::from_secs_f64(secs), cli.json)?;
         }
         Command::ForgetSource { source } => {
             let id = find_source(base, &source)?;
             let url = format!("{base}/x-orpheus/v1/sources/{id}");
             reply(agent().delete(&url).call()?)
-                .with_context(|| format!("forgetting {source} via {url}"))?;
+                .with_context(|| t!("forgetting-via", what = &source, url = &url))?;
         }
     }
     Ok(())
@@ -1046,30 +935,31 @@ struct RouteEntry {
 fn find_route(base: &str, query: &str) -> Result<String> {
     let routes: Vec<RouteEntry> =
         serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/routes"))?)
-            .context("reading the routes")?;
+            .with_context(|| t!("reading", what = "routes"))?;
     let ids: Vec<(&str, &str)> = routes
         .iter()
         .map(|r| (r.name.as_str(), r.id.as_str()))
         .collect();
-    pick(&ids, query, "route", "routes")
+    pick(&ids, query, "routes")
 }
 
 /// The ID of the source `query` names: by ID, the start of an ID, or name.
 fn find_source(base: &str, query: &str) -> Result<String> {
     let sources: Vec<SourceEntry> =
         serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/sources"))?)
-            .context("reading the sources")?;
+            .with_context(|| t!("reading", what = "sources"))?;
     let ids: Vec<(&str, &str)> = sources
         .iter()
         .map(|s| (s.name.as_str(), s.id.as_str()))
         .collect();
-    pick(&ids, query, "source", "sources")
+    pick(&ids, query, "sources")
 }
 
 /// The ID of the one of `items` (name, ID) that `query` names: by name,
 /// else by ID or the start of one, read as the daemon reads IDs: any
-/// case, `O` as 0, `I` and `L` as 1, hyphens ignored.
-fn pick(items: &[(&str, &str)], query: &str, what: &str, list: &str) -> Result<String> {
+/// case, `O` as 0, `I` and `L` as 1, hyphens ignored. `list` is the
+/// command that lists them, `routes` or `sources`.
+fn pick(items: &[(&str, &str)], query: &str, list: &str) -> Result<String> {
     let q = query.to_lowercase();
     let by_name: Vec<&(&str, &str)> = items.iter().filter(|i| i.0.to_lowercase() == q).collect();
     let found = match by_name[..] {
@@ -1089,11 +979,11 @@ fn pick(items: &[(&str, &str)], query: &str, what: &str, list: &str) -> Result<S
     };
     match found[..] {
         [i] => Ok(i.1.to_owned()),
-        [] => anyhow::bail!("no {what} {query:?}; see `orpheusctl {list}`"),
-        _ => anyhow::bail!(
-            "{query:?} matches {list} {}; give the ID",
-            found.iter().map(|i| i.1).collect::<Vec<_>>().join(", ")
-        ),
+        [] => anyhow::bail!(t!("pick-none", list = list, query = query)),
+        _ => {
+            let ids = found.iter().map(|i| i.1).collect::<Vec<_>>().join(", ");
+            anyhow::bail!(t!("pick-many", query = query, list = list, ids = ids))
+        }
     }
 }
 
@@ -1102,12 +992,12 @@ fn pick(items: &[(&str, &str)], query: &str, what: &str, list: &str) -> Result<S
 fn wire_ends(base: &str, from: &str, output: &str) -> Result<serde_json::Value> {
     let sources: Vec<SourceEntry> =
         serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/sources"))?)
-            .context("reading the sources")?;
+            .with_context(|| t!("reading", what = "sources"))?;
     let inputs: Vec<InputEntry> =
         serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/inputs"))?)
-            .context("reading the inputs")?;
+            .with_context(|| t!("reading", what = "inputs"))?;
     let outputs: Vec<Output> = serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/outputs"))?)
-        .context("reading the outputs")?;
+        .with_context(|| t!("reading", what = "outputs"))?;
     let output = &find_output(&outputs, output)?.name;
     // Receivers' streams are wired by their sources.
     let devices: Vec<&InputEntry> = inputs.iter().filter(|i| i.kind == "device").collect();
@@ -1134,18 +1024,14 @@ fn wire_ends(base: &str, from: &str, output: &str) -> Result<serde_json::Value> 
                     i.name.to_lowercase().contains(&q) || i.description.to_lowercase().contains(&q)
                 })
                 .collect();
-            match (pick(&ids, from, "source", "sources"), &by_part[..]) {
+            match (pick(&ids, from, "sources"), &by_part[..]) {
                 (Ok(id), []) => serde_json::json!({ "source": id }),
                 (Err(_), [i]) => serde_json::json!({ "input": i.name }),
-                (Err(_), []) => anyhow::bail!(
-                    "no source or input {from:?}; see `orpheusctl sources` and `orpheusctl inputs`"
-                ),
-                _ => {
-                    anyhow::bail!("{from:?} names more than one source or input; be more specific")
-                }
+                (Err(_), []) => anyhow::bail!(t!("no-source-or-input", from = from)),
+                _ => anyhow::bail!(t!("from-ambiguous", from = from)),
             }
         }
-        _ => anyhow::bail!("{from:?} names more than one source or input; give a source's ID"),
+        _ => anyhow::bail!(t!("from-ambiguous-id", from = from)),
     };
     let mut body = found;
     body["output"] = serde_json::Value::String(output.clone());
@@ -1161,7 +1047,7 @@ fn parse_pair(text: &str) -> Result<serde_json::Value> {
                 .trim_end_matches("dB")
                 .trim()
                 .parse()
-                .with_context(|| format!("{text:?}: {db:?} is no gain in dB"))?;
+                .with_context(|| t!("bad-gain-in-pair", pair = text, db = db))?;
             (pair, Some(db))
         }
         None => (text, None),
@@ -1169,7 +1055,7 @@ fn parse_pair(text: &str) -> Result<serde_json::Value> {
     let (to, from) = pair
         .split_once('=')
         .filter(|(t, f)| !t.trim().is_empty() && !f.trim().is_empty())
-        .with_context(|| format!("{text:?} is not OUT=IN, e.g. L=R, 1=U03 or L=C@-3"))?;
+        .with_context(|| t!("bad-pair", pair = text))?;
     let channel = |c: &str| {
         let c = c.trim();
         match c.parse::<usize>() {
@@ -1187,9 +1073,9 @@ fn parse_pair(text: &str) -> Result<serde_json::Value> {
 /// A gain for people: `-3 dB`, `+2.5 dB`.
 fn db_text(db: f32) -> String {
     if db > 0.0 {
-        format!("+{db} dB")
+        format!("+{} dB", num(db.to_string()))
     } else {
-        format!("{db} dB")
+        format!("{} dB", num(db.to_string()))
     }
 }
 
@@ -1235,15 +1121,16 @@ const FOLDED: &str = "⤵";
 
 /// A mix in words, `downmix 51 → ST`, with what a wire leaves out.
 fn mix_text(mix: &str, from: Option<&Layout>, to: Option<&Layout>, dropped: &[usize]) -> String {
-    let mut text = match (from, to) {
-        (Some(f), Some(t)) => format!("{mix} {} → {}", short(f), short(t)),
-        _ => mix.to_owned(),
+    let mix = t!("mix", mix = mix);
+    let text = match (from, to) {
+        (Some(f), Some(to)) => t!("mix-layouts", mix = mix, from = short(f), to = short(to)),
+        _ => mix,
     };
-    if !dropped.is_empty() {
-        let names: Vec<String> = dropped.iter().map(|&c| channel_name(from, c)).collect();
-        let _ = write!(text, ", {} left out", names.join(" "));
+    if dropped.is_empty() {
+        return text;
     }
-    text
+    let names: Vec<String> = dropped.iter().map(|&c| channel_name(from, c)).collect();
+    t!("mix-left-out", mix = text, channels = names.join(" "))
 }
 
 impl WireEntry {
@@ -1251,9 +1138,9 @@ impl WireEntry {
     fn gain_text(&self) -> Option<String> {
         match (self.gain_db, self.mute) {
             (0.0, false) => None,
-            (0.0, true) => Some("muted".into()),
+            (0.0, true) => Some(t!("muted")),
             (db, false) => Some(db_text(db)),
-            (db, true) => Some(format!("{}, muted", db_text(db))),
+            (db, true) => Some(t!("gain-muted", gain = db_text(db))),
         }
     }
 
@@ -1284,13 +1171,13 @@ fn channel_name(layout: Option<&Layout>, n: usize) -> String {
 fn waiting(w: &WireEntry) -> String {
     if w.from_channels.is_none() {
         match w.source {
-            Some(_) => format!("{} plays nowhere", w.from_name),
-            None => format!("{} is missing", w.from_name),
+            Some(_) => t!("plays-nowhere", name = &w.from_name),
+            None => t!("is-missing", name = &w.from_name),
         }
     } else if w.output_channels.is_none() {
-        format!("{} is missing", w.output_name)
+        t!("is-missing", name = &w.output_name)
     } else {
-        "no channels match".into()
+        t!("no-channels-match")
     }
 }
 
@@ -1305,7 +1192,7 @@ fn render_wire_set(w: &WireEntry, p: Paint) -> String {
         let _ = writeln!(
             o,
             ": {}",
-            p.level(Level::Warn, &format!("waiting, {}", waiting(w)))
+            p.level(Level::Warn, &t!("waiting-because", why = waiting(w)))
         );
         return o;
     }
@@ -1323,7 +1210,7 @@ fn render_wire_set(w: &WireEntry, p: Paint) -> String {
                 if own == 0.0 {
                     String::new()
                 } else {
-                    format!("@{own:+}")
+                    format!("@{}", num(format!("{own:+}")))
                 }
             )
         })
@@ -1351,8 +1238,10 @@ fn patch(base: &str, json: bool, p: Paint) -> Result<String> {
         });
         return Ok(format!("{both}\n"));
     }
-    let wires: Vec<WireEntry> = serde_json::from_str(&wires).context("reading the wires")?;
-    let levels: Levels = serde_json::from_str(&levels).context("reading the levels")?;
+    let wires: Vec<WireEntry> =
+        serde_json::from_str(&wires).with_context(|| t!("reading", what = "wires"))?;
+    let levels: Levels =
+        serde_json::from_str(&levels).with_context(|| t!("reading", what = "levels"))?;
     Ok(render_patch(&wires, Some(&levels), p))
 }
 
@@ -1432,7 +1321,10 @@ const LEVEL_WIDTH: usize = 10;
 /// right-aligned to `width`.
 fn peak_text(level: Option<&LevelEntry>, width: usize, p: Paint) -> String {
     let peak = level.and_then(|l| l.peak_db);
-    let text = peak.map_or_else(|| "silent".to_owned(), |db| format!("{db:.1} dBFS"));
+    let text = peak.map_or_else(
+        || t!("silent"),
+        |db| format!("{} dBFS", num(format!("{db:.1}"))),
+    );
     let text = format!("{text:>width$}");
     match peak {
         Some(db) if db >= 0.0 => p.level(Level::Bad, &text),
@@ -1444,7 +1336,7 @@ fn peak_text(level: Option<&LevelEntry>, width: usize, p: Paint) -> String {
 fn render_patch(wires: &[WireEntry], levels: Option<&Levels>, p: Paint) -> String {
     let mut o = String::new();
     if wires.is_empty() {
-        let _ = writeln!(o, "{}", p.mark(Level::Off, "no wires"));
+        let _ = writeln!(o, "{}", p.mark(Level::Off, &t!("no-wires")));
         return o;
     }
     let mut outputs: Vec<(&str, &str)> = Vec::new();
@@ -1461,7 +1353,7 @@ fn render_patch(wires: &[WireEntry], levels: Option<&Levels>, p: Paint) -> Strin
         let clipped = output
             .and_then(|o| o.clipped_secs_ago)
             .map(|secs| {
-                let text = format!("clipped {secs:.0} s ago");
+                let text = t!("clipped-ago", secs = format!("{secs:.0}"));
                 format!("  {}", p.level(Level::Bad, &text))
             })
             .unwrap_or_default();
@@ -1487,7 +1379,7 @@ fn render_patch(wires: &[WireEntry], levels: Option<&Levels>, p: Paint) -> Strin
                 .flat_map(|w| {
                     w.links.iter().filter(|l| l.to == *c).map(move |l| {
                         let gain = if w.mute {
-                            " muted".to_owned()
+                            format!(" {}", t!("muted"))
                         } else if l.gain_db != 0.0 {
                             format!(" {}", db_text(l.gain_db))
                         } else {
@@ -1505,7 +1397,7 @@ fn render_patch(wires: &[WireEntry], levels: Option<&Levels>, p: Paint) -> Strin
                         if l.linked {
                             text
                         } else {
-                            p.level(Level::Warn, &format!("{text} (linking)"))
+                            p.level(Level::Warn, &t!("linking", wire = text))
                         }
                     })
                 })
@@ -1533,10 +1425,10 @@ fn render_patch(wires: &[WireEntry], levels: Option<&Levels>, p: Paint) -> Strin
         if !outputs.is_empty() {
             o.push('\n');
         }
-        let _ = writeln!(o, "{}", p.bold("Waiting"));
+        let _ = writeln!(o, "{}", p.bold(&t!("heading-waiting")));
         for w in idle {
             let channels = match &w.channels {
-                None => "all".to_owned(),
+                None => t!("all-channels"),
                 Some(pairs) => pairs
                     .iter()
                     .map(|p| {
@@ -1581,7 +1473,7 @@ impl Volume {
     /// As mixers show it: the loudest channel, on a cubic scale.
     fn percent(&self) -> String {
         if self.mute {
-            return "muted".into();
+            return t!("muted");
         }
         let max = self.channels.iter().copied().fold(0.0f32, f32::max);
         format!("{:.0}%", max.cbrt() * 100.0)
@@ -1592,7 +1484,7 @@ impl Volume {
 fn render_sources(sources: &[SourceEntry], outputs: &[Output], p: Paint, now: u64) -> String {
     let mut o = String::new();
     if sources.is_empty() {
-        let _ = writeln!(o, "{}", p.mark(Level::Off, "no sources"));
+        let _ = writeln!(o, "{}", p.mark(Level::Off, &t!("no-sources")));
         return o;
     }
     let rows: Vec<[String; 6]> = sources
@@ -1603,17 +1495,13 @@ fn render_sources(sources: &[SourceEntry], outputs: &[Output], p: Paint, now: u6
                     .iter()
                     .find(|o| o.name == *name)
                     .map_or(name.clone(), |o| o.description.clone()),
-                None => "default".into(),
+                None => t!("default"),
             };
             let state = match s.receiver {
-                Some(r) => p.mark(Level::Good, &format!("playing on receiver {r}")),
+                Some(r) => p.mark(Level::Good, &t!("playing-on-receiver", receiver = r)),
                 None => {
-                    let ago = match now.saturating_sub(s.last_used) / 86_400 {
-                        0 => "today".to_owned(),
-                        1 => "yesterday".to_owned(),
-                        d => format!("{d} days ago"),
-                    };
-                    p.mark(Level::Off, &format!("last played {ago}"))
+                    let ago = t!("ago", days = now.saturating_sub(s.last_used) / 86_400);
+                    p.mark(Level::Off, &t!("last-played", ago = ago))
                 }
             };
             [
@@ -1623,12 +1511,19 @@ fn render_sources(sources: &[SourceEntry], outputs: &[Output], p: Paint, now: u6
                 s.volume.as_ref().map_or("100%".into(), Volume::percent),
                 s.layout
                     .as_ref()
-                    .map_or("as sent".into(), ToString::to_string),
+                    .map_or_else(|| t!("as-sent"), ToString::to_string),
                 state,
             ]
         })
         .collect();
-    let header = ["NAME", "ID", "OUTPUT", "VOLUME", "LAYOUT", "STATE"];
+    let header = [
+        t!("col-name"),
+        t!("col-id"),
+        t!("col-output"),
+        t!("col-volume"),
+        t!("col-layout"),
+        t!("col-state"),
+    ];
     table(
         &mut o,
         p,
@@ -1650,7 +1545,7 @@ fn unix_now() -> u64 {
 fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
     let mut o = String::new();
     if routes.is_empty() {
-        let _ = writeln!(o, "{}", p.mark(Level::Off, "no routes"));
+        let _ = writeln!(o, "{}", p.mark(Level::Off, &t!("no-routes")));
         return o;
     }
     let rows: Vec<[String; 6]> = routes
@@ -1658,16 +1553,11 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
         .map(|r| {
             let state = match (r.active, r.last_used) {
                 (true, _) => route_state(p, r.state.as_deref()),
-                (false, Some(t)) => {
-                    let days = now.saturating_sub(t) / 86_400;
-                    let ago = match days {
-                        0 => "today".to_owned(),
-                        1 => "yesterday".to_owned(),
-                        d => format!("{d} days ago"),
-                    };
-                    p.mark(Level::Off, &format!("remembered, last used {ago}"))
+                (false, Some(used)) => {
+                    let ago = t!("ago", days = now.saturating_sub(used) / 86_400);
+                    p.mark(Level::Off, &t!("remembered-last-used", ago = ago))
                 }
-                (false, None) => p.mark(Level::Off, "remembered"),
+                (false, None) => p.mark(Level::Off, &t!("remembered")),
             };
             [
                 r.name.clone(),
@@ -1679,7 +1569,14 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
             ]
         })
         .collect();
-    let header = ["NAME", "ID", "PEER", "CHANNELS", "PRIORITY", "STATE"];
+    let header = [
+        t!("col-name"),
+        t!("col-id"),
+        t!("col-peer"),
+        t!("col-channels"),
+        t!("col-priority"),
+        t!("col-state"),
+    ];
     table(&mut o, p, header, [false; 6], &rows);
     o
 }
@@ -1687,13 +1584,13 @@ fn render_routes(routes: &[RouteEntry], p: Paint, now: u64) -> String {
 /// How a running route stands, marked.
 fn route_state(p: Paint, state: Option<&str>) -> String {
     match state {
-        None | Some("connected") => p.mark(Level::Good, "connected"),
-        Some("idle") => p.mark(Level::Off, "idle, claims a receiver when audio plays"),
-        Some("busy") => p.mark(Level::Warn, "waiting for a free receiver"),
-        Some("incompatible") => p.mark(Level::Warn, "peer can't play this stream"),
-        Some("offline") => p.mark(Level::Off, "peer offline"),
-        Some("unreachable") => p.mark(Level::Warn, "peer unreachable"),
-        Some("disconnected") => p.mark(Level::Warn, "disconnected, paused"),
+        None | Some("connected") => p.mark(Level::Good, &t!("route-connected")),
+        Some("idle") => p.mark(Level::Off, &t!("route-idle")),
+        Some("busy") => p.mark(Level::Warn, &t!("route-busy")),
+        Some("incompatible") => p.mark(Level::Warn, &t!("route-incompatible")),
+        Some("offline") => p.mark(Level::Off, &t!("route-offline")),
+        Some("unreachable") => p.mark(Level::Warn, &t!("route-unreachable")),
+        Some("disconnected") => p.mark(Level::Warn, &t!("route-disconnected")),
         Some(s) => p.mark(Level::Off, s),
     }
 }
@@ -1701,18 +1598,18 @@ fn route_state(p: Paint, state: Option<&str>) -> String {
 /// The device ID of the Orpheus node `query` names: by ID, alias or name.
 fn find_node(base: &str, query: &str) -> Result<String> {
     let nodes: Vec<Node> = serde_json::from_str(&get(&format!("{base}/x-orpheus/v1/nodes"))?)
-        .context("reading the nodes")?;
+        .with_context(|| t!("reading", what = "nodes"))?;
     let is = |s: &Option<String>| s.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(query));
     let found = nodes
         .iter()
         .find(|n| is(&n.id))
         .or_else(|| nodes.iter().find(|n| is(&n.alias)))
         .or_else(|| nodes.iter().find(|n| n.name.eq_ignore_ascii_case(query)))
-        .with_context(|| format!("no node {query:?}; see `orpheusctl nodes`"))?;
+        .with_context(|| t!("no-node", query = query))?;
     found
         .id
         .clone()
-        .with_context(|| format!("{query} is not an Orpheus node"))
+        .with_context(|| t!("not-orpheus", query = query))
 }
 
 /// Changes another node's alias or pin.
@@ -1721,7 +1618,7 @@ fn change_node(base: &str, id: &str, body: serde_json::Value) -> Result<()> {
     let r = agent()
         .patch(&url)
         .send_json(body)
-        .with_context(|| format!("changing node {id} via {url}"))?;
+        .with_context(|| t!("changing-node-via", id = id, url = &url))?;
     reply(r).map(drop)
 }
 
@@ -1744,7 +1641,7 @@ fn change_settings(base: &str, patch: serde_json::Value) -> Result<String> {
         .patch(&url)
         .content_type("application/merge-patch+json")
         .send(patch.to_string())
-        .with_context(|| format!("changing settings via {url}"))?;
+        .with_context(|| t!("changing-settings-via", url = &url))?;
     reply(r)
 }
 
@@ -1752,7 +1649,8 @@ fn print_settings(raw: &str, json: bool) -> Result<()> {
     if json {
         println!("{}", raw.trim_end());
     } else {
-        let v: serde_json::Value = serde_json::from_str(raw).context("reading the settings")?;
+        let v: serde_json::Value =
+            serde_json::from_str(raw).with_context(|| t!("reading", what = "settings"))?;
         print!("{}", render_settings(&v, Paint::detect()));
     }
     Ok(())
@@ -1786,42 +1684,40 @@ struct Refused {
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "the node refused: {} (HTTP {})",
-            self.message, self.status
-        )
+        let refused = t!("refused", message = &self.message, status = self.status);
+        f.write_str(&refused)
     }
 }
 
 impl std::error::Error for Refused {}
 
-/// Why the node at `base` could not be reached, if that is what `e` means.
-fn unreachable(e: &anyhow::Error) -> Option<String> {
+/// Why the node at `base` could not be reached, if that is what `e` means:
+/// the ID of a `reason-…` text.
+fn unreachable(e: &anyhow::Error) -> Option<&'static str> {
     use std::io::ErrorKind;
     e.chain().find_map(|c| {
         let io = match c.downcast_ref::<ureq::Error>() {
             Some(ureq::Error::Io(io)) => io,
-            Some(ureq::Error::HostNotFound) => return Some("host not found".into()),
-            Some(ureq::Error::ConnectionFailed) => return Some("connection failed".into()),
-            Some(ureq::Error::Timeout(_)) => return Some("timed out".into()),
+            Some(ureq::Error::HostNotFound) => return Some("reason-host-not-found"),
+            Some(ureq::Error::ConnectionFailed) => return Some("reason-connection-failed"),
+            Some(ureq::Error::Timeout(_)) => return Some("reason-timed-out"),
             Some(_) => return None,
             // From the event stream.
             None => c.downcast_ref::<std::io::Error>()?,
         };
         let reason = match io.kind() {
-            ErrorKind::ConnectionRefused => "connection refused",
-            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => "connection reset",
-            ErrorKind::HostUnreachable => "host unreachable",
-            ErrorKind::NetworkUnreachable => "network unreachable",
-            ErrorKind::TimedOut => "timed out",
-            ErrorKind::AddrNotAvailable => "address not available",
+            ErrorKind::ConnectionRefused => "reason-connection-refused",
+            ErrorKind::ConnectionReset | ErrorKind::ConnectionAborted => "reason-connection-reset",
+            ErrorKind::HostUnreachable => "reason-host-unreachable",
+            ErrorKind::NetworkUnreachable => "reason-network-unreachable",
+            ErrorKind::TimedOut => "reason-timed-out",
+            ErrorKind::AddrNotAvailable => "reason-address-not-available",
             // Name resolution has no kind of its own.
-            _ if io.to_string().contains("lookup address") => "host not found",
-            ErrorKind::NotFound => "host not found",
+            _ if io.to_string().contains("lookup address") => "reason-host-not-found",
+            ErrorKind::NotFound => "reason-host-not-found",
             _ => return None,
         };
-        Some(reason.into())
+        Some(reason)
     })
 }
 
@@ -1867,16 +1763,19 @@ fn is_local(base: &str) -> bool {
 fn render_error(e: &anyhow::Error, base: &str, p: Paint) -> String {
     match unreachable(e) {
         // Nothing listens here, so orpheusd is not running.
-        Some(reason) if reason == "connection refused" && is_local(base) => format!(
+        Some("reason-connection-refused") if is_local(base) => format!(
             "{}\n  {}\n",
-            p.mark(Level::Bad, "orpheusd is not running on this machine"),
-            p.dim("Start it with orpheusd, or choose a node with --node or ORPHEUS_NODE."),
+            p.mark(Level::Bad, &t!("not-running")),
+            p.dim(&t!("not-running-hint")),
         ),
-        Some(reason) => format!(
-            "{}\n  {}\n",
-            p.mark(Level::Bad, &format!("no Orpheus node at {base}: {reason}")),
-            p.dim("Is orpheusd running there? Choose a node with --node or ORPHEUS_NODE."),
-        ),
+        Some(reason) => {
+            let reason = i18n::texts().get(reason).unwrap_or_default();
+            format!(
+                "{}\n  {}\n",
+                p.mark(Level::Bad, &t!("no-node-at", base = base, reason = reason)),
+                p.dim(&t!("no-node-at-hint")),
+            )
+        }
         None => format!("{}\n", p.mark(Level::Bad, &format!("{e:#}"))),
     }
 }
@@ -1901,7 +1800,7 @@ fn get(url: &str) -> Result<String> {
         .call()
         .map_err(anyhow::Error::from)
         .and_then(reply)
-        .with_context(|| format!("querying {url}"))
+        .with_context(|| t!("querying", url = url))
 }
 
 /// The output `query` names: by name, by description, or by a part of
@@ -1920,15 +1819,15 @@ fn find_output<'a>(outputs: &'a [Output], query: &str) -> Result<&'a Output> {
         .collect();
     match found[..] {
         [o] => Ok(o),
-        [] => anyhow::bail!("no output matches {query:?}; see `orpheusctl outputs`"),
-        _ => anyhow::bail!(
-            "{query:?} matches {}; be more specific",
-            found
+        [] => anyhow::bail!(t!("no-output", query = query)),
+        _ => {
+            let outputs = found
                 .iter()
                 .map(|o| format!("{:?}", o.description))
                 .collect::<Vec<_>>()
-                .join(", ")
-        ),
+                .join(", ");
+            anyhow::bail!(t!("output-ambiguous", query = query, outputs = outputs))
+        }
     }
 }
 
@@ -1955,7 +1854,8 @@ fn post(url: &str, body: impl Serialize) -> Result<String> {
 fn status(base: &str) -> Result<(String, Status)> {
     let url = format!("{base}/x-orpheus/v1/status");
     let raw = get(&url)?;
-    let s = serde_json::from_str(&raw).with_context(|| format!("reading status from {url}"))?;
+    let s = serde_json::from_str(&raw)
+        .with_context(|| t!("reading-from", what = "status", url = &url))?;
     Ok((raw, s))
 }
 
@@ -2049,12 +1949,14 @@ fn follow(base: &str, interval: Duration, paint: Paint, screen: &mut Screen) -> 
     loop {
         let quiet = match socket.read() {
             Ok(tungstenite::Message::Text(text)) => {
-                let event: Event = serde_json::from_str(&text).context("reading an event")?;
+                let event: Event =
+                    serde_json::from_str(&text).with_context(|| t!("reading", what = "event"))?;
                 if screen.json {
                     screen.show(&format!("{}\n", event.data))?;
                     continue;
                 }
-                let s: Status = serde_json::from_value(event.data).context("reading the status")?;
+                let s: Status = serde_json::from_value(event.data)
+                    .with_context(|| t!("reading", what = "status"))?;
                 let sample = Some((Instant::now(), s));
                 if prev.is_none() {
                     prev = sample;
@@ -2063,7 +1965,7 @@ fn follow(base: &str, interval: Duration, paint: Paint, screen: &mut Screen) -> 
                 }
                 false
             }
-            Ok(tungstenite::Message::Close(_)) => anyhow::bail!("the node closed the connection"),
+            Ok(tungstenite::Message::Close(_)) => anyhow::bail!(t!("node-closed")),
             Ok(_) => continue,
             Err(tungstenite::Error::Io(e))
                 if matches!(
@@ -2077,8 +1979,8 @@ fn follow(base: &str, interval: Duration, paint: Paint, screen: &mut Screen) -> 
                 tungstenite::Error::ConnectionClosed
                 | tungstenite::Error::AlreadyClosed
                 | tungstenite::Error::Protocol(_),
-            ) => anyhow::bail!("the node closed the connection"),
-            Err(e) => return Err(anyhow::Error::new(e).context("reading events")),
+            ) => anyhow::bail!(t!("node-closed")),
+            Err(e) => return Err(anyhow::Error::new(e).context(t!("reading", what = "events"))),
         };
         if screen.json {
             continue;
@@ -2118,19 +2020,19 @@ fn events(
     use std::net::{TcpStream, ToSocketAddrs};
     let uri: ureq::http::Uri = base
         .parse()
-        .with_context(|| format!("bad node URL {base}"))?;
+        .with_context(|| t!("bad-node-url", base = base))?;
     anyhow::ensure!(
         uri.scheme_str() == Some("http"),
-        "watching needs an http:// node URL, not {base}"
+        t!("watch-needs-http", base = base)
     );
     let host = uri.host().unwrap_or_default();
     let port = uri.port_u16().unwrap_or(80);
     let addr = (host.trim_start_matches('[').trim_end_matches(']'), port)
         .to_socket_addrs()
         .and_then(|mut a| a.next().ok_or_else(|| std::io::ErrorKind::NotFound.into()))
-        .with_context(|| format!("looking up {host}"))?;
+        .with_context(|| t!("looking-up", host = host))?;
     let stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .with_context(|| format!("connecting to {base}"))?;
+        .with_context(|| t!("connecting", base = base))?;
     stream.set_read_timeout(Some(CONNECT_TIMEOUT))?;
     let url = format!("ws://{host}:{port}/x-orpheus/v1/events?topics={topics}");
     let (socket, _) = tungstenite::client(url.as_str(), stream)
@@ -2145,9 +2047,9 @@ fn events(
             }
             .into(),
             tungstenite::HandshakeError::Failure(e) => anyhow::Error::new(e),
-            tungstenite::HandshakeError::Interrupted(_) => anyhow::anyhow!("timed out"),
+            tungstenite::HandshakeError::Interrupted(_) => anyhow::anyhow!(t!("reason-timed-out")),
         })
-        .with_context(|| format!("opening {url}"))?;
+        .with_context(|| t!("opening", url = &url))?;
     socket.get_ref().set_read_timeout(Some(timeout))?;
     Ok(socket)
 }
@@ -2162,18 +2064,19 @@ enum Counts {
 }
 
 impl Counts {
-    /// The number, and whether the name after it is singular.
-    fn show(self, n: u64) -> (String, bool) {
+    /// The number as shown, and as it chooses the plural of the name
+    /// after it.
+    fn show(self, n: u64) -> (String, f64) {
         match self {
-            Counts::Total => (n.to_string(), n == 1),
+            Counts::Total => (n.to_string(), n as f64),
             Counts::Rate(secs) => {
                 let r = n as f64 / secs;
                 let text = if r >= 10.0 || r.fract() == 0.0 {
                     format!("{r:.0}")
                 } else {
-                    format!("{r:.1}")
+                    num(format!("{r:.1}"))
                 };
-                (text, r == 1.0)
+                (text, r)
             }
         }
     }
@@ -2190,8 +2093,46 @@ impl Counts {
     }
 }
 
-/// Width of the key column, so that values line up under section headlines.
-const KEY: usize = 11;
+/// The keys of the status, by their text IDs.
+const KEYS: [&str; 23] = [
+    "key-error",
+    "key-interface",
+    "key-identity",
+    "key-state",
+    "key-grandmaster",
+    "key-offset",
+    "key-delay",
+    "key-frequency",
+    "key-steps",
+    "key-listen",
+    "key-channels",
+    "key-output",
+    "key-mix",
+    "key-priority",
+    "key-link-offset",
+    "key-level",
+    "key-margin",
+    "key-jitter",
+    "key-packets",
+    "key-ignored",
+    "key-buffer",
+    "key-asrc",
+    "key-problems",
+];
+
+/// Width of the key column, so that values line up under section
+/// headlines: that of the longest key in the user's language.
+fn key_width() -> usize {
+    static WIDTH: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        let texts = i18n::texts();
+        KEYS.iter()
+            .filter_map(|id| texts.get(id))
+            .map(|k| k.chars().count())
+            .max()
+            .unwrap_or(0)
+    });
+    *WIDTH
+}
 
 /// ANSI styling, on only when the output is a terminal and `NO_COLOR` is unset.
 #[derive(Clone, Copy)]
@@ -2257,7 +2198,7 @@ impl Paint {
 }
 
 fn heading(o: &mut String, p: Paint, title: &str, mark: Option<String>) {
-    let title = format!("{title:<w$}", w = KEY + 4);
+    let title = format!("{title:<w$}", w = key_width() + 4);
     let line = match mark {
         Some(m) => format!("{}{m}", p.bold(&title)),
         None => p.bold(title.trim_end()),
@@ -2265,36 +2206,48 @@ fn heading(o: &mut String, p: Paint, title: &str, mark: Option<String>) {
     let _ = writeln!(o, "\n{line}");
 }
 
+/// A row of the status: the key by its text ID, one of [`KEYS`].
 fn row(o: &mut String, p: Paint, key: &str, value: &str) {
-    let _ = writeln!(o, "  {}  {value}", p.dim(&format!("{key:<KEY$}")));
+    let key = i18n::texts().get(key).unwrap_or_else(|| key.to_owned());
+    let _ = writeln!(
+        o,
+        "  {}  {value}",
+        p.dim(&format!("{key:<w$}", w = key_width()))
+    );
 }
 
 fn us(ns: Option<i64>) -> String {
-    ns.map_or("-".into(), |n| format!("{:.1} µs", n as f64 / 1000.0))
+    ns.map_or("-".into(), |n| {
+        format!("{} µs", num(format!("{:.1}", n as f64 / 1000.0)))
+    })
 }
 
-/// The non-zero counters, highlighted, or "none".
-fn problems(p: Paint, c: Counts, counts: &[(u64, &str, &str)]) -> String {
+/// The non-zero counters, highlighted, or "none". Each is the ID of a
+/// `count-…` text.
+fn problems(p: Paint, c: Counts, counts: &[(u64, &'static str)]) -> String {
     let found: Vec<String> = counts
         .iter()
-        .filter(|(n, ..)| *n > 0)
-        .map(|&(n, one, many)| {
-            let (num, single) = c.show(n);
-            format!("{num} {}{}", if single { one } else { many }, c.unit())
+        .filter(|(n, _)| *n > 0)
+        .map(|&(n, id)| {
+            let (shown, count) = c.show(n);
+            let text = orpheus_i18n::Text::new(id)
+                .arg("n", shown)
+                .arg("count", orpheus_i18n::Arg::Count(count));
+            format!("{}{}", i18n::texts().text(&text), c.unit())
         })
         .collect();
     if found.is_empty() {
-        "none".into()
+        t!("none")
     } else {
         p.level(Level::Warn, &found.join(", "))
     }
 }
 
-fn buffer_counts(b: &Buffer) -> [(u64, &'static str, &'static str); 3] {
+fn buffer_counts(b: &Buffer) -> [(u64, &'static str); 3] {
     [
-        (b.underruns, "underrun", "underruns"),
-        (b.overruns, "overrun", "overruns"),
-        (b.resyncs, "resync", "resyncs"),
+        (b.underruns, "count-underrun"),
+        (b.overruns, "count-overrun"),
+        (b.resyncs, "count-resync"),
     ]
 }
 
@@ -2307,11 +2260,11 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
         p.dim(&format!("{}  orpheusd {}", s.id, s.version))
     );
     if !s.audio {
-        let mark = p.mark(Level::Bad, "no audio system, no streams");
-        heading(&mut o, p, "Audio", Some(mark));
+        let mark = p.mark(Level::Bad, &t!("no-audio"));
+        heading(&mut o, p, &t!("heading-audio"), Some(mark));
     }
     if !s.warnings.is_empty() {
-        heading(&mut o, p, "Warnings", None);
+        heading(&mut o, p, &t!("heading-warnings"), None);
         for w in &s.warnings {
             let _ = writeln!(o, "  {}", p.mark(Level::Warn, &w.message));
         }
@@ -2320,11 +2273,11 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
         Some(ClockInfo { ptp: Some(t), .. }) => clock(&mut o, p, t),
         Some(c) => {
             let source = match c.source.as_str() {
-                "system" => "system clock",
-                other => other,
+                "system" => t!("system-clock"),
+                other => other.to_owned(),
             };
-            let mark = p.mark(Level::Warn, source);
-            heading(&mut o, p, "Clock", Some(mark));
+            let mark = p.mark(Level::Warn, &source);
+            heading(&mut o, p, &t!("heading-clock"), Some(mark));
         }
         None => {}
     }
@@ -2332,9 +2285,14 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
         receiver(&mut o, p, c, r, s.accept.as_deref());
     }
     if let Some(l) = &s.loopback {
-        heading(&mut o, p, "Loopback", None);
-        row(&mut o, p, "buffer", &format!("{} frames", l.level_frames));
-        row(&mut o, p, "problems", &problems(p, c, &buffer_counts(l)));
+        heading(&mut o, p, &t!("heading-loopback"), None);
+        row(&mut o, p, "key-buffer", &t!("frames", n = l.level_frames));
+        row(
+            &mut o,
+            p,
+            "key-problems",
+            &problems(p, c, &buffer_counts(l)),
+        );
     }
     senders(&mut o, p, c, &s.routes);
     o
@@ -2343,42 +2301,48 @@ fn render(s: &Status, p: Paint, c: Counts) -> String {
 fn clock(o: &mut String, p: Paint, t: &Ptp) {
     if !t.running {
         let mark = if t.holdover {
-            p.mark(Level::Bad, "PTP stopped, holding over")
+            p.mark(Level::Bad, &t!("ptp-holding-over"))
         } else {
-            p.mark(Level::Bad, "PTP not running, system clock")
+            p.mark(Level::Bad, &t!("ptp-not-running"))
         };
-        heading(o, p, "Clock", Some(mark));
-        row(o, p, "error", t.error.as_deref().unwrap_or("-"));
+        heading(o, p, &t!("heading-clock"), Some(mark));
+        row(o, p, "key-error", t.error.as_deref().unwrap_or("-"));
         if !t.interface.is_empty() {
-            row(o, p, "interface", &t.interface);
+            row(o, p, "key-interface", &t.interface);
         }
-        row(o, p, "frequency", &format!("{:+.2} ppm", t.frequency_ppm));
-        row(o, p, "steps", &t.steps.to_string());
+        row(o, p, "key-frequency", &ppm(t.frequency_ppm, 2));
+        row(o, p, "key-steps", &t.steps.to_string());
         return;
     }
+    let state = t!("ptp-state", state = &t.state);
     let mark = match t.state.as_str() {
-        "faulty" | "disabled" => p.mark(Level::Bad, &format!("PTP, {}", t.state)),
-        _ if t.settled => p.mark(Level::Good, "PTP, settled"),
-        _ => p.mark(Level::Warn, "PTP, settling"),
+        "faulty" | "disabled" => p.mark(Level::Bad, &t!("ptp-heading-state", state = &state)),
+        _ if t.settled => p.mark(Level::Good, &t!("ptp-settled")),
+        _ => p.mark(Level::Warn, &t!("ptp-settling")),
     };
-    heading(o, p, "Clock", Some(mark));
+    heading(o, p, &t!("heading-clock"), Some(mark));
     let transport = match t.transport.as_str() {
         "ipv4" => "IPv4",
         "ipv6" => "IPv6",
         other => other,
     };
-    row(o, p, "interface", &format!("{} ({transport})", t.interface));
-    row(o, p, "identity", &t.identity);
-    row(o, p, "state", &t.state.replace('_', " "));
+    row(
+        o,
+        p,
+        "key-interface",
+        &format!("{} ({transport})", t.interface),
+    );
+    row(o, p, "key-identity", &t.identity);
+    row(o, p, "key-state", &state);
     let gm = if t.grandmaster == t.identity {
-        "this node"
+        t!("this-node")
     } else {
-        &t.grandmaster
+        t.grandmaster.clone()
     };
-    row(o, p, "grandmaster", gm);
-    row(o, p, "offset", &us(t.offset_ns));
-    row(o, p, "delay", &us(t.mean_delay_ns));
-    row(o, p, "frequency", &format!("{:+.2} ppm", t.frequency_ppm));
+    row(o, p, "key-grandmaster", &gm);
+    row(o, p, "key-offset", &us(t.offset_ns));
+    row(o, p, "key-delay", &us(t.mean_delay_ns));
+    row(o, p, "key-frequency", &ppm(t.frequency_ppm, 2));
     // One or two steps after a start are normal; more mean the clock jumps.
     let steps = t.steps.to_string();
     let steps = if t.steps > 2 {
@@ -2386,69 +2350,82 @@ fn clock(o: &mut String, p: Paint, t: &Ptp) {
     } else {
         steps
     };
-    row(o, p, "steps", &steps);
+    row(o, p, "key-steps", &steps);
+}
+
+/// A rate deviation, `+1.25 ppm`.
+fn ppm(ppm: f64, places: usize) -> String {
+    format!("{} ppm", num(format!("{ppm:+.places$}")))
 }
 
 fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&str>) {
-    let title = format!("Receiver {}", r.id);
+    let title = t!("receiver-title", id = r.id);
     let Some(st) = &r.stream else {
         let mark = match &r.sender {
-            Some(from) => p.mark(Level::Off, &format!("connected to {from}, off")),
-            None => p.mark(Level::Off, &format!("free, port {}", r.port)),
+            Some(from) => p.mark(Level::Off, &t!("connected-off", from = from)),
+            None => p.mark(Level::Off, &t!("free-port", port = r.port)),
         };
         heading(o, p, &title, Some(mark));
         return;
     };
     let mark = match (st.ssrc, &r.sender) {
         (Some(_), Some(from)) => match r.state.as_deref() {
-            Some("muted") => p.mark(Level::Off, &format!("receiving from {from}, muted")),
-            Some("ducked") => p.mark(Level::Good, &format!("receiving from {from}, ducked")),
-            _ => p.mark(Level::Good, &format!("receiving from {from}")),
+            Some("muted") => p.mark(Level::Off, &t!("receiving-muted", from = from)),
+            Some("ducked") => p.mark(Level::Good, &t!("receiving-ducked", from = from)),
+            _ => p.mark(Level::Good, &t!("receiving-from", from = from)),
         },
-        (Some(ssrc), None) => p.mark(Level::Good, &format!("receiving ssrc {ssrc:08x}")),
-        (None, Some(from)) => p.mark(Level::Off, &format!("connected to {from}, idle")),
-        (None, None) if accept == Some("any") => p.mark(Level::Off, "free, plays any sender"),
-        (None, None) => p.mark(Level::Off, "idle"),
+        (Some(ssrc), None) => p.mark(
+            Level::Good,
+            &t!("receiving-ssrc", ssrc = format!("{ssrc:08x}")),
+        ),
+        (None, Some(from)) => p.mark(Level::Off, &t!("connected-idle", from = from)),
+        (None, None) if accept == Some("any") => p.mark(Level::Off, &t!("free-any")),
+        (None, None) => p.mark(Level::Off, &t!("idle")),
     };
     heading(o, p, &title, Some(mark));
-    row(o, p, "listen", &st.listen);
+    row(o, p, "key-listen", &st.listen);
     if let Some(layout) = &r.layout {
-        row(o, p, "channels", &channels(layout));
+        row(o, p, "key-channels", &channels(layout));
     }
     if let Some(parked) = &r.parked {
         let why = match (parked.why.as_str(), &parked.description) {
-            ("lost", Some(output)) => format!("parked: {output} is gone"),
-            ("unwired", _) => "parked: its last wire was removed".to_owned(),
-            _ => "parked".to_owned(),
+            ("lost", Some(output)) => t!("parked-lost", output = output),
+            ("unwired", _) => t!("parked-unwired"),
+            _ => t!("parked"),
         };
-        row(o, p, "output", &p.mark(Level::Off, &why));
+        row(o, p, "key-output", &p.mark(Level::Off, &why));
     } else if r.held {
-        let why = "none: the default output is another node's sink";
-        row(o, p, "output", &p.mark(Level::Bad, why));
+        row(o, p, "key-output", &p.mark(Level::Bad, &t!("held")));
     } else if r.wired {
-        row(o, p, "output", "on wires, see `orpheusctl patch`");
+        row(o, p, "key-output", &t!("on-wires"));
     } else if let Some(output) = &r.output {
         let output = match &r.plays_on {
             Some(on) => format!("{output} ({on})"),
             None => output.clone(),
         };
-        row(o, p, "output", &output);
+        row(o, p, "key-output", &output);
         if let Some(mix) = &r.mix {
             let text = mix_text(mix, r.layout.as_ref(), r.output_channels.as_ref(), &[]);
-            row(o, p, "mix", &text);
+            row(o, p, "key-mix", &text);
         }
     }
     if r.priority.as_deref() == Some("high") {
-        row(o, p, "priority", "high");
+        row(o, p, "key-priority", &t!("priority-high"));
     }
-    row(o, p, "link offset", &format!("{} ms", st.link_offset_ms));
-    let level = st
-        .peak_dbfs
-        .map_or("silence".into(), |db| format!("{db:.1} dBFS"));
-    row(o, p, "level", &level);
+    row(
+        o,
+        p,
+        "key-link-offset",
+        &format!("{} ms", st.link_offset_ms),
+    );
+    let level = st.peak_dbfs.map_or_else(
+        || t!("silence"),
+        |db| format!("{} dBFS", num(format!("{db:.1}"))),
+    );
+    row(o, p, "key-level", &level);
     let margin = match st.margin_us {
         Some(m) => {
-            let text = format!("{:.2} ms", m as f64 / 1000.0);
+            let text = ms(m);
             match m {
                 ..=0 => p.level(Level::Bad, &text),
                 1..1000 => p.level(Level::Warn, &text),
@@ -2457,38 +2434,39 @@ fn receiver(o: &mut String, p: Paint, c: Counts, r: &Receiver, accept: Option<&s
         }
         None => "-".into(),
     };
-    row(o, p, "margin", &margin);
+    row(o, p, "key-margin", &margin);
     if let Some(j) = st.jitter_us {
-        let text = format!("{:.2} ms", j as f64 / 1000.0);
+        let text = ms(j);
         // As orpheusd's health check warns.
         let text = if j > 3000 {
             p.level(Level::Warn, &text)
         } else {
             text
         };
-        row(o, p, "jitter", &text);
+        row(o, p, "key-jitter", &text);
     }
-    row(o, p, "packets", &c.packets(st.packets));
+    row(o, p, "key-packets", &c.packets(st.packets));
     if st.ignored > 0 {
         // From other sources: expected while connected to one sender.
-        row(o, p, "ignored", &c.packets(st.ignored));
+        row(o, p, "key-ignored", &c.packets(st.ignored));
     }
-    row(
-        o,
-        p,
-        "buffer",
-        &format!("{} frames", st.buffer.level_frames),
-    );
-    row(o, p, "ASRC", &format!("{:+.1} ppm", st.asrc_ppm));
+    let frames = t!("frames", n = st.buffer.level_frames);
+    row(o, p, "key-buffer", &frames);
+    row(o, p, "key-asrc", &ppm(st.asrc_ppm, 1));
     let mut counts = vec![
-        (st.lost, "lost", "lost"),
-        (st.late, "late", "late"),
-        (st.early, "early", "early"),
-        (st.malformed, "malformed", "malformed"),
-        (st.realigns, "realign", "realigns"),
+        (st.lost, "count-lost"),
+        (st.late, "count-late"),
+        (st.early, "count-early"),
+        (st.malformed, "count-malformed"),
+        (st.realigns, "count-realign"),
     ];
     counts.extend(buffer_counts(&st.buffer));
-    row(o, p, "problems", &problems(p, c, &counts));
+    row(o, p, "key-problems", &problems(p, c, &counts));
+}
+
+/// Microseconds as milliseconds, `1.25 ms`.
+fn ms(us: i64) -> String {
+    format!("{} ms", num(format!("{:.2}", us as f64 / 1000.0)))
 }
 
 /// The channels of a layout as `Left (L), Right (R)`.
@@ -2503,20 +2481,26 @@ fn channels(layout: &Layout) -> String {
 
 fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
     if senders.is_empty() {
-        let mark = p.mark(Level::Off, "none");
-        heading(o, p, "Routes", Some(mark));
+        let mark = p.mark(Level::Off, &t!("none"));
+        heading(o, p, &t!("heading-routes"), Some(mark));
         return;
     }
-    heading(o, p, "Routes", None);
+    heading(o, p, &t!("heading-routes"), None);
     let header = [
-        "ID", "NAME", "PEER", "PACKETS", "BUFFER", "ASRC", "PROBLEMS",
+        t!("col-id"),
+        t!("col-name"),
+        t!("col-peer"),
+        t!("col-packets"),
+        t!("col-buffer"),
+        t!("col-asrc"),
+        t!("col-problems"),
     ];
     let rows: Vec<[String; 7]> = senders
         .iter()
         .map(|t| {
             let mut counts = vec![
-                (t.send_errors, "send error", "send errors"),
-                (t.realigns, "realign", "realigns"),
+                (t.send_errors, "count-send-error"),
+                (t.realigns, "count-realign"),
             ];
             counts.extend(buffer_counts(&t.buffer));
             [
@@ -2524,8 +2508,8 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
                 t.name.clone(),
                 peer_column(t),
                 c.packets(t.packets),
-                format!("{} frames", t.buffer.level_frames),
-                format!("{:+.1} ppm", t.asrc_ppm),
+                t!("frames", n = t.buffer.level_frames),
+                ppm(t.asrc_ppm, 1),
                 problems(p, c, &counts),
             ]
         })
@@ -2538,30 +2522,33 @@ fn senders(o: &mut String, p: Paint, c: Counts, senders: &[Sender]) {
 fn peer_column(t: &Sender) -> String {
     let mut notes = vec![];
     match t.receiver.as_ref().map(|r| r.state.as_str()) {
-        Some("disconnected") => notes.push("disconnected, paused".to_owned()),
-        Some("busy") => notes.push("waiting for a free receiver".to_owned()),
-        Some("incompatible") => notes.push("peer can't play this stream".to_owned()),
-        Some("offline") => notes.push("peer offline".to_owned()),
-        Some(s @ ("unreachable" | "connecting" | "idle")) => notes.push(s.to_owned()),
-        _ if !t.enabled && !t.hidden => notes.push("off".into()),
+        Some("disconnected") => notes.push(t!("peer-disconnected")),
+        Some("busy") => notes.push(t!("peer-busy")),
+        Some("incompatible") => notes.push(t!("peer-incompatible")),
+        Some("offline") => notes.push(t!("peer-offline")),
+        Some("unreachable") => notes.push(t!("peer-unreachable")),
+        Some("connecting") => notes.push(t!("peer-connecting")),
+        Some("idle") => notes.push(t!("peer-idle")),
+        _ if !t.enabled && !t.hidden => notes.push(t!("peer-off")),
         _ => {}
     }
     match t.receiver.as_ref().and_then(|r| r.parked.as_deref()) {
-        Some("lost") => notes.push("its output there is gone".into()),
-        Some("unwired") => notes.push("unwired there".into()),
+        Some("lost") => notes.push(t!("peer-output-gone")),
+        Some("unwired") => notes.push(t!("peer-unwired")),
         Some(why) => notes.push(why.to_owned()),
         None => {}
     }
     if t.hidden {
-        notes.push("sink hidden".into());
+        notes.push(t!("peer-sink-hidden"));
     }
     match t.receiver.as_ref().and_then(|r| r.policy.as_deref()) {
-        Some("muted") => notes.push("muted by policy".into()),
-        Some(held) => notes.push(held.to_owned()),
+        Some("muted") => notes.push(t!("peer-muted")),
+        Some("ducked") => notes.push(t!("peer-ducked")),
+        Some(other) => notes.push(other.to_owned()),
         None => {}
     }
     if t.priority.as_deref() == Some("high") {
-        notes.push("high priority".into());
+        notes.push(t!("peer-high-priority"));
     }
     if notes.is_empty() {
         t.peer.clone()
@@ -2575,11 +2562,11 @@ fn peer_column(t: &Sender) -> String {
 fn table<const N: usize>(
     o: &mut String,
     p: Paint,
-    header: [&str; N],
+    header: [String; N],
     right: [bool; N],
     rows: &[[String; N]],
 ) {
-    let mut width = header.map(str::len);
+    let mut width = header.each_ref().map(|h| h.chars().count());
     for r in rows {
         for (w, cell) in width.iter_mut().zip(r) {
             *w = (*w).max(cell.chars().count());
@@ -2598,7 +2585,11 @@ fn table<const N: usize>(
         }
         l
     };
-    let _ = writeln!(o, "{}", p.dim(line(header).trim_end()));
+    let _ = writeln!(
+        o,
+        "{}",
+        p.dim(line(header.each_ref().map(String::as_str)).trim_end())
+    );
     for r in rows {
         let _ = writeln!(o, "{}", line(r.each_ref().map(String::as_str)).trim_end());
     }
@@ -2608,14 +2599,14 @@ fn table<const N: usize>(
 fn render_outputs(outputs: &[Output], p: Paint) -> String {
     let mut o = String::new();
     if outputs.is_empty() {
-        let _ = writeln!(o, "{}", p.mark(Level::Off, "no outputs"));
+        let _ = writeln!(o, "{}", p.mark(Level::Off, &t!("no-outputs")));
         return o;
     }
     let rows: Vec<[String; 5]> = outputs
         .iter()
         .map(|out| {
             let kind = match &out.overridden {
-                Some(_) => format!("{} (set)", out.kind),
+                Some(_) => t!("type-set", type = &out.kind),
                 None => out.kind.clone(),
             };
             let mut notes = Vec::new();
@@ -2625,24 +2616,23 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
                     .find(|o| o.name == c.device)
                     .map_or(c.device.as_str(), |o| o.description.as_str());
                 let channels: Vec<String> = c.channels.iter().map(usize::to_string).collect();
-                let missing = if outputs.iter().any(|o| o.name == c.device) {
-                    ""
+                let channels = channels.join(", ");
+                notes.push(if outputs.iter().any(|o| o.name == c.device) {
+                    t!("created-on", device = device, channels = channels)
                 } else {
-                    " (missing)"
-                };
-                notes.push(format!("on {device} {}{missing}", channels.join(", ")));
+                    t!("created-on-missing", device = device, channels = channels)
+                });
             }
             if !out.receivers.is_empty() {
                 let ids: Vec<String> = out.receivers.iter().map(u32::to_string).collect();
-                let noun = if ids.len() == 1 {
-                    "receiver"
-                } else {
-                    "receivers"
-                };
-                notes.push(format!("{noun} {}", ids.join(", ")));
+                notes.push(t!(
+                    "plays-receivers",
+                    count = ids.len(),
+                    ids = ids.join(", ")
+                ));
             }
             if out.default {
-                notes.push("default".into());
+                notes.push(t!("default"));
             }
             [
                 out.description.clone(),
@@ -2653,7 +2643,13 @@ fn render_outputs(outputs: &[Output], p: Paint) -> String {
             ]
         })
         .collect();
-    let header = ["OUTPUT", "TYPE", "CHANNELS", "NAME", ""];
+    let header = [
+        t!("col-output"),
+        t!("col-type"),
+        t!("col-channels"),
+        t!("col-name"),
+        String::new(),
+    ];
     table(&mut o, p, header, [false; 5], &rows);
     o
 }
@@ -2671,7 +2667,7 @@ fn short(layout: &Layout) -> String {
 fn render_inputs(inputs: &[InputEntry], p: Paint) -> String {
     let mut o = String::new();
     if inputs.is_empty() {
-        let _ = writeln!(o, "{}", p.mark(Level::Off, "no inputs"));
+        let _ = writeln!(o, "{}", p.mark(Level::Off, &t!("no-inputs")));
         return o;
     }
     let rows: Vec<[String; 4]> = inputs
@@ -2679,13 +2675,18 @@ fn render_inputs(inputs: &[InputEntry], p: Paint) -> String {
         .map(|i| {
             [
                 i.description.clone(),
-                i.kind.clone(),
+                t!("input-kind", kind = &i.kind),
                 short(&i.channels),
                 i.name.clone(),
             ]
         })
         .collect();
-    let header = ["INPUT", "KIND", "CHANNELS", "NAME"];
+    let header = [
+        t!("col-input"),
+        t!("col-kind"),
+        t!("col-channels"),
+        t!("col-name"),
+    ];
     table(&mut o, p, header, [false; 4], &rows);
     o
 }
@@ -2701,17 +2702,19 @@ fn render_settings(v: &serde_json::Value, p: Paint) -> String {
                 serde_json::Value::Null => "-".into(),
                 other => other.to_string(),
             };
-            let from = v["sources"][section][key].as_str().unwrap_or("default");
-            let from = if from == "default" {
-                p.dim(from)
+            let source = v["sources"][section][key].as_str().unwrap_or("default");
+            let from = t!("setting-from", from = source);
+            let from = if source == "default" {
+                p.dim(&from)
             } else {
-                from.to_owned()
+                from
             };
             rows.push([format!("{section}.{key}"), value, from]);
         }
     }
     let mut o = String::new();
-    table(&mut o, p, ["SETTING", "VALUE", "FROM"], [false; 3], &rows);
+    let header = [t!("col-setting"), t!("col-value"), t!("col-from")];
+    table(&mut o, p, header, [false; 3], &rows);
     o
 }
 
@@ -2719,17 +2722,17 @@ fn render_settings(v: &serde_json::Value, p: Paint) -> String {
 fn render_nodes(nodes: &[Node], p: Paint) -> String {
     let mut o = String::new();
     if nodes.is_empty() {
-        let _ = writeln!(o, "{}", p.mark(Level::Off, "no other nodes found"));
+        let _ = writeln!(o, "{}", p.mark(Level::Off, &t!("no-nodes")));
         return o;
     }
     let rows: Vec<[String; 6]> = nodes
         .iter()
         .map(|n| {
-            let pin = if n.pinned { ", pinned" } else { "" };
-            let state = if n.online {
-                p.mark(Level::Good, &format!("online{pin}"))
-            } else {
-                p.mark(Level::Off, &format!("offline{pin}"))
+            let state = match (n.online, n.pinned) {
+                (true, false) => p.mark(Level::Good, &t!("online")),
+                (true, true) => p.mark(Level::Good, &t!("online-pinned")),
+                (false, false) => p.mark(Level::Off, &t!("offline")),
+                (false, true) => p.mark(Level::Off, &t!("offline-pinned")),
             };
             [
                 match &n.alias {
@@ -2740,15 +2743,22 @@ fn render_nodes(nodes: &[Node], p: Paint) -> String {
                 n.addresses.first().cloned().unwrap_or_else(|| "-".into()),
                 n.version.clone().unwrap_or_else(|| "-".into()),
                 match n.link.as_deref() {
-                    Some("wired") => "wired".into(),
-                    Some("wifi") => p.level(Level::Warn, "Wi-Fi"),
+                    Some("wired") => t!("wired"),
+                    Some("wifi") => p.level(Level::Warn, &t!("wifi")),
                     _ => "-".into(),
                 },
                 state,
             ]
         })
         .collect();
-    let header = ["NAME", "ID", "ADDRESS", "VERSION", "LINK", "STATE"];
+    let header = [
+        t!("col-name"),
+        t!("col-id"),
+        t!("col-address"),
+        t!("col-version"),
+        t!("col-link"),
+        t!("col-state"),
+    ];
     table(&mut o, p, header, [false; 6], &rows);
     o
 }
@@ -3312,5 +3322,20 @@ Clock          ● PTP stopped, holding over
   steps        1
 "
         );
+    }
+
+    /// The keys of the status rows are texts, and count for its width.
+    #[test]
+    fn status_keys_are_texts() {
+        for key in KEYS {
+            assert!(i18n::CATALOG.has(key), "{key}");
+        }
+        let source = include_str!("main.rs");
+        for call in ["row(o, p, \"", "row(&mut o, p, \""] {
+            for rest in source.split(call).skip(1) {
+                let key = &rest[..rest.find('"').unwrap()];
+                assert!(KEYS.contains(&key), "{key}");
+            }
+        }
     }
 }

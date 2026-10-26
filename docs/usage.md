@@ -12,6 +12,10 @@ orpheusctl status --node 192.168.1.20:7481
 ORPHEUS_NODE=http://[fd00::20]:7480 orpheusctl status
 ```
 
+It speaks the language of its environment (`LANG`, English and German so
+far), and shows the node's warnings in the node's language. This page
+quotes it in English; `LANG=C orpheusctl …` gives English too.
+
 | Command | Effect |
 |---|---|
 | `status` | Shows the node's ID, name, version, clock, receivers and routes. |

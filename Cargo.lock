@@ -1222,6 +1222,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "orpheus-i18n"
+version = "0.0.1"
+dependencies = [
+ "fluent-bundle",
+ "fluent-langneg",
+ "fluent-syntax",
+ "sys-locale",
+ "tracing",
+ "unic-langid",
+]
+
+[[package]]
 name = "orpheus-nmos"
 version = "0.0.1"
 dependencies = [
@@ -1249,6 +1261,7 @@ dependencies = [
  "anyhow",
  "clap",
  "orpheus-core",
+ "orpheus-i18n",
  "serde",
  "serde_json",
  "tungstenite",
@@ -1261,20 +1274,17 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
- "fluent-bundle",
- "fluent-langneg",
- "fluent-syntax",
  "orpheus-aes70",
  "orpheus-clock",
  "orpheus-core",
  "orpheus-discovery",
  "orpheus-engine",
+ "orpheus-i18n",
  "orpheus-nmos",
  "orpheus-pipewire",
  "serde",
  "serde_json",
  "socket2",
- "sys-locale",
  "tempfile",
  "timestamped-socket",
  "tokio",
@@ -1283,7 +1293,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "unic-langid",
  "ureq",
  "utoipa",
  "utoipa-axum",

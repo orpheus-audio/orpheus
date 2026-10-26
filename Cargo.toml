@@ -7,6 +7,7 @@ members = [
     "orpheus-clock",
     "orpheus-discovery",
     "orpheus-engine",
+    "orpheus-i18n",
     "orpheus-pipewire",
     "orpheusd",
     "orpheusctl",
@@ -20,6 +21,7 @@ repository = "https://github.com/orpheus-audio/orpheus"
 
 [workspace.dependencies]
 orpheus-core = { path = "orpheus-core", version = "0.0.1" }
+orpheus-i18n = { path = "orpheus-i18n" }
 serde = { version = "1", features = ["derive"] }
 
 # Release build with whole-program optimization: slow to build, for running

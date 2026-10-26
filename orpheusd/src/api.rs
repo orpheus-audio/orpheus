@@ -1268,9 +1268,10 @@ async fn change_settings(
 ) -> Result<Json<SettingsView>, ApiError> {
     blocking(move || {
         let mut store = node.settings.lock().unwrap();
-        let change = store
-            .patch(&patch)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        let change = store.patch(&patch).map_err(|e| {
+            let texts = crate::i18n::texts(&store.get().ui.language);
+            (StatusCode::BAD_REQUEST, texts.text(&e))
+        })?;
         let old = store.get().clone();
         let new = change.settings.clone();
         if new.ptp != old.ptp

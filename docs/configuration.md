@@ -92,7 +92,7 @@ enabled = true
 port = 7481
 
 [ui]
-# language = "de"
+language = "auto"
 ```
 
 ### Top level
@@ -252,7 +252,7 @@ What Orpheus shows in the audio system's mixers.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `language` | none | The language of the names Orpheus gives, such as a sink's `TV (unavailable)`, as a language tag: `de`, `de-AT`. Without it, the environment's (`LC_ALL`, `LC_MESSAGES`, `LANG`). Orpheus speaks English and German; other languages get English. |
+| `language` | `auto` | The language of the names Orpheus gives, such as a sink's `TV (unavailable)`, of its [warnings](usage.md#warnings) and of errors in settings, as a language tag: `de`, `de-AT`. The log stays in English. `auto` takes the environment's (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`): for a systemd user unit that is the session's, which `systemctl --user show-environment` shows. The loopback and the wire and meter nodes keep the names they got at the start. Orpheus speaks English and German; other languages get English. `orpheusctl` goes by its own environment. See [languages](architecture.md#languages). |
 
 ### `[icons]`
 

@@ -56,6 +56,7 @@ use serde_json::{Value, json};
 
 use crate::api::Node;
 use crate::config::{Accept, Claim, RTP_PORT, RoutesConfig, WhenLost};
+use crate::i18n::Text;
 use crate::nmos::FORMAT;
 use crate::nmos::{self, error};
 use crate::outputs;
@@ -1387,7 +1388,7 @@ fn tend_sinks(node: &Node) {
         return;
     };
     let settings = node.settings();
-    let texts = crate::i18n::texts(settings.ui.language.as_deref());
+    let texts = crate::i18n::texts(&settings.ui.language);
     let receiver = settings.receiver;
     let lost_after = Duration::from_millis(receiver.lost_after_ms.into());
     let move_on = receiver.when_lost == WhenLost::Default;
@@ -1408,7 +1409,10 @@ fn tend_sinks(node: &Node) {
             gone_sinks.insert(sink.to_owned());
         }
         let label = unavailable
-            .then(|| Some(texts.sink_unavailable(&engine.sender_name(id)?)))
+            .then(|| {
+                let name = engine.sender_name(id)?;
+                Some(texts.text(&Text::new("sink-unavailable").arg("name", name)))
+            })
             .flatten();
         engine.set_sender_label(id, label.as_deref());
         let pinned = link

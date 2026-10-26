@@ -22,6 +22,8 @@ use crate::sender::{Route, Sender, SenderConfig, SenderStatus};
 pub struct LoopbackConfig {
     pub name: String,
     pub description: String,
+    /// Of the stream that plays what the sink takes.
+    pub playback_description: String,
     pub format: AudioFormat,
     pub latency_ms: u32,
     /// Frames per cycle to ask the audio system for.
@@ -93,7 +95,7 @@ impl Engine {
         let playback = self.backend.create_playback(
             &StreamSpec {
                 name: format!("{}.playback", cfg.name),
-                description: format!("{} (playback)", cfg.description),
+                description: cfg.playback_description.clone(),
                 format: cfg.format,
                 layout: Layout::default_for(cfg.format.channels.into()),
                 group: Some(cfg.name.clone()),

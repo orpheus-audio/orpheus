@@ -12,6 +12,8 @@ use orpheus_core::OutputType;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::i18n::{self, Arg, Text};
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -84,7 +86,7 @@ impl TryFrom<RawAudio> for AudioConfig {
     fn try_from(raw: RawAudio) -> Result<Self, String> {
         let block = match (raw.block_frames, raw.cycle_ms) {
             (Some(_), Some(_)) => {
-                return Err("set either block_frames or cycle_ms, not both".into());
+                return Err(i18n::texts(i18n::AUTO).text(&Text::new("setting-block-both")));
             }
             (Some(frames), None) => Some(Block::Frames(frames)),
             (None, Some(ms)) => Some(Block::Millis(ms)),
@@ -94,13 +96,16 @@ impl TryFrom<RawAudio> for AudioConfig {
         if let Some(frames) = audio.block_frames(48_000)
             && !BLOCK_FRAMES.contains(&frames)
         {
-            return Err(format!(
-                "the block must be {} to {} frames (at 48 kHz {:.2} to {:.0} ms), not {frames}",
-                BLOCK_FRAMES.start(),
-                BLOCK_FRAMES.end(),
-                *BLOCK_FRAMES.start() as f64 / 48.0,
-                *BLOCK_FRAMES.end() as f64 / 48.0,
-            ));
+            let error = Text::new("setting-block")
+                .arg("min", *BLOCK_FRAMES.start())
+                .arg("max", *BLOCK_FRAMES.end())
+                .arg(
+                    "min_ms",
+                    Arg::Decimal(*BLOCK_FRAMES.start() as f64 / 48.0, 2),
+                )
+                .arg("max_ms", Arg::Decimal(*BLOCK_FRAMES.end() as f64 / 48.0, 0))
+                .arg("frames", frames);
+            return Err(i18n::texts(i18n::AUTO).text(&error));
         }
         Ok(audio)
     }
@@ -224,12 +229,20 @@ pub enum WhenLost {
 }
 
 /// What Orpheus shows in the audio system.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UiConfig {
-    /// The language of the names Orpheus gives, such as `de`; `None` for
-    /// the environment's.
-    pub language: Option<String>,
+    /// The language of what Orpheus shows, such as `de`; `auto` for the
+    /// environment's.
+    pub language: String,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: i18n::AUTO.into(),
+        }
+    }
 }
 
 /// The routes this node sends: when they hold a receiver on the peer.
@@ -408,18 +421,23 @@ impl Config {
         }
     }
 
-    /// What the types can't express.
+    /// What the types can't express, in the language the file sets.
     fn check(&self) -> Result<()> {
+        let texts = i18n::texts(&self.ui.language);
         let r = &self.receiver;
         if !(1..=MAX_RECEIVERS).contains(&r.max) {
-            anyhow::bail!("[receiver] max must be 1 to {MAX_RECEIVERS}");
+            let error = Text::new("setting-range")
+                .arg("key", "[receiver] max")
+                .arg("min", 1)
+                .arg("max", MAX_RECEIVERS);
+            anyhow::bail!(texts.text(&error));
         }
         if u32::from(r.port) + 2 * (u32::from(r.max) - 1) > u32::from(u16::MAX) {
-            anyhow::bail!("[receiver] port + 2 × (max − 1) must stay below 65536");
+            anyhow::bail!(texts.text(&Text::new("setting-ports")));
         }
         crate::settings::Settings::from_config(self)
             .check()
-            .map_err(anyhow::Error::msg)
+            .map_err(|e| anyhow::Error::msg(texts.text(&e)))
     }
 
     /// The configured name, or the hostname if none is set.

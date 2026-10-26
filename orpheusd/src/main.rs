@@ -31,7 +31,7 @@ use orpheus_clock::{Clock, SystemClock, Timescale};
 use orpheus_core::AudioFormat;
 use orpheus_discovery::{Announcement, Discovery};
 use orpheus_engine::{Engine, LoopbackConfig};
-use orpheus_pipewire::{Icons, PipeWireBackend};
+use orpheus_pipewire::{Icons, Names, PipeWireBackend};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::signal::unix::{SignalKind, signal};
 use tower::Layer;
@@ -45,6 +45,7 @@ use tracing_subscriber::registry::LookupSpan;
 
 use crate::config::Config;
 use crate::home::Home;
+use crate::i18n::{Text, Texts};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -73,8 +74,20 @@ async fn main() -> Result<()> {
     for (&kind, name) in &config.icons {
         icons.set(kind, name.as_str());
     }
-    let engine = match PipeWireBackend::connect(icons) {
-        Ok(backend) => Some(start_engine(backend, clock, &config)?),
+    // Named once, in the language set at the start.
+    let texts = i18n::texts(&settings.get().ui.language);
+    let names = Names {
+        meter: Box::new({
+            let texts = texts.clone();
+            move |output| texts.text(&Text::new("meter").arg("output", output))
+        }),
+        wire: Box::new({
+            let texts = texts.clone();
+            move |from, to| texts.text(&Text::new("wire").arg("from", from).arg("to", to))
+        }),
+    };
+    let engine = match PipeWireBackend::connect(icons, names) {
+        Ok(backend) => Some(start_engine(backend, clock, &config, &texts)?),
         Err(e) => {
             tracing::warn!(error = %e, "no audio system; running without audio");
             None
@@ -318,13 +331,17 @@ fn start_engine(
     backend: PipeWireBackend,
     clock: Arc<dyn Clock>,
     config: &Config,
+    texts: &Texts,
 ) -> Result<Engine> {
     let mut engine = Engine::new(Box::new(backend), clock);
     if config.loopback.enabled {
         engine
             .start_loopback(&LoopbackConfig {
                 name: "orpheus.loopback".into(),
-                description: "Orpheus loopback".into(),
+                description: texts.text(&Text::new("loopback")),
+                playback_description: texts.text(
+                    &Text::new("loopback-playback").arg("name", texts.text(&Text::new("loopback"))),
+                ),
                 format: AudioFormat::AES67,
                 latency_ms: config.loopback.latency_ms,
                 block_frames: config.audio.block_frames(AudioFormat::AES67.rate),

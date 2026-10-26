@@ -18,6 +18,7 @@ use serde_json::{Map, Value};
 use utoipa::ToSchema;
 
 use crate::config::{Accept, Claim, Config, Policy, WhenLost};
+use crate::i18n::Text;
 
 /// The settings in effect.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -92,9 +93,9 @@ pub struct SenderSettings {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UiSettings {
-    /// The language of the names Orpheus gives, such as `de`; `null` for
-    /// the environment's (`LC_ALL`, `LC_MESSAGES`, `LANG`).
-    pub language: Option<String>,
+    /// The language of what Orpheus shows, such as `de`; `auto` for the
+    /// environment's (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`).
+    pub language: String,
 }
 
 /// The longest fade-in.
@@ -169,45 +170,45 @@ impl Settings {
     }
 
     /// What the types can't express.
-    pub fn check(&self) -> Result<(), String> {
+    pub fn check(&self) -> Result<(), Text> {
         let (p, r) = (&self.ptp, &self.receiver);
         if p.interface.as_deref() == Some("") {
-            return Err("[ptp] interface must not be empty".into());
+            return Err(Text::new("setting-empty").arg("key", "[ptp] interface"));
         }
         if p.step_threshold_us == 0 || p.settle_threshold_us == 0 {
-            return Err("[ptp] step_threshold_us and settle_threshold_us must be above 0".into());
+            return Err(Text::new("setting-thresholds"));
         }
         if r.default_output.as_deref() == Some("") {
-            return Err("[receiver] default_output must not be empty".into());
+            return Err(Text::new("setting-empty").arg("key", "[receiver] default_output"));
         }
         if !(0.0..=96.0).contains(&r.duck_db) {
-            return Err("[receiver] duck_db must be 0 to 96".into());
+            return Err(range("[receiver] duck_db", 0, 96));
         }
         if !(1..=MAX_LINK_OFFSET_MS).contains(&r.link_offset_ms) {
-            return Err(format!(
-                "[receiver] link_offset_ms must be 1 to {MAX_LINK_OFFSET_MS}"
-            ));
+            return Err(range("[receiver] link_offset_ms", 1, MAX_LINK_OFFSET_MS));
         }
         if r.lost_after_ms > MAX_LOST_AFTER_MS {
-            return Err(format!(
-                "[receiver] lost_after_ms must be 0 to {MAX_LOST_AFTER_MS}"
-            ));
+            return Err(range("[receiver] lost_after_ms", 0, MAX_LOST_AFTER_MS));
         }
         if self.sender.release_after_s == 0 {
-            return Err("[sender] release_after_s must be above 0".into());
+            return Err(Text::new("setting-above-zero").arg("key", "[sender] release_after_s"));
         }
         if self.sender.fade_in_ms > MAX_FADE_IN_MS {
-            return Err(format!("[sender] fade_in_ms must be 0 to {MAX_FADE_IN_MS}"));
+            return Err(range("[sender] fade_in_ms", 0, MAX_FADE_IN_MS));
         }
-        if let Some(l) = &self.ui.language
-            && !crate::i18n::valid(l)
-        {
-            return Err(format!(
-                "[ui] language {l:?} is not a language tag, such as de"
-            ));
+        if !crate::i18n::valid(&self.ui.language) {
+            return Err(Text::new("setting-language").arg("language", &self.ui.language));
         }
         Ok(())
     }
+}
+
+/// `key` must be `min` to `max`.
+fn range(key: &'static str, min: u32, max: u32) -> Text {
+    Text::new("setting-range")
+        .arg("key", key)
+        .arg("min", min)
+        .arg("max", max)
 }
 
 /// The settings in effect and the layers they come from.
@@ -241,9 +242,8 @@ impl Store {
             path,
         };
         let overrides = match std::fs::read(&store.path) {
-            Ok(data) => {
-                serde_json::from_slice::<Map<String, Value>>(&data).map_err(|e| e.to_string())
-            }
+            Ok(data) => serde_json::from_slice::<Map<String, Value>>(&data)
+                .map_err(|e| Text::new("settings-invalid").arg("error", e.to_string())),
             Err(_) => return store,
         };
         match overrides.and_then(|o| store.resolve(o)) {
@@ -252,7 +252,8 @@ impl Store {
                 store.current = change.settings;
             }
             Err(e) => {
-                tracing::warn!(error = %e, path = %store.path.display(), "ignoring settings");
+                let error = crate::i18n::texts("en").text(&e);
+                tracing::warn!(%error, path = %store.path.display(), "ignoring settings");
             }
         }
         store
@@ -300,11 +301,11 @@ impl Store {
 
     /// Checks a merge patch on the overrides and returns the settings it
     /// would give.
-    pub fn patch(&self, patch: &Value) -> Result<Change, String> {
+    pub fn patch(&self, patch: &Value) -> Result<Change, Text> {
         let mut overrides = Value::Object(self.overrides.clone());
         merge(&mut overrides, patch);
         let Value::Object(overrides) = overrides else {
-            return Err("the settings must be a JSON object".into());
+            return Err(Text::new("settings-not-object"));
         };
         self.resolve(overrides)
     }
@@ -320,18 +321,19 @@ impl Store {
     }
 
     /// The settings `overrides` give on top of the base.
-    fn resolve(&self, overrides: Map<String, Value>) -> Result<Change, String> {
+    fn resolve(&self, overrides: Map<String, Value>) -> Result<Change, Text> {
         let mut value = serde_json::to_value(&self.base).expect("settings serialize");
         for (section, keys) in &overrides {
             if !keys.is_object() {
-                return Err(format!("{section} must be an object"));
+                return Err(Text::new("settings-section-not-object").arg("section", section));
             }
             match value.get_mut(section) {
                 Some(base) => merge(base, keys),
-                None => return Err(format!("unknown section {section}")),
+                None => return Err(Text::new("settings-unknown-section").arg("section", section)),
             }
         }
-        let settings: Settings = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let settings: Settings = serde_json::from_value(value)
+            .map_err(|e| Text::new("settings-invalid").arg("error", e.to_string()))?;
         settings.check()?;
         // Sections emptied by the patch are dropped.
         let overrides = overrides
@@ -439,6 +441,9 @@ mod tests {
         );
         assert!(s.patch(&json!({"sender": {"claim": "never"}})).is_err());
         assert!(s.patch(&json!([])).is_err());
+        assert!(s.patch(&json!({"ui": {"language": "de_"}})).is_err());
+        assert!(s.patch(&json!({"ui": {"language": "de-AT"}})).is_ok());
+        assert!(s.patch(&json!({"ui": {"language": "auto"}})).is_ok());
     }
 
     #[test]

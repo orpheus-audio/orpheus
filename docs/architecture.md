@@ -46,6 +46,7 @@ Linux.
 | `orpheusctl` | Command-line client for the HTTP API of any node. |
 | `orpheus-discovery` | Announces the node over mDNS and keeps the list of other nodes. |
 | `orpheus-nmos` | NMOS IS-04 resources, IDs and versions; IS-05 parameters; writing and reading SDP. |
+| `orpheus-i18n` | Texts in the user's language from compiled-in Fluent files, for `orpheusd` and `orpheusctl`. |
 | `orpheus-aes70` | The device side of AES70: OCP.1 messages and data types, the managers, a tree of blocks, gains, mutes and level meters, and subscriptions. `no_std` with `alloc`, for the ESP32 firmware too. |
 
 ## Audio path
@@ -530,15 +531,35 @@ default output, sender and `ui` settings are read where they are used.
 
 ## Languages
 
-`i18n.rs` gives the names Orpheus shows in the audio system, such as a
-sink's `TV (unavailable)`, in the user's language. The translations are
-Fluent files, `orpheusd/locales/<language>/orpheusd.ftl`, compiled in;
-English lies under every other language, so a missing translation shows
-English. The language is `[ui] language`, else the environment's (via
-`sys-locale`), negotiated against those there are (`de-AT` gets `de`).
-Each message is the whole name, so that a language can order it as it
-needs. A test checks that every language has every message. To add a
-language, add its file and its line in `LOCALES`.
+Everything Orpheus shows to people is in their language: the names in the
+audio system (a sink's `TV (unavailable)`, the loopback, the wire and
+meter nodes), the [warnings](usage.md#warnings), the errors in settings,
+and all of `orpheusctl`, its help included. Logs stay in English, and so
+do errors that come from the system or from libraries (a socket's
+`Permission denied`, a JSON parser's message), which appear inside the
+texts as they are. The API's own error messages are English for now.
+
+`orpheus-i18n` does the work: a `Catalog` holds a program's Fluent files,
+compiled in, and gives `Texts` for a language; English lies under every
+other language, so a missing translation shows English. A `Text` is a
+message ID with its arguments, formatted later in any language, which is
+how `orpheusd` shows a warning in the node's language and logs it in
+English. The files:
+
+- `orpheusd/locales/<language>/orpheusd.ftl`, in `[ui] language`; with
+  `auto`, the default, in the environment's;
+- `orpheusctl/locales/<language>/orpheusctl.ftl`, in the environment's
+  language (`LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, `LANG`), whatever the
+  node's. clap can't translate its help, so `orpheusctl` sets each
+  command's and argument's text from `cmd-<command>` and
+  `arg-<command>-<argument>`. clap's own error messages stay English.
+
+Languages are negotiated against those there are (`de-AT` gets `de`).
+Each message is a whole sentence or name, so that a language can order
+it as it needs; plurals choose by a `$count`. Tests check that every
+language has every message, that the code asks only for messages English
+has, and that every command and argument has its help. To add a language,
+add its files and their lines in the two `Catalog`s.
 
 ## Events
 

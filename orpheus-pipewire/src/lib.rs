@@ -136,6 +136,27 @@ enum Kind {
     Playback(PlaybackPort),
 }
 
+/// The names of the nodes the backend makes for itself, as graph tools such
+/// as qpwgraph show them.
+pub struct Names {
+    /// A node measuring an output, by the output's node name.
+    pub meter: Box<dyn Fn(&str) -> String + Send>,
+    /// A node playing wires, by the node names at their ends.
+    pub wire: WireName,
+}
+
+/// Names a node playing wires, by the node names at their ends.
+pub type WireName = Box<dyn Fn(&str, &str) -> String + Send>;
+
+impl Default for Names {
+    fn default() -> Self {
+        Self {
+            meter: Box::new(|output| format!("Orpheus meter {output}")),
+            wire: Box::new(|from, to| format!("Orpheus wire {from} → {to}")),
+        }
+    }
+}
+
 /// Handle to the PipeWire thread. Dropping it stops the thread and removes all
 /// streams.
 pub struct PipeWireBackend {
@@ -149,8 +170,9 @@ pub struct PipeWireBackend {
 
 impl PipeWireBackend {
     /// Connects to the PipeWire daemon of the current user session. Streams
-    /// to and from other nodes get their icons from `icons`.
-    pub fn connect(icons: Icons) -> Result<Self, BackendError> {
+    /// to and from other nodes get their icons from `icons`; the nodes the
+    /// backend makes for itself their names from `names`.
+    pub fn connect(icons: Icons, names: Names) -> Result<Self, BackendError> {
         let (tx, rx) = pw::channel::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let graph = Arc::new(Mutex::new(Graph::default()));
@@ -158,7 +180,7 @@ impl PipeWireBackend {
             .name("orpheus-pipewire".into())
             .spawn({
                 let graph = graph.clone();
-                move || run(rx, ready_tx, graph)
+                move || run(rx, ready_tx, graph, names)
             })?;
         match ready_rx.recv() {
             Ok(Ok(())) => Ok(Self {
@@ -445,6 +467,7 @@ fn run(
     rx: pw::channel::Receiver<Command>,
     ready: mpsc::SyncSender<Result<(), String>>,
     graph: Arc<Mutex<Graph>>,
+    names: Names,
 ) {
     pw::init();
     let setup = || -> Result<_, pw::Error> {
@@ -479,7 +502,10 @@ fn run(
     let streams: Rc<RefCell<HashMap<u64, Live>>> = Rc::default();
     let groups: Rc<RefCell<Groups>> = Rc::default();
     let created: Rc<RefCell<HashMap<u64, Created>>> = Rc::default();
-    let nodes: Rc<RefCell<Wiring>> = Rc::default();
+    let nodes = Rc::new(RefCell::new(Wiring {
+        names,
+        ..Wiring::default()
+    }));
     // Links the created outputs to their devices, and the wires through
     // their nodes, as ports come and go.
     let relink = Rc::new({
@@ -716,6 +742,7 @@ struct Wiring {
     nodes: HashMap<(String, String), WireNode>,
     meters: HashMap<String, MeterNode>,
     next: u64,
+    names: Names,
 }
 
 /// Nodes to drop once their links are.
@@ -769,7 +796,7 @@ impl Wiring {
             }
             let name = format!("orpheus.meter.{}", self.next);
             self.next += 1;
-            let description = format!("Orpheus meter {output}");
+            let description = (self.names.meter)(output);
             match MeterNode::new(core, &name, &description, channels) {
                 Ok(node) => {
                     self.meters.insert(output.clone(), node);
@@ -783,7 +810,7 @@ impl Wiring {
                 None => {
                     let name = format!("orpheus.wire.{}", self.next);
                     self.next += 1;
-                    let description = format!("Orpheus wire {} → {}", key.0, key.1);
+                    let description = (self.names.wire)(&key.0, &key.1);
                     match WireNode::new(core, &name, &description, pairs.clone(), gains) {
                         Ok(node) => {
                             self.nodes.insert(key.clone(), node);
