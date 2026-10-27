@@ -10,9 +10,10 @@
 //! an override, `null` removes it.
 
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::PathBuf;
 
-use orpheus_clock::ptp::{PtpConfig, PtpTransport};
+use orpheus_clock::ptp::{PtpConfig, PtpTransport, PtpUnicast};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
@@ -51,6 +52,13 @@ pub struct PtpSettings {
     pub step_threshold_us: u32,
     /// Offset from the grandmaster under which the clock counts as settled.
     pub settle_threshold_us: u32,
+    /// `auto`, `always` or `never`: when to ask the master for unicast.
+    #[schema(value_type = String, example = "auto")]
+    pub unicast: PtpUnicast,
+    /// PTP devices to ask for Announce by unicast when their multicast
+    /// doesn't arrive, besides the Orpheus nodes.
+    #[schema(value_type = Vec<String>, example = json!(["192.168.1.5"]))]
+    pub unicast_masters: Vec<IpAddr>,
 }
 
 /// The receivers. A change of `link_offset_ms` restarts running streams.
@@ -123,6 +131,7 @@ pub fn ptp_config(p: &PtpSettings) -> PtpConfig {
         slave_only: p.slave_only,
         step_threshold_us: p.step_threshold_us,
         settle_threshold_us: p.settle_threshold_us,
+        unicast: p.unicast,
     }
 }
 
@@ -159,6 +168,8 @@ impl Settings {
                 slave_only: p.slave_only,
                 step_threshold_us: p.step_threshold_us,
                 settle_threshold_us: p.settle_threshold_us,
+                unicast: p.unicast,
+                unicast_masters: p.unicast_masters.clone(),
             },
             receiver: ReceiverSettings {
                 accept: r.accept,

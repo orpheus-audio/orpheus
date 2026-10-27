@@ -299,8 +299,16 @@ mod tests {
             common::{PortIdentity, Tlv, TlvSetBuilder},
             messages::{AnnounceMessage, Header, Message, MessageBody, PtpVersion, MAX_DATA_LEN},
         },
-        port::tests::{setup_test_port, setup_test_port_custom_identity, setup_test_state},
+        port::{
+            tests::{setup_test_port, setup_test_port_custom_identity, setup_test_state},
+            PeerId, Source,
+        },
         time::Time,
+    };
+
+    const FROM: Source = Source {
+        peer: PeerId(1),
+        multicast: true,
     };
 
     fn default_announce_message_header() -> Header {
@@ -365,7 +373,7 @@ mod tests {
         let mut packet = [0; MAX_DATA_LEN];
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(packet, FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
@@ -386,7 +394,7 @@ mod tests {
         let mut packet = [0; MAX_DATA_LEN];
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(packet, FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
@@ -442,21 +450,21 @@ mod tests {
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
 
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(packet, FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(packet, FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_general_receive(packet);
+        let mut actions = port.handle_general_receive(packet, FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
@@ -485,21 +493,21 @@ mod tests {
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(1));
+        let mut actions = port.handle_event_receive(packet, Time::from_micros(1), FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(2));
+        let mut actions = port.handle_event_receive(packet, Time::from_micros(2), FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
         assert!(actions.next().is_none());
         drop(actions);
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(3));
+        let mut actions = port.handle_event_receive(packet, Time::from_micros(3), FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };
@@ -545,7 +553,7 @@ mod tests {
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(1));
+        let mut actions = port.handle_event_receive(packet, Time::from_micros(1), FROM);
         assert!(actions.next().is_none());
 
         drop(actions);
@@ -569,7 +577,7 @@ mod tests {
         let packet_len = announce_message.serialize(&mut packet).unwrap();
         let packet = &packet[..packet_len];
 
-        let mut actions = port.handle_event_receive(packet, Time::from_micros(2));
+        let mut actions = port.handle_event_receive(packet, Time::from_micros(2), FROM);
         let Some(PortAction::ResetAnnounceReceiptTimer { .. }) = actions.next() else {
             panic!("Unexpected action");
         };

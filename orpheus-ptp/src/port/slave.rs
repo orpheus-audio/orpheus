@@ -11,7 +11,9 @@ use crate::{
         PDelayRespMessage, SyncMessage,
     },
     filters::Filter,
-    port::{actions::TimestampContextInner, state::SyncState, PortAction, TimestampContext},
+    port::{
+        actions::TimestampContextInner, state::SyncState, Destination, PortAction, TimestampContext,
+    },
     ptp_instance::PtpInstanceStateMutex,
     time::{Duration, Interval, Time},
     Clock,
@@ -509,6 +511,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                 },
                 data: &self.packet_buffer[..message_length],
                 link_local: true,
+                to: Destination::Multicast,
             }
         ]
     }
@@ -522,7 +525,8 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                 log::debug!("Starting new delay measurement");
 
                 let delay_id = self.delay_seq_ids.generate();
-                let delay_req = self.instance_state.with_ref(|state| {
+                let to = self.requests.delay_req_to();
+                let mut delay_req = self.instance_state.with_ref(|state| {
                     Message::delay_req(
                         &state.default_ds,
                         self.port_identity,
@@ -531,6 +535,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                     )
                 });
 
+                delay_req.header.unicast_flag = to != Destination::Multicast;
                 let message_length = match delay_req.serialize(&mut self.packet_buffer) {
                     Ok(length) => length,
                     Err(error) => {
@@ -559,6 +564,7 @@ impl<A, C: Clock, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'_, Running,
                         },
                         data: &self.packet_buffer[..message_length],
                         link_local: false,
+                        to,
                     }
                 ]
             }
@@ -789,6 +795,7 @@ mod tests {
             context,
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = action.next()
         else {
             panic!("Unexpected action");
@@ -872,6 +879,7 @@ mod tests {
             context,
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = action.next()
         else {
             panic!("Unexpected action");
@@ -1187,6 +1195,7 @@ mod tests {
             context,
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = action.next()
         else {
             panic!("Unexpected action");
@@ -1303,6 +1312,7 @@ mod tests {
             context,
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -1368,6 +1378,7 @@ mod tests {
             context,
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -1450,6 +1461,7 @@ mod tests {
             context,
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -1533,6 +1545,7 @@ mod tests {
             context,
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -1606,6 +1619,7 @@ mod tests {
             context,
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");

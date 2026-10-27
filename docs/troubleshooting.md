@@ -70,7 +70,9 @@ and it follows the grandmaster again within seconds, without a restart.
 - **Every node is master.** If each node reports `master` and itself as
   grandmaster, they don't hear each other's announce messages. Check the
   firewall, the `domain`, and that all nodes use the same transport (the
-  status shows `/ipv4` or `/ipv6`).
+  status shows `/ipv4` or `/ipv6`). Where only multicast is lost, the
+  nodes find each other by unicast after about 10 s; see
+  [below](#ptp-works-for-a-few-minutes-then-stops).
 - **Wrong interface.** On a machine with Ethernet and Wi-Fi, the default
   route may be on the wrong one. Set `[ptp] interface`.
 - **It's still settling.** A node settles about 10 s after it hears the
@@ -78,9 +80,11 @@ and it follows the grandmaster again within seconds, without a restart.
 - **Wi-Fi.** PTP over Wi-Fi is unreliable. Access points send multicast at a
   low rate, and with power saving they hold it back for 100 to 300 ms. Use
   Ethernet if you can; the servo keeps held messages out of the clock
-  ([clock](clock.md#ptp)). The node warns about it (`wifi`,
-  `ptp_delay` or `ptp_steps` in the [warnings](usage.md#warnings)). Turn
-  off [power saving](#wi-fi-power-saving) on every node on Wi-Fi.
+  ([clock](clock.md#ptp)), and nodes ask their master for unicast
+  ([clock](clock.md#unicast)): `unicast` in the status should say
+  `granted`. The node warns about it (`wifi`, `ptp_delay`, `ptp_steps` or
+  `ptp_multicast` in the [warnings](usage.md#warnings)). Turn off [power
+  saving](#wi-fi-power-saving) on every node on Wi-Fi.
 - **Unsteady path.** If `steps` keeps rising (warning `ptp_steps`), the
   delay to the grandmaster jumps by more than `step_threshold_us` for
   seconds at a time. Raise it, for example `[ptp] step_threshold_us =
@@ -156,8 +160,10 @@ ufw does this by default (IGMP is IP protocol 2; the kernel log shows
 `[UFW BLOCK] … PROTO=2` from the router about every two minutes). mDNS
 keeps working, because switches and access points send link-local groups
 (224.0.0.x) to every port anyway, so `orpheusctl nodes` still lists the
-others. On Wi-Fi the node then gets PTP only by unicast from other
-Orpheus nodes, and nothing from a grandmaster that is not one.
+others. The node then asks the other Orpheus nodes for PTP by unicast
+([clock](clock.md#unicast)), so it keeps working, but a grandmaster that is
+not an Orpheus node it hears only if listed in `[ptp] unicast_masters` and
+able to negotiate unicast. Let IGMP in all the same.
 
 With ufw, add to `/etc/ufw/before.rules`, above the `COMMIT` line:
 

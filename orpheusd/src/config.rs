@@ -3,11 +3,11 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use orpheus_clock::ptp::PtpTransport;
+use orpheus_clock::ptp::{PtpTransport, PtpUnicast};
 use orpheus_core::OutputType;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -335,6 +335,13 @@ pub struct PtpConfig {
     pub step_threshold_us: u32,
     /// Offset from the grandmaster under which the clock counts as settled.
     pub settle_threshold_us: u32,
+    /// `auto`, `always` or `never`: when to ask the master for Sync and
+    /// Delay_Resp by unicast. `auto` does when Wi-Fi is on the path or the
+    /// measurements spread widely.
+    pub unicast: PtpUnicast,
+    /// PTP devices to ask for Announce by unicast when their multicast
+    /// doesn't arrive, besides the Orpheus nodes found by discovery.
+    pub unicast_masters: Vec<IpAddr>,
 }
 
 impl Default for PtpConfig {
@@ -350,6 +357,8 @@ impl Default for PtpConfig {
             slave_only: d.slave_only,
             step_threshold_us: d.step_threshold_us,
             settle_threshold_us: d.settle_threshold_us,
+            unicast: d.unicast,
+            unicast_masters: vec![],
         }
     }
 }
@@ -549,6 +558,14 @@ mod tests {
         assert_eq!(c.ptp.transport, PtpTransport::Auto);
         let c: Config = toml::from_str("[ptp]\ntransport = \"ipv6\"").unwrap();
         assert_eq!(c.ptp.transport, PtpTransport::Ipv6);
+        assert_eq!(c.ptp.unicast, PtpUnicast::Auto);
+        let c: Config = toml::from_str("[ptp]\nunicast = \"never\"").unwrap();
+        assert_eq!(c.ptp.unicast, PtpUnicast::Never);
+        let c: Config = toml::from_str("[ptp]\nunicast_masters = [\"10.0.0.5\"]").unwrap();
+        assert_eq!(
+            c.ptp.unicast_masters,
+            ["10.0.0.5".parse::<IpAddr>().unwrap()]
+        );
     }
 
     #[test]

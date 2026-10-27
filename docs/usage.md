@@ -584,9 +584,10 @@ Clock          ● PTP, settled
   interface    enp3s0 (IPv4)
   identity     4cb04a.fffe.50a582
   state        slave
-  grandmaster  9c6b00.fffe.1a2b3c
+  grandmaster  9c6b00.fffe.1a2b3c (192.168.1.20)
   offset       -0.4 µs
   delay        41.2 µs
+  path jitter  12.5 µs
   frequency    +12.31 ppm
   steps        1
 
@@ -633,10 +634,17 @@ and go; see [warnings](#warnings).
 - `state`: `slave` follows the grandmaster, `master` is it. `listening` means
   no other PTP clock has been heard yet. `uncalibrated` means following but
   not yet synchronized.
-- `grandmaster`: the clock everyone follows; `this node` if it is this one.
+- `grandmaster`: the clock everyone follows, and its address; `this node`
+  if it is this one.
 - `offset`: estimated difference from the grandmaster. A few µs to tens of µs
   is normal with software timestamps.
 - `delay`: estimated one-way network delay to the grandmaster.
+- `path jitter`: how widely the latest PTP measurements spread: tens of µs
+  wired, a millisecond or more over Wi-Fi.
+- `unicast`: whether the grandmaster sends to this node by unicast
+  (`requested`, `granted`, or `refused, multicast`), or on the grandmaster,
+  to how many nodes; see [clock](clock.md#unicast). Not shown while
+  neither.
 - `frequency`: how much faster than the system clock the PTP clock runs. This
   is the crystal difference between the two machines, typically within
   ±50 ppm.
@@ -838,7 +846,10 @@ websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
 - `clock.source`: `ptp` while PTP runs, `holdover` while it is stopped
   after following a grandmaster, `system` otherwise. `clock.ptp` is there
   whenever PTP is enabled, also while it isn't running: `running`, and if
-  not, `error` (why) and `holdover`.
+  not, `error` (why) and `holdover`. While following, `master_address` and
+  `path_jitter_us`; `unicast` is `off`, `requested`, `granted` or
+  `refused`, and `unicast_followers` counts the nodes a grandmaster sends
+  to by unicast.
 - `accept`, `policy`, `duck_db`: the [`[receiver]`
   settings](configuration.md#receiver).
 - `receivers`: one per connection and the free one. `sender` names the
@@ -894,6 +905,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `ptp_delay` | clock | The path to the PTP grandmaster takes more than 0.5 ms; wired it takes tens to a few hundred µs. On Wi-Fi the message names the signal, as for `jitter`. |
 | `ptp_down` | clock | PTP is not running, so the node plays out of step with the other nodes: on the system clock, or holding over the grandmaster's last time and rate. It tries again by itself; see [clock](clock.md#when-ptp-cant-run). |
 | `ptp_steps` | clock | The PTP clock stepped 3 times within a minute instead of settling, which a slow or unsteady path to the grandmaster causes. On Wi-Fi the message names the signal, as for `jitter`. |
+| `ptp_multicast` | clock | Wi-Fi is on the path to the PTP master (this node's or the master's, as it announces), and the master refused to send by unicast or didn't answer, so PTP crosses Wi-Fi by multicast. See [clock](clock.md#unicast). |
 | `held` | receiver | The stream plays nowhere: the default output is a sink to another node, and streams are passed on to other nodes only when chosen. See [outputs and volume](#outputs-and-volume). |
 | `peer_busy` | sender | The route wants a receiver on the peer, but all of the peer's receivers play other senders; it tries again every 5 seconds. Raise `[receiver] max` on the peer, or let other routes [claim on play](#claiming-a-receiver-on-play). |
 | `peer_incompatible` | sender | None of the peer's receivers can play the route's stream; it tries again when the peer's receivers change. |

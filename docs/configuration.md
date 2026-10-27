@@ -86,6 +86,8 @@ priority2 = 128
 slave_only = false
 step_threshold_us = 2000
 settle_threshold_us = 100
+unicast = "auto"
+unicast_masters = []
 
 [aes70]
 enabled = true
@@ -245,6 +247,8 @@ Clock synchronization with the other nodes and with AES67 devices. See
 | `slave_only` | `false` | Never become the grandmaster. |
 | `step_threshold_us` | `2000` | Offsets above this are corrected in one step, smaller ones gradually. |
 | `settle_threshold_us` | `100` | The clock counts as settled once its offset from the grandmaster stays below this. |
+| `unicast` | `"auto"` | When to ask the master for Sync and Delay_Resp by unicast: `"auto"` when Wi-Fi is on the path (this node's interface, or the master announces it) or the measurements spread more than 250 µs, `"always"`, or `"never"`. See [clock](clock.md#unicast). `"never"` also stops asking for Announce by unicast. |
+| `unicast_masters` | `[]` | Addresses of PTP devices that aren't Orpheus nodes, to ask for Announce by unicast when their multicast doesn't arrive, as the other Orpheus nodes are. They must offer unicast negotiation (ptp4l: `unicast_listen 1`). |
 
 The PTP message rates follow the AES67 media profile and cannot be configured
 yet: sync every 125 ms, announce every 2 s, delay requests every second.
@@ -332,7 +336,7 @@ set over the API stays until it is reset.
 
 | Section | Keys | When it takes effect |
 |---|---|---|
-| `ptp` | `interface`, `transport`, `domain`, `priority1`, `priority2`, `slave_only`, `step_threshold_us`, `settle_threshold_us` | PTP restarts at once; the clock keeps running without a jump. If PTP can't start with the new values, nothing changes. |
+| `ptp` | `interface`, `transport`, `domain`, `priority1`, `priority2`, `slave_only`, `step_threshold_us`, `settle_threshold_us`, `unicast`, `unicast_masters` | PTP restarts at once; the clock keeps running without a jump. If PTP can't start with the new values, nothing changes. |
 | `receiver` | `accept`, `policy`, `duck_db`, `default_output`, `when_lost`, `lost_after_ms` | at once |
 | `receiver` | `link_offset_ms` | at once; streams that play restart, with a short gap |
 | `sender` | `claim`, `release_after_s`, `fade_in_ms` | at once |

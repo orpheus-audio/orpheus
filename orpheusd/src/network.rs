@@ -8,7 +8,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 
-use orpheus_clock::ptp::{PtpTransport, Unicast};
+use orpheus_clock::ptp::PtpTransport;
 use orpheus_discovery::Link;
 
 use crate::nmos;
@@ -26,18 +26,13 @@ pub fn is_wireless(interface: &str) -> bool {
     dir.join("wireless").exists() || dir.join("phy80211").exists()
 }
 
-/// Where PTP messages also go by unicast: to the other Orpheus nodes that
-/// announce Wi-Fi, by one address of `transport`. Multicast reaches the
-/// rest; from a node on Wi-Fi too, which sends it to the access point like
-/// unicast. `ptp_wireless`: PTP runs over Wi-Fi here.
-pub fn ptp_unicast(
-    ptp_wireless: bool,
-    transport: PtpTransport,
-    nodes: &[orpheus_discovery::Node],
-) -> Unicast {
-    let peers = nodes
+/// Where the other Orpheus nodes are for PTP: one address each, of
+/// `transport`, a global IPv6 address before a link-local one. PTP asks
+/// those whose multicast doesn't arrive for Announce by unicast.
+pub fn ptp_peers(transport: PtpTransport, nodes: &[orpheus_discovery::Node]) -> Vec<IpAddr> {
+    nodes
         .iter()
-        .filter(|n| n.online && n.id.is_some() && n.link == Some(Link::Wifi))
+        .filter(|n| n.online && n.id.is_some())
         .filter_map(|n| {
             let ips = n
                 .addresses
@@ -47,7 +42,6 @@ pub fn ptp_unicast(
                 // Not resolved yet: PTP isn't running.
                 PtpTransport::Auto => None,
                 PtpTransport::Ipv4 => ips.into_iter().find(IpAddr::is_ipv4),
-                // A global address, else a link-local one.
                 PtpTransport::Ipv6 => {
                     let v6: Vec<IpAddr> = ips.filter(IpAddr::is_ipv6).collect();
                     v6.iter()
@@ -57,11 +51,23 @@ pub fn ptp_unicast(
                 }
             }
         })
-        .collect();
-    Unicast {
-        peers,
-        wireless: ptp_wireless,
-    }
+        .collect()
+}
+
+/// Whether the Orpheus node at `address`, as PTP gives its master's,
+/// announces that it is on Wi-Fi.
+pub fn announces_wifi(address: &str, nodes: &[orpheus_discovery::Node]) -> bool {
+    let Ok(address) = address.parse::<IpAddr>() else {
+        return false;
+    };
+    nodes.iter().any(|n| {
+        n.online
+            && n.link == Some(Link::Wifi)
+            && n.addresses
+                .iter()
+                .filter_map(|a| a.split('%').next()?.parse::<IpAddr>().ok())
+                .any(|ip| ip.to_canonical() == address.to_canonical())
+    })
 }
 
 /// The interface the kernel would send to `ip` through.
@@ -115,7 +121,7 @@ mod tests {
     }
 
     #[test]
-    fn ptp_unicast_reaches_wifi() {
+    fn ptp_peers_one_address_each() {
         let nodes = [
             node("WIRED", &["10.0.0.2", "fe80::2%eth0"], Some(Link::Wired)),
             node(
@@ -123,36 +129,38 @@ mod tests {
                 &["10.0.0.3", "2001:db8::3", "fe80::3%wlan0"],
                 Some(Link::Wifi),
             ),
-            node("UNKNOWN", &["fe80::4%eth0"], None),
+            node("LOCAL", &["fe80::4%eth0"], None),
         ];
         let ip = |a: &str| a.parse::<IpAddr>().unwrap();
-        // Only the peer on Wi-Fi, wherever this node is.
-        for wireless in [false, true] {
-            let u = ptp_unicast(wireless, PtpTransport::Ipv4, &nodes);
-            assert_eq!(u.peers, [ip("10.0.0.3")]);
-            assert_eq!(u.wireless, wireless);
-        }
+        assert_eq!(
+            ptp_peers(PtpTransport::Ipv4, &nodes),
+            [ip("10.0.0.2"), ip("10.0.0.3")]
+        );
         // A global IPv6 address over a link-local one.
-        let u = ptp_unicast(true, PtpTransport::Ipv6, &nodes);
-        assert_eq!(u.peers, [ip("2001:db8::3")]);
-        let mut local = nodes.clone();
-        local[1].addresses = vec!["fe80::3%wlan0".into()];
-        let u = ptp_unicast(true, PtpTransport::Ipv6, &local);
-        assert_eq!(u.peers, [ip("fe80::3")]);
+        assert_eq!(
+            ptp_peers(PtpTransport::Ipv6, &nodes),
+            [ip("fe80::2"), ip("2001:db8::3"), ip("fe80::4")]
+        );
         // Not to nodes that went offline, nor to other NMOS nodes.
         let mut gone = nodes.clone();
+        gone[0].online = false;
+        gone[1].id = None;
+        assert!(ptp_peers(PtpTransport::Ipv4, &gone).is_empty());
+    }
+
+    #[test]
+    fn master_on_wifi() {
+        let nodes = [
+            node("WIRED", &["10.0.0.2", "fe80::2%eth0"], Some(Link::Wired)),
+            node("WIFI", &["10.0.0.3", "fe80::3%wlan0"], Some(Link::Wifi)),
+        ];
+        assert!(announces_wifi("10.0.0.3", &nodes));
+        assert!(announces_wifi("fe80::3", &nodes));
+        assert!(!announces_wifi("10.0.0.2", &nodes));
+        // Not an Orpheus node, or gone.
+        assert!(!announces_wifi("10.0.0.9", &nodes));
+        let mut gone = nodes.clone();
         gone[1].online = false;
-        assert!(
-            ptp_unicast(true, PtpTransport::Ipv4, &gone)
-                .peers
-                .is_empty()
-        );
-        let mut other = nodes.clone();
-        other[1].id = None;
-        assert!(
-            ptp_unicast(true, PtpTransport::Ipv4, &other)
-                .peers
-                .is_empty()
-        );
+        assert!(!announces_wifi("10.0.0.3", &gone));
     }
 }

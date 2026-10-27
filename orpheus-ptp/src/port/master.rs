@@ -1,13 +1,13 @@
 use arrayvec::ArrayVec;
 
-use super::{state::PortState, ForwardedTLVProvider, Port, PortActionIterator, Running};
+use super::{state::PortState, ForwardedTLVProvider, Port, PortActionIterator, Running, Source};
 use crate::{
     datastructures::{
         common::{PortIdentity, Tlv, TlvSetBuilder, TlvType},
-        messages::{DelayReqMessage, Header, Message, MAX_DATA_LEN},
+        messages::{DelayReqMessage, Header, Message, MessageType, MAX_DATA_LEN},
     },
     filters::Filter,
-    port::{actions::TimestampContextInner, PortAction, TimestampContext},
+    port::{actions::TimestampContextInner, Destination, PortAction, TimestampContext},
     ptp_instance::PtpInstanceStateMutex,
     time::Time,
 };
@@ -37,18 +37,25 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
                 }
             };
 
-            actions![
-                PortAction::ResetSyncTimer {
-                    duration: self.config.sync_interval.as_core_duration(),
-                },
-                PortAction::SendEvent {
-                    context: TimestampContext {
-                        inner: TimestampContextInner::Sync { id: seq_id },
+            let reset = PortAction::ResetSyncTimer {
+                duration: self.config.sync_interval.as_core_duration(),
+            };
+            let send = PortAction::SendEvent {
+                context: TimestampContext {
+                    inner: TimestampContextInner::Sync {
+                        id: seq_id,
+                        to: Destination::Multicast,
                     },
-                    data: &self.packet_buffer[..packet_length],
-                    link_local: false,
-                }
-            ]
+                },
+                data: &self.packet_buffer[..packet_length],
+                link_local: false,
+                to: Destination::Multicast,
+            };
+            if self.grants.tick(MessageType::Sync) {
+                actions![reset, send, unicast_now()]
+            } else {
+                actions![reset, send]
+            }
         } else {
             actions![]
         }
@@ -58,21 +65,20 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         &mut self,
         id: u16,
         timestamp: Time,
+        to: Destination,
     ) -> PortActionIterator<'_> {
         if matches!(self.port_state, PortState::Master) {
-            let packet_length = match self
-                .instance_state
-                .with_ref(|state| {
-                    Message::follow_up(
-                        &state.default_ds,
-                        self.port_identity,
-                        id,
-                        timestamp,
-                        self.config.minor_ptp_version.into(),
-                    )
-                })
-                .serialize(&mut self.packet_buffer)
-            {
+            let mut message = self.instance_state.with_ref(|state| {
+                Message::follow_up(
+                    &state.default_ds,
+                    self.port_identity,
+                    id,
+                    timestamp,
+                    self.config.minor_ptp_version.into(),
+                )
+            });
+            message.header.unicast_flag = to != Destination::Multicast;
+            let packet_length = match message.serialize(&mut self.packet_buffer) {
                 Ok(length) => length,
                 Err(error) => {
                     log::error!(
@@ -86,6 +92,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
             actions![PortAction::SendGeneral {
                 data: &self.packet_buffer[..packet_length],
                 link_local: false,
+                to,
             }]
         } else {
             actions![]
@@ -174,15 +181,19 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
                 }
             };
 
-            actions![
-                PortAction::ResetAnnounceTimer {
-                    duration: self.config.announce_interval.as_core_duration(),
-                },
-                PortAction::SendGeneral {
-                    data: &self.packet_buffer[..packet_length],
-                    link_local: false,
-                }
-            ]
+            let reset = PortAction::ResetAnnounceTimer {
+                duration: self.config.announce_interval.as_core_duration(),
+            };
+            let send = PortAction::SendGeneral {
+                data: &self.packet_buffer[..packet_length],
+                link_local: false,
+                to: Destination::Multicast,
+            };
+            if self.grants.tick(MessageType::Announce) {
+                actions![reset, send, unicast_now()]
+            } else {
+                actions![reset, send]
+            }
         } else {
             actions![]
         }
@@ -193,16 +204,24 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         header: Header,
         message: DelayReqMessage,
         timestamp: Time,
+        from: Source,
     ) -> PortActionIterator<'_> {
         if matches!(self.port_state, PortState::Master) {
             log::debug!("Received DelayReq");
-            let delay_resp_message = Message::delay_resp(
+            // Answered the way it came.
+            let to = if from.multicast {
+                Destination::Multicast
+            } else {
+                Destination::Unicast(from.peer)
+            };
+            let mut delay_resp_message = Message::delay_resp(
                 header,
                 message,
                 self.port_identity,
                 self.config.min_delay_req_interval(),
                 timestamp,
             );
+            delay_resp_message.header.unicast_flag = !from.multicast;
 
             let packet_length = match delay_resp_message.serialize(&mut self.packet_buffer) {
                 Ok(length) => length,
@@ -215,6 +234,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
             actions![PortAction::SendGeneral {
                 data: &self.packet_buffer[..packet_length],
                 link_local: false,
+                to,
             }]
         } else {
             actions![]
@@ -254,6 +274,7 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
                 }
             },
             link_local: true,
+            to: Destination::Multicast,
         }]
     }
 
@@ -285,7 +306,15 @@ impl<A, C, F: Filter, R, S: PtpInstanceStateMutex> Port<'_, Running, A, R, C, F,
         actions![PortAction::SendGeneral {
             data: &self.packet_buffer[..packet_length],
             link_local: true,
+            to: Destination::Multicast,
         }]
+    }
+}
+
+/// Asks for [`Port::handle_unicast_timer`] right away.
+fn unicast_now<'a>() -> PortAction<'a> {
+    PortAction::ResetUnicastTimer {
+        duration: core::time::Duration::ZERO,
     }
 }
 
@@ -303,9 +332,14 @@ mod tests {
         },
         port::{
             tests::{setup_test_port, setup_test_state},
-            NoForwardedTLVs,
+            NoForwardedTLVs, PeerId,
         },
         time::Interval,
+    };
+
+    const MULTICAST: Source = Source {
+        peer: PeerId(1),
+        multicast: true,
     };
 
     #[test]
@@ -334,11 +368,13 @@ mod tests {
                 origin_timestamp: Time::from_micros(0).into(),
             },
             Time::from_fixed_nanos(U96F32::from_bits((200000 << 32) + (500 << 16))),
+            MULTICAST,
         );
 
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = action.next()
         else {
             panic!("Unexpected resulting action");
@@ -387,11 +423,13 @@ mod tests {
                 origin_timestamp: Time::from_micros(0).into(),
             },
             Time::from_fixed_nanos(U96F32::from_bits((220000 << 32) + (300 << 16))),
+            MULTICAST,
         );
 
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = action.next()
         else {
             panic!("Unexpected resulting action");
@@ -447,6 +485,7 @@ mod tests {
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -474,6 +513,7 @@ mod tests {
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -519,6 +559,7 @@ mod tests {
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -572,6 +613,7 @@ mod tests {
             context,
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -588,18 +630,20 @@ mod tests {
         };
 
         let id = match context.inner {
-            TimestampContextInner::Sync { id } => id,
+            TimestampContextInner::Sync { id, .. } => id,
             _ => panic!("Wrong type of context"),
         };
 
         let mut actions = port.handle_sync_timestamp(
             id,
             Time::from_fixed_nanos(U96F32::from_bits((601300 << 32) + (230 << 16))),
+            Destination::Multicast,
         );
 
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -639,6 +683,7 @@ mod tests {
             context,
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -655,18 +700,20 @@ mod tests {
         };
 
         let id = match context.inner {
-            TimestampContextInner::Sync { id } => id,
+            TimestampContextInner::Sync { id, .. } => id,
             _ => panic!("wrong type of context"),
         };
 
         let mut actions = port.handle_sync_timestamp(
             id,
             Time::from_fixed_nanos(U96F32::from_bits((1000601300 << 32) + (543 << 16))),
+            Destination::Multicast,
         );
 
         let Some(PortAction::SendGeneral {
             data,
             link_local: false,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -709,6 +756,7 @@ mod tests {
             context,
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");
@@ -730,6 +778,7 @@ mod tests {
         let Some(PortAction::SendGeneral {
             data,
             link_local: true,
+            to: Destination::Multicast,
         }) = actions.next()
         else {
             panic!("Unexpected action");

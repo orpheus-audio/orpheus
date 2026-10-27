@@ -48,8 +48,8 @@ use orpheus_ptp::filters::{
 };
 use orpheus_ptp::observability::port::PortState;
 use orpheus_ptp::port::{
-    InBmca, MAX_DATA_LEN, Measurement, NoForwardedTLVs, Port, PortAction, PortActionIterator,
-    TimestampContext, is_message_buffer_compatible,
+    Destination, InBmca, MAX_DATA_LEN, Measurement, NoForwardedTLVs, PeerId, Port, PortAction,
+    PortActionIterator, Source, TimestampContext, is_message_buffer_compatible,
 };
 use orpheus_ptp::time::{Duration, Interval, Time};
 use orpheus_ptp::{OverlayClock, PtpInstance, PtpInstanceState};
@@ -128,23 +128,57 @@ pub enum PtpTransport {
     Ipv6,
 }
 
-/// Where PTP messages go besides the multicast group: other nodes on
-/// Wi-Fi. An access point holds multicast back while any client dozes, up
-/// to a beacon interval (about 100 ms), and sends it at its lowest rate
-/// without retries; unicast it sends at once, acknowledged. Every node
-/// sends both, so wired nodes and other PTP devices keep multicast; a node
-/// on Wi-Fi takes a sender's messages by unicast once it heard it that way.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Unicast {
-    /// The nodes, on the port's transport; link-local IPv6 addresses are
-    /// taken on the port's interface.
-    pub peers: Vec<IpAddr>,
-    /// The port's interface is on Wi-Fi. The node then drops multicast
-    /// from senders that also reach it by unicast, and sends its unicast
-    /// copies first: a message's send time is that of the first copy, and
-    /// the others leave a few µs later. A wired node sends multicast first,
-    /// for the wired nodes that follow it.
-    pub wireless: bool,
+/// When a follower asks its master for Sync and Delay_Resp by unicast
+/// (IEEE 1588-2019 16.1). An access point holds multicast back while any
+/// client dozes, up to a beacon interval (about 100 ms), and sends it at
+/// its lowest rate without retries; unicast it sends at once, acknowledged.
+/// Wi-Fi anywhere on the path hurts: a master on Wi-Fi gets every
+/// follower's delay requests by multicast from the access point.
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PtpUnicast {
+    /// When the path is known to cross Wi-Fi ([`PtpClock::set_wifi_on_path`])
+    /// or the measurements spread widely, from then on while following
+    /// the same grandmaster.
+    #[default]
+    Auto,
+    /// Always, for networks that drop multicast.
+    Always,
+    /// Never.
+    Never,
+}
+
+/// Where a follower's request for unicast stands.
+#[cfg_attr(feature = "serde", derive(serde::Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UnicastState {
+    /// Not asked for: not needed, not following, or the master not heard
+    /// yet.
+    #[default]
+    Off,
+    /// Asked, no answer yet.
+    Requested,
+    /// The master sends by unicast.
+    Granted,
+    /// The master refused or didn't answer; the node takes multicast and
+    /// asks again later.
+    Refused,
+}
+
+impl From<orpheus_ptp::port::UnicastState> for UnicastState {
+    fn from(s: orpheus_ptp::port::UnicastState) -> Self {
+        use orpheus_ptp::port::UnicastState as S;
+        match s {
+            S::Off => Self::Off,
+            S::Requested => Self::Requested,
+            S::Granted => Self::Granted,
+            S::Refused => Self::Refused,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -163,6 +197,7 @@ pub struct PtpConfig {
     pub step_threshold_us: u32,
     /// Offset under which the clock counts as settled.
     pub settle_threshold_us: u32,
+    pub unicast: PtpUnicast,
 }
 
 impl Default for PtpConfig {
@@ -176,6 +211,7 @@ impl Default for PtpConfig {
             slave_only: false,
             step_threshold_us: 2000,
             settle_threshold_us: 100,
+            unicast: PtpUnicast::Auto,
         }
     }
 }
@@ -250,6 +286,17 @@ pub struct PtpStatus {
     pub steps: u64,
     /// Within the settle threshold of the grandmaster, or the grandmaster.
     pub settled: bool,
+    /// Address of the master, while following one.
+    #[cfg_attr(feature = "serde", serde(skip_serializing_if = "Option::is_none"))]
+    pub master_address: Option<String>,
+    /// How widely the latest measurements spread on the way from and to
+    /// the master: the 90th percentile of how late they came, against the
+    /// earliest. Tens of µs wired, milliseconds on Wi-Fi.
+    pub path_jitter_us: Option<f64>,
+    /// Whether the master sends to this node by unicast.
+    pub unicast: UnicastState,
+    /// Nodes this node sends to by unicast as master.
+    pub unicast_followers: usize,
 }
 
 /// The system clock on the TAI timescale, read-only underneath the overlay.
@@ -283,7 +330,13 @@ struct Shared {
     frequency_ppm: AtomicU64,
     /// The clock has followed a grandmaster since the start.
     followed: AtomicBool,
-    unicast: Mutex<Unicast>,
+    /// Wi-Fi is known to be on the path to the master.
+    wifi_on_path: AtomicBool,
+    /// The servo's latest path jitter, in ns; `u64::MAX` for none.
+    jitter_ns: Arc<AtomicU64>,
+    /// Where other PTP nodes are, to ask for Announce by unicast if their
+    /// multicast doesn't arrive.
+    unicast_peers: Mutex<Vec<IpAddr>>,
 }
 
 impl Shared {
@@ -306,11 +359,17 @@ impl Shared {
                 frequency_ppm: 0.0,
                 steps: 0,
                 settled: false,
+                master_address: None,
+                path_jitter_us: None,
+                unicast: UnicastState::Off,
+                unicast_followers: 0,
             }),
             steps: AtomicU64::new(0),
             frequency_ppm: AtomicU64::new(0f64.to_bits()),
             followed: AtomicBool::new(false),
-            unicast: Mutex::new(Unicast::default()),
+            wifi_on_path: AtomicBool::new(false),
+            jitter_ns: Arc::new(AtomicU64::new(u64::MAX)),
+            unicast_peers: Mutex::new(Vec::new()),
         }
     }
 
@@ -419,9 +478,20 @@ impl PtpClock {
         self.shared.status.lock().unwrap().clone()
     }
 
-    /// Sets where PTP messages go besides the multicast group.
-    pub fn set_unicast(&self, unicast: Unicast) {
-        *self.shared.unicast.lock().unwrap() = unicast;
+    /// Tells whether Wi-Fi is on the path to the master: this node's
+    /// interface, or the master's. With [`PtpUnicast::Auto`] the node then
+    /// asks the master for unicast.
+    pub fn set_wifi_on_path(&self, wifi: bool) {
+        self.shared.wifi_on_path.store(wifi, Relaxed);
+    }
+
+    /// Tells where other PTP nodes are. Those whose multicast Announce
+    /// doesn't arrive, because something on the way drops multicast, the
+    /// node asks for Announce by unicast (unless [`PtpUnicast::Never`]);
+    /// one that becomes its master it then asks for Sync and Delay_Resp
+    /// by unicast too.
+    pub fn set_unicast_peers(&self, peers: Vec<IpAddr>) {
+        *self.shared.unicast_peers.lock().unwrap() = peers;
     }
 }
 
@@ -509,6 +579,7 @@ type BmcaPort<'a> =
 /// and the next one step back.
 struct Servo {
     config: KalmanConfiguration,
+    jitter_ns: Arc<AtomicU64>,
     filter: KalmanFilter,
     /// Time of the last step; measurements shortly after it are dropped.
     stepped_at: Option<Time>,
@@ -552,6 +623,17 @@ impl Gate {
     fn clear(&mut self) {
         self.excess.clear();
     }
+
+    /// The 90th percentile of the window's excess against its fastest,
+    /// once the window is half full.
+    fn spread(&self) -> Option<f64> {
+        if self.excess.len() < self.len / 2 {
+            return None;
+        }
+        let mut sorted: Vec<f64> = self.excess.iter().copied().collect();
+        sorted.sort_by(f64::total_cmp);
+        Some(sorted[sorted.len() * 9 / 10] - sorted[0])
+    }
 }
 
 /// The path delay, as the median of recent samples.
@@ -591,13 +673,31 @@ impl DelayEstimate {
     }
 }
 
-impl Filter for Servo {
-    type Config = KalmanConfiguration;
+/// The servo's settings, and where it reports the path jitter.
+#[derive(Clone)]
+struct ServoConfig {
+    kalman: KalmanConfiguration,
+    jitter_ns: Arc<AtomicU64>,
+}
 
-    fn new(config: KalmanConfiguration) -> Self {
+impl From<KalmanConfiguration> for ServoConfig {
+    fn from(kalman: KalmanConfiguration) -> Self {
         Self {
-            filter: KalmanFilter::new(config),
-            config,
+            kalman,
+            jitter_ns: Arc::new(AtomicU64::new(u64::MAX)),
+        }
+    }
+}
+
+impl Filter for Servo {
+    type Config = ServoConfig;
+
+    fn new(config: ServoConfig) -> Self {
+        config.jitter_ns.store(u64::MAX, Relaxed);
+        Self {
+            filter: KalmanFilter::new(config.kalman),
+            jitter_ns: config.jitter_ns,
+            config: config.kalman,
             stepped_at: None,
             delay: DelayEstimate::default(),
             sync_gate: Gate::new(GATE_SYNC_SAMPLES),
@@ -623,7 +723,15 @@ impl Filter for Servo {
             self.delay_gate.clear();
             self.far = 0;
         }
-        if !self.gate(&mut m) {
+        let pass = self.gate(&mut m);
+        if let Some(spread) = [self.sync_gate.spread(), self.delay_gate.spread()]
+            .into_iter()
+            .flatten()
+            .reduce(f64::max)
+        {
+            self.jitter_ns.store((spread * 1e9) as u64, Relaxed);
+        }
+        if !pass {
             return FilterUpdate::default();
         }
         if let Some(sync) = m.raw_sync_offset {
@@ -766,6 +874,8 @@ struct Timers {
     delay_request: Option<Instant>,
     announce_receipt: Option<Instant>,
     filter_update: Option<Instant>,
+    unicast: Option<Instant>,
+    negotiation: Option<Instant>,
 }
 
 async fn at(deadline: Option<Instant>) {
@@ -1136,7 +1246,7 @@ async fn run<A: Transport>(
         ),
     );
     let clock = PortClock(shared.clone());
-    let filter = KalmanConfiguration {
+    let kalman = KalmanConfiguration {
         step_threshold: Duration::from_nanos(cfg.step_threshold_us as i64 * 1000),
         // Correct offsets within about a second instead of two.
         steer_time: Duration::from_seconds(1.0),
@@ -1147,6 +1257,10 @@ async fn run<A: Transport>(
         // cold start; see docs/clock.md.
         difference_estimation_boundary: 2,
         ..Default::default()
+    };
+    let filter = ServoConfig {
+        kalman,
+        jitter_ns: shared.jitter_ns.clone(),
     };
     // AES67 media profile defaults.
     let port_config = PortConfig {
@@ -1173,19 +1287,35 @@ async fn run<A: Transport>(
     let mut settle = Settle::default();
     let mut event_buf = [0u8; MAX_DATA_LEN];
     let mut general_buf = [0u8; 2048];
-    let mut seen = Seen::default();
-    let mut heard = Heard::default();
+    let mut peers = Peers::default();
+    let mut want = WantUnicast::default();
     let mut bmca_at = Instant::now();
     loop {
         instance.bmca(&mut [&mut port]);
-        publish(&instance, &port, shared, cfg, &mut settle);
+        let grandmaster = instance.parent_ds().grandmaster_identity;
+        let known: Vec<PeerId> = if cfg.unicast == PtpUnicast::Never {
+            vec![]
+        } else {
+            let now = Instant::now();
+            let ips = shared.unicast_peers.lock().unwrap().clone();
+            ips.into_iter().map(|ip| peers.id(ip, now)).collect()
+        };
+        port.set_unicast_peers(&known);
+        port.set_unicast(want.update(
+            cfg.unicast,
+            shared.wifi_on_path.load(Relaxed),
+            shared.jitter_ns.load(Relaxed),
+            grandmaster,
+            port.is_steering(),
+        ));
+        publish(&instance, &port, shared, cfg, &mut settle, &peers);
         bmca_at += instance.bmca_interval();
 
         let (mut running, actions) = port.end_bmca();
-        let mut pending = handle_actions(actions, &mut sockets, &mut timers, &clock).await;
+        let mut pending = handle_actions(actions, &mut sockets, &mut timers, &clock, &peers).await;
         while let Some((context, time)) = pending {
             let actions = running.handle_send_timestamp(context, time);
-            pending = handle_actions(actions, &mut sockets, &mut timers, &clock).await;
+            pending = handle_actions(actions, &mut sockets, &mut timers, &clock, &peers).await;
         }
 
         loop {
@@ -1199,10 +1329,10 @@ async fn run<A: Transport>(
                 result = sockets.event.recv(&mut event_buf) => match result {
                     Ok(packet) => {
                         let data = &event_buf[..packet.bytes_read];
-                        let take = heard.take(&packet, wireless(&clock)) && seen.first(data);
                         match packet.timestamp_data.selected_timestamp() {
-                            Some(ts) if is_message_buffer_compatible(data) && take => {
-                                running.handle_event_receive(data, clock.time_of(ts))
+                            Some(ts) if is_message_buffer_compatible(data) => {
+                                let from = peers.source(&packet);
+                                running.handle_event_receive(data, clock.time_of(ts), from)
                             }
                             _ => PortActionIterator::empty(),
                         }
@@ -1215,11 +1345,7 @@ async fn run<A: Transport>(
                 result = sockets.general.recv(&mut general_buf) => match result {
                     Ok(packet) => {
                         let data = &general_buf[..packet.bytes_read];
-                        if heard.take(&packet, wireless(&clock)) && seen.first(data) {
-                            running.handle_general_receive(data)
-                        } else {
-                            PortActionIterator::empty()
-                        }
+                        running.handle_general_receive(data, peers.source(&packet))
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "PTP receive failed");
@@ -1246,9 +1372,18 @@ async fn run<A: Transport>(
                     timers.filter_update = None;
                     running.handle_filter_update_timer()
                 },
+                () = at(timers.unicast) => {
+                    timers.unicast = None;
+                    running.handle_unicast_timer()
+                },
+                () = at(timers.negotiation) => {
+                    timers.negotiation = None;
+                    running.handle_negotiation_timer()
+                },
             };
             loop {
-                let pending = handle_actions(actions, &mut sockets, &mut timers, &clock).await;
+                let pending =
+                    handle_actions(actions, &mut sockets, &mut timers, &clock, &peers).await;
                 actions = match pending {
                     Some((context, time)) => running.handle_send_timestamp(context, time),
                     None => break,
@@ -1259,88 +1394,89 @@ async fn run<A: Transport>(
     }
 }
 
-/// How long [`Heard`] counts a sender as reaching the node by unicast:
-/// some announce intervals.
-const HEARD_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+/// Path jitter above which a node asks for unicast with
+/// [`PtpUnicast::Auto`]: wired with software timestamps it is tens of µs,
+/// on Wi-Fi a millisecond or more.
+const UNICAST_JITTER_NS: u64 = 250_000;
 
-/// Whether the port's interface is on Wi-Fi, as the node last said.
-fn wireless(clock: &PortClock) -> bool {
-    clock.0.unicast.lock().unwrap().wireless
-}
-
-/// The senders the node lately heard by unicast. On Wi-Fi it takes their
-/// messages only that way: a multicast copy may have waited for the next
-/// beacon. Senders that never send unicast, such as other PTP devices,
-/// it keeps hearing by multicast.
+/// Whether to ask the master for unicast.
 #[derive(Default)]
-struct Heard {
-    unicast: HashMap<IpAddr, Instant>,
+struct WantUnicast {
+    /// The grandmaster the path jitter was found high with.
+    noisy: Option<ClockIdentity>,
 }
 
-impl Heard {
-    /// Whether to take `packet`.
-    fn take<A: Transport>(&mut self, packet: &RecvResult<A>, wireless: bool) -> bool {
-        self.take_from(
-            packet.remote_addr.ip(),
-            packet.local_addr.ip().is_multicast(),
-            wireless,
-            Instant::now(),
-        )
+impl WantUnicast {
+    /// `jitter_ns`: the latest path jitter, `u64::MAX` for none.
+    fn update(
+        &mut self,
+        mode: PtpUnicast,
+        wifi_on_path: bool,
+        jitter: u64,
+        grandmaster: ClockIdentity,
+        following: bool,
+    ) -> bool {
+        if self.noisy.is_some_and(|gm| gm != grandmaster) {
+            self.noisy = None;
+        }
+        if following && jitter != u64::MAX && jitter > UNICAST_JITTER_NS && self.noisy.is_none() {
+            tracing::info!(
+                jitter_us = jitter / 1000,
+                "PTP path jitter high, asking for unicast"
+            );
+            self.noisy = Some(grandmaster);
+        }
+        match mode {
+            PtpUnicast::Always => true,
+            PtpUnicast::Never => false,
+            PtpUnicast::Auto => wifi_on_path || self.noisy.is_some(),
+        }
+    }
+}
+
+/// How long [`Peers`] keeps a sender it heard nothing more from: longer
+/// than any unicast grant, so that the port no longer holds its number.
+const PEER_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The numbers the port knows senders by, and their addresses. Numbers are
+/// not given out twice.
+#[derive(Default)]
+struct Peers {
+    ids: HashMap<IpAddr, PeerId>,
+    addrs: HashMap<PeerId, (IpAddr, Instant)>,
+    next: u32,
+}
+
+impl Peers {
+    /// Where `packet` came from.
+    fn source<A: Transport>(&mut self, packet: &RecvResult<A>) -> Source {
+        Source {
+            peer: self.id(packet.remote_addr.ip(), Instant::now()),
+            multicast: packet.local_addr.ip().is_multicast(),
+        }
     }
 
-    fn take_from(&mut self, from: IpAddr, multicast: bool, wireless: bool, now: Instant) -> bool {
-        if !multicast {
-            if self.unicast.insert(from, now).is_none() && wireless {
-                tracing::debug!(%from, "PTP from this sender by unicast only");
-            }
-            return true;
+    fn id(&mut self, ip: IpAddr, now: Instant) -> PeerId {
+        if let Some(&id) = self.ids.get(&ip) {
+            self.addrs.insert(id, (ip, now));
+            return id;
         }
-        self.unicast.retain(|from, t| {
-            let keep = now.duration_since(*t) <= HEARD_FOR;
-            if !keep && wireless {
-                tracing::debug!(%from, "PTP from this sender by multicast again");
+        self.addrs.retain(|_, (ip, t)| {
+            let keep = now.duration_since(*t) <= PEER_FOR;
+            if !keep {
+                self.ids.remove(ip);
             }
             keep
         });
-        !(wireless && self.unicast.contains_key(&from))
+        let id = PeerId(self.next);
+        self.next = self.next.wrapping_add(1);
+        self.ids.insert(ip, id);
+        self.addrs.insert(id, (ip, now));
+        id
     }
-}
 
-/// How long [`Seen`] remembers a message.
-const SEEN_FOR: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// The messages received lately, to drop the second copy of one that came
-/// both by multicast and by [`Unicast`]. A message is told by its type,
-/// domain, sender and sequence number.
-#[derive(Default)]
-struct Seen {
-    recent: VecDeque<(Instant, [u8; 14])>,
-}
-
-impl Seen {
-    /// Whether `message` is the first copy; too short to tell counts as
-    /// first, for statime to reject.
-    fn first(&mut self, message: &[u8]) -> bool {
-        let Some(header) = message.get(..34) else {
-            return true;
-        };
-        let mut key = [0; 14];
-        key[0] = header[0] & 0x0f;
-        key[1] = header[4];
-        key[2..].copy_from_slice(&header[20..32]);
-        let now = Instant::now();
-        while self
-            .recent
-            .front()
-            .is_some_and(|(t, _)| now.duration_since(*t) > SEEN_FOR)
-        {
-            self.recent.pop_front();
-        }
-        if self.recent.iter().any(|(_, k)| *k == key) {
-            return false;
-        }
-        self.recent.push_back((now, key));
-        true
+    fn addr(&self, id: PeerId) -> Option<IpAddr> {
+        self.addrs.get(&id).map(|(ip, _)| *ip)
     }
 }
 
@@ -1362,23 +1498,20 @@ async fn handle_actions<A: Transport>(
     sockets: &mut Sockets<A>,
     timers: &mut Timers,
     clock: &PortClock,
+    peers: &Peers,
 ) -> Option<(TimestampContext, Time)> {
     let mut pending = None;
-    let unicast = clock.0.unicast.lock().unwrap().clone();
     let scope = sockets.scope;
-    // The group first, then the peers, or the other way round. Peer
-    // delay messages stay on the link, multicast only.
-    let destinations = |link_local: bool, port: u16| -> Vec<A> {
-        let peers = unicast
-            .peers
-            .iter()
-            .filter(|_| !link_local)
-            .filter_map(|ip| A::unicast(*ip, port, scope));
-        let group = std::iter::once(A::group(link_local, port));
-        if unicast.wireless {
-            peers.chain(group).collect()
-        } else {
-            group.chain(peers).collect()
+    let destination = |to: Destination, link_local: bool, port: u16| -> Option<A> {
+        match to {
+            Destination::Multicast => Some(A::group(link_local, port)),
+            Destination::Unicast(id) => {
+                let addr = peers.addr(id).and_then(|ip| A::unicast(ip, port, scope));
+                if addr.is_none() {
+                    tracing::debug!(?id, "PTP peer forgotten, not sent");
+                }
+                addr
+            }
         }
     };
     for action in actions {
@@ -1387,11 +1520,13 @@ async fn handle_actions<A: Transport>(
                 context,
                 data,
                 link_local,
+                to,
             } => {
-                let mut to = destinations(link_local, EVENT_PORT).into_iter();
-                let first = to.next().expect("the group is always there");
+                let Some(to) = destination(to, link_local, EVENT_PORT) else {
+                    continue;
+                };
                 let before = orpheus_ptp::Clock::now(clock);
-                match sockets.event.send_to(data, first).await {
+                match sockets.event.send_to(data, to).await {
                     Ok(ts) => match ts.selected_timestamp() {
                         Some(ts) => {
                             sockets.missing = 0;
@@ -1406,18 +1541,16 @@ async fn handle_actions<A: Transport>(
                     },
                     Err(e) => tracing::warn!(error = %e, "PTP send failed"),
                 }
-                // Copies: their send times don't count.
-                for addr in to {
-                    if let Err(e) = sockets.event.send_to(data, addr).await {
-                        tracing::debug!(error = %e, %addr, "PTP unicast send failed");
-                    }
-                }
             }
-            PortAction::SendGeneral { data, link_local } => {
-                for addr in destinations(link_local, GENERAL_PORT) {
-                    if let Err(e) = sockets.general.send_to(data, addr).await {
-                        tracing::warn!(error = %e, %addr, "PTP send failed");
-                    }
+            PortAction::SendGeneral {
+                data,
+                link_local,
+                to,
+            } => {
+                if let Some(addr) = destination(to, link_local, GENERAL_PORT)
+                    && let Err(e) = sockets.general.send_to(data, addr).await
+                {
+                    tracing::warn!(error = %e, %addr, "PTP send failed");
                 }
             }
             PortAction::ResetAnnounceTimer { duration } => {
@@ -1434,6 +1567,12 @@ async fn handle_actions<A: Transport>(
             }
             PortAction::ResetFilterUpdateTimer { duration } => {
                 timers.filter_update = Some(Instant::now() + duration);
+            }
+            PortAction::ResetUnicastTimer { duration } => {
+                timers.unicast = Some(Instant::now() + duration);
+            }
+            PortAction::ResetNegotiationTimer { duration } => {
+                timers.negotiation = Some(Instant::now() + duration);
             }
             PortAction::ForwardTLV { .. } => {}
         }
@@ -1479,6 +1618,7 @@ fn publish(
     shared: &Shared,
     cfg: &PtpConfig,
     settle: &mut Settle,
+    peers: &Peers,
 ) {
     let state = PtpState::from(port.port_ds().port_state);
     // A delay of exactly zero means the filter has no measurements yet.
@@ -1501,10 +1641,16 @@ fn publish(
         shared.followed.store(true, Relaxed);
     }
     let grandmaster = format_identity(instance.parent_ds().grandmaster_identity);
+    let following = matches!(state, PtpState::Slave | PtpState::Uncalibrated);
+    let jitter_ns = shared.jitter_ns.load(Relaxed);
+    let unicast = UnicastState::from(port.unicast_state());
 
     let mut status = shared.status.lock().unwrap();
     if status.state != state || status.settled != settled || status.grandmaster != grandmaster {
         tracing::info!(?state, settled, %grandmaster, "PTP");
+    }
+    if status.unicast != unicast {
+        tracing::info!(?unicast, "PTP unicast");
     }
     *status = PtpStatus {
         state,
@@ -1514,6 +1660,13 @@ fn publish(
         frequency_ppm,
         steps: shared.steps.load(Relaxed),
         settled,
+        master_address: port
+            .master_peer()
+            .and_then(|p| peers.addr(p))
+            .map(|ip| ip.to_string()),
+        path_jitter_us: (following && jitter_ns != u64::MAX).then(|| jitter_ns as f64 / 1000.0),
+        unicast,
+        unicast_followers: port.unicast_followers(),
         ..status.clone()
     };
 }
@@ -1658,44 +1811,64 @@ mod tests {
     }
 
     #[test]
-    fn seen_drops_second_copies() {
-        // A PTP header: type, domain, sender port identity, sequence.
-        let message = |kind: u8, sender: u8, sequence: u16| {
-            let mut m = vec![0u8; 44];
-            m[0] = 0x10 | kind;
-            m[20..30].fill(sender);
-            m[30..32].copy_from_slice(&sequence.to_be_bytes());
-            m
-        };
-        let mut seen = Seen::default();
-        assert!(seen.first(&message(0, 1, 7)));
-        assert!(!seen.first(&message(0, 1, 7)));
-        // The follow-up of that sync, the next sync, another sender.
-        assert!(seen.first(&message(8, 1, 7)));
-        assert!(seen.first(&message(0, 1, 8)));
-        assert!(seen.first(&message(0, 2, 7)));
-        // Too short to tell.
-        assert!(seen.first(&[0; 10]));
-        assert!(seen.first(&[0; 10]));
+    fn unicast_wanted_on_wifi_or_jitter() {
+        let gm = ClockIdentity([1; 8]);
+        let other = ClockIdentity([2; 8]);
+        let mut want = WantUnicast::default();
+        let quiet = 40_000;
+        let noisy = 1_500_000;
+        // Wired and calm: multicast; Wi-Fi known: unicast.
+        assert!(!want.update(PtpUnicast::Auto, false, quiet, gm, true));
+        assert!(want.update(PtpUnicast::Auto, true, quiet, gm, true));
+        assert!(want.update(PtpUnicast::Always, false, quiet, gm, true));
+        // No jitter known yet, or not following: nothing learned.
+        assert!(!want.update(PtpUnicast::Auto, false, u64::MAX, gm, true));
+        assert!(!want.update(PtpUnicast::Auto, false, noisy, gm, false));
+        // Noisy once: unicast for as long as that grandmaster lasts.
+        assert!(want.update(PtpUnicast::Auto, false, noisy, gm, true));
+        assert!(want.update(PtpUnicast::Auto, false, quiet, gm, true));
+        assert!(!want.update(PtpUnicast::Auto, false, quiet, other, true));
+        assert!(!want.update(PtpUnicast::Never, true, noisy, other, true));
     }
 
     #[test]
-    fn heard_prefers_unicast_on_wifi() {
-        let gm: IpAddr = "10.0.0.2".parse().unwrap();
-        let other: IpAddr = "10.0.0.9".parse().unwrap();
+    fn gate_spread() {
+        let mut gate = Gate::new(16);
+        for _ in 0..7 {
+            gate.pass(0.001);
+        }
+        assert_eq!(gate.spread(), None);
+        // Seven of sixteen 1 ms late: that is the 90th percentile.
+        for _ in 0..9 {
+            gate.pass(0.0);
+        }
+        assert_eq!(gate.spread(), Some(0.001));
+        // One of sixteen late is not.
+        for _ in 0..6 {
+            gate.pass(0.0);
+        }
+        assert_eq!(gate.spread(), Some(0.0));
+    }
+
+    #[test]
+    fn peers_keep_their_numbers() {
+        let a: IpAddr = "10.0.0.2".parse().unwrap();
+        let b: IpAddr = "fe80::3".parse().unwrap();
         let t0 = Instant::now();
         let at = |s: u64| t0 + std::time::Duration::from_secs(s);
-        let mut heard = Heard::default();
-        // Multicast counts until the sender is heard by unicast.
-        assert!(heard.take_from(gm, true, true, at(0)));
-        assert!(heard.take_from(gm, false, true, at(1)));
-        assert!(!heard.take_from(gm, true, true, at(2)));
-        // Wired, multicast always counts.
-        assert!(heard.take_from(gm, true, false, at(2)));
-        // Senders that never send unicast keep their multicast.
-        assert!(heard.take_from(other, true, true, at(2)));
-        // Once unicast stops, multicast counts again.
-        assert!(heard.take_from(gm, true, true, at(12)));
+        let mut peers = Peers::default();
+        let id_a = peers.id(a, at(0));
+        let id_b = peers.id(b, at(1));
+        assert_ne!(id_a, id_b);
+        assert_eq!(peers.id(a, at(500)), id_a);
+        assert_eq!(peers.addr(id_b), Some(b));
+        // b went quiet: forgotten once someone new turns up, and back
+        // under a new number.
+        let id_c = peers.id("10.0.0.4".parse().unwrap(), at(700));
+        assert_eq!(peers.addr(id_b), None);
+        assert_eq!(peers.addr(id_a), Some(a));
+        let id_b2 = peers.id(b, at(701));
+        assert!(![id_a, id_b, id_c].contains(&id_b2));
     }
 
     #[test]
@@ -1784,7 +1957,7 @@ mod tests {
             now: Time::from_secs(1000),
             steps: 0,
         };
-        let mut servo = Servo::new(KalmanConfiguration::default());
+        let mut servo = Servo::new(KalmanConfiguration::default().into());
         let sync = |clock: &TestClock, offset: Duration| Measurement {
             event_time: clock.now,
             raw_sync_offset: Some(offset),
@@ -1823,7 +1996,7 @@ mod tests {
             now: Time::from_secs(1000),
             steps: 0,
         };
-        let mut servo = Servo::new(KalmanConfiguration::default());
+        let mut servo = Servo::new(KalmanConfiguration::default().into());
         let (delay, offset) = (Duration::from_millis(5), Duration::from_micros(300));
         for i in 0..40 {
             clock.now += Duration::from_millis(125);
@@ -1937,10 +2110,13 @@ mod tests {
             steering_ppm: 0.0,
             steps: 0,
         };
-        let mut servo = Servo::new(KalmanConfiguration {
-            step_threshold,
-            ..KalmanConfiguration::default()
-        });
+        let mut servo = Servo::new(
+            KalmanConfiguration {
+                step_threshold,
+                ..KalmanConfiguration::default()
+            }
+            .into(),
+        );
         let path = 0.003;
         let mut run = Run {
             steps: 0,

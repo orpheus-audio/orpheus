@@ -65,6 +65,7 @@ pub struct TimestampContext {
 pub(super) enum TimestampContextInner {
     Sync {
         id: u16,
+        to: Destination,
     },
     DelayReq {
         id: u16,
@@ -76,6 +77,30 @@ pub(super) enum TimestampContextInner {
         id: u16,
         requestor_identity: PortIdentity,
     },
+}
+
+/// A peer, numbered by the user, who keeps what it stands for, such as an IP
+/// address. The port only hands the number back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PeerId(pub u32);
+
+/// Where a packet goes
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Destination {
+    /// The PTP multicast group, or the peer delay group for packets marked
+    /// as link local
+    Multicast,
+    /// One peer
+    Unicast(PeerId),
+}
+
+/// Where a received packet came from
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Source {
+    /// The sender
+    pub peer: PeerId,
+    /// The packet was sent to a multicast group rather than to this node
+    pub multicast: bool,
 }
 
 /// An action the [`Port`](`super::Port`) needs the user to perform
@@ -96,6 +121,7 @@ pub enum PortAction<'a> {
         context: TimestampContext,
         data: &'a [u8],
         link_local: bool,
+        to: Destination,
     },
     /// Send a general packet
     ///
@@ -104,12 +130,22 @@ pub enum PortAction<'a> {
     /// Packets marked as link local should be sent per the instructions
     /// for sending peer to peer delay mechanism messages of the relevant
     /// transport specification of PTP.
-    SendGeneral { data: &'a [u8], link_local: bool },
+    SendGeneral {
+        data: &'a [u8],
+        link_local: bool,
+        to: Destination,
+    },
     /// Call [`Port::handle_announce_timer`](`super::Port::handle_announce_timer`) in `duration` from now
     ResetAnnounceTimer { duration: core::time::Duration },
     /// Call [`Port::handle_sync_timer`](`super::Port::handle_sync_timer`) in
     /// `duration` from now
     ResetSyncTimer { duration: core::time::Duration },
+    /// Call [`Port::handle_unicast_timer`](`super::Port::handle_unicast_timer`)
+    /// in `duration` from now
+    ResetUnicastTimer { duration: core::time::Duration },
+    /// Call [`Port::handle_negotiation_timer`](`super::Port::handle_negotiation_timer`)
+    /// in `duration` from now
+    ResetNegotiationTimer { duration: core::time::Duration },
     /// Call [`Port::handle_delay_request_timer`](`super::Port::handle_delay_request_timer`) in `duration` from now
     ResetDelayRequestTimer { duration: core::time::Duration },
     /// Call [`Port::handle_announce_receipt_timer`](`super::Port::handle_announce_receipt_timer`) in `duration` from now
@@ -125,7 +161,7 @@ pub enum PortAction<'a> {
     ForwardTLV { tlv: ForwardedTLV<'a> },
 }
 
-const MAX_ACTIONS: usize = 2;
+const MAX_ACTIONS: usize = 3;
 
 /// An Iterator over [`PortAction`]s
 ///

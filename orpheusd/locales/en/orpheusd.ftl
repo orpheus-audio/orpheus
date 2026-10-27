@@ -25,6 +25,7 @@ warning-wifi-grandmaster = { $role ->
     }
 warning-ptp-delay = the path to the PTP grandmaster takes { $ms } ms, wired it is well below { $limit } ms: { $cause }
 warning-ptp-steps = the PTP clock stepped { $count } times in the last minute instead of settling: the path to the grandmaster is slow or unsteady; { $cause }
+warning-ptp-multicast = the PTP master { $master } refuses unicast, so PTP crosses Wi-Fi by multicast, which the access point holds back and sends at its lowest rate: the clock may not settle
 
 # The likely cause of a slow or unsteady path, completing the warnings.
 cause-unknown = Wi-Fi or a congested link on the way

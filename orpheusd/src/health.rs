@@ -20,7 +20,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use orpheus_clock::ptp::PtpState;
+use orpheus_clock::ptp::{PtpState, UnicastState};
 use orpheus_discovery::Link;
 use orpheus_engine::{ReceiverId, SenderId};
 use serde::Serialize;
@@ -52,8 +52,7 @@ const STEPS_WINDOW: Duration = Duration::from_secs(60);
 /// An output warns for this long after it last reached full scale.
 const CLIP_WINDOW: Duration = Duration::from_secs(10);
 /// How often the network is looked at again: the node's own link, which it
-/// announces, PTP's unicast peers and Wi-Fi power saving. None of them is
-/// urgent; PTP keeps its multicast meanwhile.
+/// announces, and Wi-Fi power saving. Neither is urgent.
 const NETWORK_CHECK: Duration = Duration::from_secs(30);
 /// How long the node warns after it had to turn Wi-Fi power saving off
 /// again because something turned it back on.
@@ -86,6 +85,9 @@ pub enum WarningKind {
     PtpDelay,
     /// The PTP clock keeps stepping instead of settling.
     PtpSteps,
+    /// PTP crosses Wi-Fi by multicast: the master refused unicast, or
+    /// didn't answer.
+    PtpMulticast,
     /// PTP is not running; the clock runs on by itself.
     PtpDown,
     /// The receiver's stream plays nowhere: the default output is a sink
@@ -226,9 +228,9 @@ struct State {
     power_save_off: BTreeMap<String, Option<Instant>>,
 }
 
-/// Checks once a second, logs warnings as they come and go, and keeps the
-/// node's announced link and PTP's unicast peers current, every
-/// [`NETWORK_CHECK`].
+/// Checks once a second, logs warnings as they come and go, tells PTP
+/// whether Wi-Fi is on the path to its master, and keeps the node's
+/// announced link current, every [`NETWORK_CHECK`].
 pub async fn watch(node: Arc<Node>) {
     let mut state = State::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -264,11 +266,6 @@ fn check(node: &Node, state: &mut State) {
         {
             tracing::warn!(error = %e, "announcing the node's link");
         }
-        if let Some(ptp) = &node.ptp {
-            let s = ptp.status();
-            let wireless = !s.interface.is_empty() && network::is_wireless(&s.interface);
-            ptp.set_unicast(network::ptp_unicast(wireless, s.transport, &nodes));
-        }
     }
     // A change of the setting or of the power source counts at once.
     let setting = node.settings().wifi.power_save;
@@ -277,7 +274,7 @@ fn check(node: &Node, state: &mut State) {
         state.power_save_mode = Some(mode);
         state.power_save = power_save(node, mode, &mut state.power_save_off);
     }
-    let mut found = clock(node, state);
+    let mut found = clock(node, state, &nodes);
     found.extend(receivers(node, state, &nodes));
     found.extend(senders(node, &nodes));
     found.extend(held(node));
@@ -310,7 +307,7 @@ fn check(node: &Node, state: &mut State) {
     health.warnings = found;
 }
 
-fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
+fn clock(node: &Node, state: &mut State, nodes: &[orpheus_discovery::Node]) -> Vec<Warning> {
     let Some(ptp) = &node.ptp else {
         return vec![];
     };
@@ -340,7 +337,22 @@ fn clock(node: &Node, state: &mut State) -> Vec<Warning> {
     }
     let mut found = vec![];
     let following = matches!(s.state, PtpState::Slave | PtpState::Uncalibrated);
-    let wireless = network::is_wireless(&s.interface);
+    let wireless = !s.interface.is_empty() && network::is_wireless(&s.interface);
+    let master_wireless = s
+        .master_address
+        .as_deref()
+        .is_some_and(|m| network::announces_wifi(m, nodes));
+    ptp.set_wifi_on_path(wireless || master_wireless);
+    let mut peers = network::ptp_peers(s.transport, nodes);
+    peers.extend(&node.settings().ptp.unicast_masters);
+    ptp.set_unicast_peers(peers);
+    if following && (wireless || master_wireless) && s.unicast == UnicastState::Refused {
+        let master = s.master_address.as_deref().unwrap_or(&s.grandmaster);
+        found.push(warn(
+            WarningKind::PtpMulticast,
+            Text::new("warning-ptp-multicast").arg("master", master),
+        ));
+    }
     let cause = || {
         if wireless {
             wifi_cause(&s.interface)

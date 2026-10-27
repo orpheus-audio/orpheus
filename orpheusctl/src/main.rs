@@ -192,6 +192,18 @@ struct Ptp {
     frequency_ppm: f64,
     steps: u64,
     settled: bool,
+    #[serde(default)]
+    master_address: Option<String>,
+    #[serde(default)]
+    path_jitter_us: Option<f64>,
+    #[serde(default = "off")]
+    unicast: String,
+    #[serde(default)]
+    unicast_followers: usize,
+}
+
+fn off() -> String {
+    "off".into()
 }
 
 #[derive(Clone, Deserialize)]
@@ -2094,7 +2106,7 @@ impl Counts {
 }
 
 /// The keys of the status, by their text IDs.
-const KEYS: [&str; 23] = [
+const KEYS: [&str; 25] = [
     "key-error",
     "key-interface",
     "key-identity",
@@ -2102,6 +2114,8 @@ const KEYS: [&str; 23] = [
     "key-grandmaster",
     "key-offset",
     "key-delay",
+    "key-path-jitter",
+    "key-unicast",
     "key-frequency",
     "key-steps",
     "key-listen",
@@ -2336,12 +2350,29 @@ fn clock(o: &mut String, p: Paint, t: &Ptp) {
     row(o, p, "key-state", &state);
     let gm = if t.grandmaster == t.identity {
         t!("this-node")
+    } else if let Some(address) = &t.master_address {
+        format!("{} ({address})", t.grandmaster)
     } else {
         t.grandmaster.clone()
     };
     row(o, p, "key-grandmaster", &gm);
     row(o, p, "key-offset", &us(t.offset_ns));
     row(o, p, "key-delay", &us(t.mean_delay_ns));
+    if let Some(jitter) = t.path_jitter_us {
+        row(o, p, "key-path-jitter", &us(Some((jitter * 1000.0) as i64)));
+    }
+    if t.unicast != "off" {
+        let unicast = t!("ptp-unicast", state = &t.unicast);
+        let unicast = if t.unicast == "refused" {
+            p.level(Level::Warn, &unicast)
+        } else {
+            unicast
+        };
+        row(o, p, "key-unicast", &unicast);
+    } else if t.unicast_followers > 0 {
+        let followers = t!("ptp-unicast-followers", count = t.unicast_followers);
+        row(o, p, "key-unicast", &followers);
+    }
     row(o, p, "key-frequency", &ppm(t.frequency_ppm, 2));
     // One or two steps after a start are normal; more mean the clock jumps.
     let steps = t.steps.to_string();
@@ -2775,7 +2806,9 @@ mod tests {
             "identity": "4cb04a.fffe.50a582", "state": "slave",
             "grandmaster": "9c6b00.fffe.1a2b3c", "offset_ns": -412,
             "mean_delay_ns": 41200, "frequency_ppm": 12.31, "steps": 1,
-            "settled": true}},
+            "settled": true, "master_address": "192.168.1.20",
+            "path_jitter_us": 1250.0, "unicast": "granted",
+            "unicast_followers": 0}},
         "accept": "connected",
         "receivers": [{"id": 0, "port": 5004, "stream": {"listen": "[::]:5004",
             "link_offset_ms": 10, "ssrc": 1579090602, "packets": 120000,
@@ -2802,9 +2835,11 @@ Clock          ● PTP, settled
   interface    enp3s0 (IPv4)
   identity     4cb04a.fffe.50a582
   state        slave
-  grandmaster  9c6b00.fffe.1a2b3c
+  grandmaster  9c6b00.fffe.1a2b3c (192.168.1.20)
   offset       -0.4 µs
   delay        41.2 µs
+  path jitter  1250.0 µs
+  unicast      granted
   frequency    +12.31 ppm
   steps        1
 
@@ -3309,6 +3344,10 @@ Routes
             frequency_ppm: 12.31,
             steps: 1,
             settled: false,
+            master_address: None,
+            path_jitter_us: None,
+            unicast: "off".into(),
+            unicast_followers: 0,
         };
         let mut o = String::new();
         clock(&mut o, Paint(false), &t);

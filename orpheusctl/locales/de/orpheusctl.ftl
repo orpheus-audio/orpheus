@@ -206,6 +206,16 @@ ptp-state = { $state ->
     }
 ptp-heading-state = PTP, { $state }
 this-node = dieser Knoten
+ptp-unicast = { $state ->
+        [requested] angefragt
+        [granted] gewährt
+        [refused] abgelehnt, Multicast
+       *[other] { $state }
+    }
+ptp-unicast-followers = an { $count ->
+        [one] einen Knoten
+       *[other] { $count } Knoten
+    }
 key-error = Fehler
 key-interface = Schnittstelle
 key-identity = Identität
@@ -213,6 +223,8 @@ key-state = Zustand
 key-grandmaster = Grandmaster
 key-offset = Abweichung
 key-delay = Laufzeit
+key-path-jitter = Weg-Jitter
+key-unicast = Unicast
 key-frequency = Frequenz
 key-steps = Sprünge
 key-listen = Lauscht

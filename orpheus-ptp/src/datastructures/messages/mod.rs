@@ -10,6 +10,7 @@ pub(crate) use p_delay_resp::*;
 pub(crate) use p_delay_resp_follow_up::*;
 pub(crate) use sync::*;
 
+pub(crate) use self::signalling::UnicastTlv;
 use self::{management::ManagementMessage, signalling::SignalingMessage};
 use super::{
     common::{PortIdentity, TimeInterval, TlvSet, WireTimestamp},
@@ -444,6 +445,31 @@ impl Message<'_> {
 }
 
 impl<'a> Message<'a> {
+    /// A signaling message carrying `tlvs`. Signaling for unicast
+    /// negotiation always goes by unicast.
+    pub(crate) fn signaling(
+        header: Header,
+        target_port_identity: PortIdentity,
+        tlvs: TlvSet<'a>,
+    ) -> Self {
+        Message {
+            header: Header {
+                unicast_flag: true,
+                log_message_interval: 0x7f,
+                ..header
+            },
+            body: MessageBody::Signaling(SignalingMessage {
+                target_port_identity,
+            }),
+            suffix: tlvs,
+        }
+    }
+
+    /// The unicast negotiation TLVs in this message.
+    pub(crate) fn unicast_tlvs(&self) -> impl Iterator<Item = UnicastTlv> + 'a {
+        self.suffix.tlv().filter_map(|tlv| UnicastTlv::parse(&tlv))
+    }
+
     pub(crate) fn header(&self) -> &Header {
         &self.header
     }

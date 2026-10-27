@@ -5,12 +5,13 @@
 use core::{cell::RefCell, ops::ControlFlow};
 
 pub use actions::{
-    ForwardedTLV, ForwardedTLVProvider, NoForwardedTLVs, PortAction, PortActionIterator,
-    TimestampContext,
+    Destination, ForwardedTLV, ForwardedTLVProvider, NoForwardedTLVs, PeerId, PortAction,
+    PortActionIterator, Source, TimestampContext,
 };
 pub use measurement::Measurement;
 use rand::Rng;
 use state::PortState;
+pub use unicast::UnicastState;
 
 use self::sequence_id::SequenceIdGenerator;
 pub use crate::datastructures::messages::{
@@ -49,11 +50,10 @@ macro_rules! actions {
             crate::port::PortActionIterator::from(list)
         }
     };
-    [$action1:expr, $action2:expr] => {
+    [$($action:expr),+] => {
         {
             let mut list = ::arrayvec::ArrayVec::new();
-            list.push($action1);
-            list.push($action2);
+            $(list.push($action);)+
             crate::port::PortActionIterator::from(list)
         }
     };
@@ -66,6 +66,7 @@ mod measurement;
 mod sequence_id;
 mod slave;
 pub(crate) mod state;
+mod unicast;
 
 /// A single port of the PTP instance
 ///
@@ -179,6 +180,8 @@ pub(crate) mod state;
 ///     delay_req_timer: system::Timer,
 ///     announce_receipt_timer: system::Timer,
 ///     filter_update_timer: system::Timer,
+///     unicast_timer: system::Timer,
+///     negotiation_timer: system::Timer,
 ///     time_critical_socket: system::UdpSocket,
 ///     general_socket: system::UdpSocket,
 ///     send_timestamp: Option<(TimestampContext, Time)>
@@ -187,11 +190,11 @@ pub(crate) mod state;
 /// fn handle_actions(resources: &mut MyPortResources, actions: PortActionIterator) {
 ///     for action in actions {
 ///         match action {
-///             PortAction::SendEvent { context, data, link_local } => {
+///             PortAction::SendEvent { context, data, link_local, to: _ } => {
 ///                 let timestamp = resources.time_critical_socket.send(data, link_local);
 ///                 resources.send_timestamp = Some((context, timestamp));
 ///             }
-///             PortAction::SendGeneral { data, link_local } => {
+///             PortAction::SendGeneral { data, link_local, to: _ } => {
 ///                 resources.general_socket.send(data, link_local);
 ///             }
 ///             PortAction::ResetAnnounceTimer { duration } => {
@@ -206,6 +209,12 @@ pub(crate) mod state;
 ///             }
 ///             PortAction::ResetFilterUpdateTimer { duration } => {
 ///                 resources.filter_update_timer.expire_in(duration)
+///             }
+///             PortAction::ResetUnicastTimer { duration } => {
+///                 resources.unicast_timer.expire_in(duration)
+///             }
+///             PortAction::ResetNegotiationTimer { duration } => {
+///                 resources.negotiation_timer.expire_in(duration)
 ///             }
 ///             PortAction::ForwardTLV { .. } => {}
 ///         }
@@ -226,7 +235,7 @@ pub(crate) mod state;
 /// #    }
 /// #    pub struct UdpSocket;
 /// #    impl UdpSocket {
-/// #         pub fn recv(&mut self) -> Option<(&'static [u8], orpheus_ptp::time::Time)> { unimplemented!() }
+/// #         pub fn recv(&mut self) -> Option<(&'static [u8], orpheus_ptp::time::Time, orpheus_ptp::port::Source)> { unimplemented!() }
 /// #    }
 /// # }
 /// # struct MyPortResources {
@@ -235,6 +244,8 @@ pub(crate) mod state;
 /// #     delay_req_timer: system::Timer,
 /// #     announce_receipt_timer: system::Timer,
 /// #     filter_update_timer: system::Timer,
+/// #     unicast_timer: system::Timer,
+/// #     negotiation_timer: system::Timer,
 /// #     time_critical_socket: system::UdpSocket,
 /// #     general_socket: system::UdpSocket,
 /// #     send_timestamp: Option<(orpheus_ptp::port::TimestampContext, orpheus_ptp::time::Time)>
@@ -257,10 +268,14 @@ pub(crate) mod state;
 ///         running_port.handle_announce_receipt_timer()
 ///     } else if resources.filter_update_timer.has_expired() {
 ///         running_port.handle_filter_update_timer()
-///     } else if let Some((data, timestamp)) = resources.time_critical_socket.recv() {
-///         running_port.handle_event_receive(data, timestamp)
-///     } else if let Some((data, _timestamp)) = resources.general_socket.recv() {
-///         running_port.handle_general_receive(data)
+///     } else if resources.unicast_timer.has_expired() {
+///         running_port.handle_unicast_timer()
+///     } else if resources.negotiation_timer.has_expired() {
+///         running_port.handle_negotiation_timer()
+///     } else if let Some((data, timestamp, from)) = resources.time_critical_socket.recv() {
+///         running_port.handle_event_receive(data, timestamp, from)
+///     } else if let Some((data, _timestamp, from)) = resources.general_socket.recv() {
+///         running_port.handle_general_receive(data, from)
 ///     } else if let Some((context, timestamp)) = resources.send_timestamp.take() {
 ///         running_port.handle_send_timestamp(context, timestamp)
 ///     } else {
@@ -301,6 +316,8 @@ pub struct Port<'a, L, A, R, C, F: Filter, S = RefCell<PtpInstanceState>> {
     /// or `mean_link_delay` when DelayMechanism is P2P.
     mean_delay: Option<Duration>,
     peer_delay_state: PeerDelayState,
+    grants: unicast::Grants,
+    requests: unicast::Requests,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -344,8 +361,8 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
         timestamp: Time,
     ) -> PortActionIterator<'_> {
         match context.inner {
-            actions::TimestampContextInner::Sync { id } => {
-                self.handle_sync_timestamp(id, timestamp)
+            actions::TimestampContextInner::Sync { id, to } => {
+                self.handle_sync_timestamp(id, timestamp, to)
             }
             actions::TimestampContextInner::DelayReq { id } => {
                 self.handle_delay_timestamp(id, timestamp)
@@ -371,6 +388,16 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
     /// Handle the sync timer going off
     pub fn handle_sync_timer(&mut self) -> PortActionIterator<'_> {
         self.send_sync()
+    }
+
+    /// Handle the unicast timer going off
+    pub fn handle_unicast_timer(&mut self) -> PortActionIterator<'_> {
+        self.send_unicast()
+    }
+
+    /// Handle the negotiation timer going off
+    pub fn handle_negotiation_timer(&mut self) -> PortActionIterator<'_> {
+        self.tick_requests()
     }
 
     /// Handle the delay request timer going off
@@ -448,6 +475,8 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
             filter: self.filter,
             mean_delay: self.mean_delay,
             peer_delay_state: self.peer_delay_state,
+            grants: self.grants,
+            requests: self.requests,
         }
     }
 
@@ -482,36 +511,74 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
         &'b mut self,
         data: &'b [u8],
         timestamp: Time,
+        from: Source,
     ) -> PortActionIterator<'b> {
         let message = match self.parse_and_filter(data) {
             ControlFlow::Continue(value) => value,
             ControlFlow::Break(value) => return value,
         };
 
+        if self.drop_from_master(&message, from) {
+            return actions![];
+        }
         match message.body {
             MessageBody::Sync(sync) => self.handle_sync(message.header, sync, timestamp),
             MessageBody::DelayReq(delay_request) => {
-                self.handle_delay_req(message.header, delay_request, timestamp)
+                self.handle_delay_req(message.header, delay_request, timestamp, from)
             }
             MessageBody::PDelayReq(_) => self.handle_pdelay_req(message.header, timestamp),
             MessageBody::PDelayResp(peer_delay_response) => {
                 self.handle_peer_delay_response(message.header, peer_delay_response, timestamp)
             }
-            _ => self.handle_general_internal(message),
+            _ => self.handle_general_internal(message, from),
         }
     }
 
     /// Handle a general ptp message
-    pub fn handle_general_receive<'b>(&'b mut self, data: &'b [u8]) -> PortActionIterator<'b> {
+    pub fn handle_general_receive<'b>(
+        &'b mut self,
+        data: &'b [u8],
+        from: Source,
+    ) -> PortActionIterator<'b> {
         let message = match self.parse_and_filter(data) {
             ControlFlow::Continue(value) => value,
             ControlFlow::Break(value) => return value,
         };
 
-        self.handle_general_internal(message)
+        if self.drop_from_master(&message, from) {
+            return actions![];
+        }
+        self.handle_general_internal(message, from)
     }
 
-    fn handle_general_internal<'b>(&'b mut self, message: Message<'b>) -> PortActionIterator<'b> {
+    /// Notes where a message came from; returns whether to drop it: a
+    /// multicast copy of what the master sends by unicast.
+    fn drop_from_master(&mut self, message: &Message<'_>, from: Source) -> bool {
+        if matches!(message.body, MessageBody::Announce(_)) {
+            self.requests.heard_announce(from);
+        }
+        let PortState::Slave(state) = &self.port_state else {
+            return false;
+        };
+        let sender = message.header.source_port_identity;
+        if sender != state.remote_master {
+            return false;
+        }
+        let sync = matches!(message.body, MessageBody::Sync(_));
+        self.requests.heard(sender, from, sync);
+        from.multicast
+            && matches!(
+                message.body,
+                MessageBody::Sync(_) | MessageBody::FollowUp(_)
+            )
+            && self.requests.drops_multicast_from(sender)
+    }
+
+    fn handle_general_internal<'b>(
+        &'b mut self,
+        message: Message<'b>,
+        from: Source,
+    ) -> PortActionIterator<'b> {
         match message.body {
             MessageBody::Announce(announce) => self.handle_announce(&message, announce),
             MessageBody::FollowUp(follow_up) => self.handle_follow_up(message.header, follow_up),
@@ -528,7 +595,8 @@ impl<'a, A: AcceptableMasterList, C: Clock, F: Filter, R: Rng, S: PtpInstanceSta
                 log::warn!("Received event message over general interface");
                 actions![]
             }
-            MessageBody::Management(_) | MessageBody::Signaling(_) => actions![],
+            MessageBody::Signaling(_) => self.handle_signaling(&message, from),
+            MessageBody::Management(_) => actions![],
         }
     }
 }
@@ -562,6 +630,8 @@ impl<'a, A, C, F: Filter, R, S> Port<'a, InBmca, A, R, C, F, S> {
                 filter: self.filter,
                 mean_delay: self.mean_delay,
                 peer_delay_state: self.peer_delay_state,
+                grants: self.grants,
+                requests: self.requests,
             },
             self.lifecycle.pending_action,
         )
@@ -577,6 +647,12 @@ impl<L, A, R, C: Clock, F: Filter, S> Port<'_, L, A, R, C, F, S> {
             state
         );
         core::mem::swap(&mut self.port_state, &mut state);
+        if matches!(self.port_state, PortState::Slave(_)) {
+            self.requests.reset();
+        }
+        if matches!(state, PortState::Master) && !matches!(self.port_state, PortState::Master) {
+            self.grants.clear();
+        }
         if matches!(state, PortState::Slave(_) | PortState::Faulty)
             || matches!(self.port_state, PortState::Faulty)
         {
@@ -591,6 +667,37 @@ impl<L, A, R, C, F: Filter, S> Port<'_, L, A, R, C, F, S> {
     /// Indicate whether this [`Port`] is steering its clock.
     pub fn is_steering(&self) -> bool {
         matches!(self.port_state, PortState::Slave(_))
+    }
+
+    /// Ask the master for Sync and Delay_Resp by unicast while this port
+    /// follows it (IEEE 1588-2019 16.1), or stop asking.
+    pub fn set_unicast(&mut self, want: bool) {
+        self.requests.set_want(want);
+    }
+
+    /// The peers to hear Announce from: by unicast, asked for, when their
+    /// multicast doesn't arrive. A master heard only that way is asked for
+    /// Sync and Delay_Resp by unicast as well.
+    pub fn set_unicast_peers(&mut self, peers: &[PeerId]) {
+        self.requests.set_known(peers);
+    }
+
+    /// Where the request for unicast Sync stands.
+    pub fn unicast_state(&self) -> UnicastState {
+        self.requests.state()
+    }
+
+    /// How the master this port follows reaches it, once heard.
+    pub fn master_peer(&self) -> Option<PeerId> {
+        match &self.port_state {
+            PortState::Slave(state) => self.requests.peer_of(state.remote_master),
+            _ => None,
+        }
+    }
+
+    /// How many peers this port sends Sync to by unicast.
+    pub fn unicast_followers(&self) -> usize {
+        self.grants.followers()
     }
 
     /// Indicate whether this [`Port`] is in the master state.
@@ -691,7 +798,12 @@ impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, 
             multiport_disable: None,
             packet_buffer: [0; MAX_DATA_LEN],
             lifecycle: InBmca {
-                pending_action: actions![PortAction::ResetAnnounceReceiptTimer { duration }],
+                pending_action: actions![
+                    PortAction::ResetAnnounceReceiptTimer { duration },
+                    PortAction::ResetNegotiationTimer {
+                        duration: core::time::Duration::ZERO
+                    }
+                ],
                 local_best: None,
             },
             announce_seq_ids: SequenceIdGenerator::new(),
@@ -701,6 +813,8 @@ impl<'a, A, C, F: Filter, R: Rng, S: PtpInstanceStateMutex> Port<'a, InBmca, A, 
             filter,
             mean_delay: None,
             peer_delay_state: PeerDelayState::Empty,
+            grants: Default::default(),
+            requests: Default::default(),
         }
     }
 }

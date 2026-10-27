@@ -153,29 +153,54 @@ not see each other, and AES67 and Dante devices only speak IPv4.
 The node measures the path delay end to end (delay request/response), as
 AES67 requires.
 
-**Unicast on Wi-Fi.** An access point sends multicast at its lowest rate,
-without acknowledging or repeating it, and holds it back until the next
-beacon while any client dozes. Unicast it sends at once and repeats when
-lost. So every node sends PTP by multicast, as usual, and also by unicast
-to the Orpheus nodes that announce Wi-Fi in discovery (looked at every
-30 s). A wired node needs no copy: a node on Wi-Fi sends its multicast to
-the access point like unicast, and the access point passes it on to the
-wire at once.
-
-A node whose PTP interface is on Wi-Fi takes a sender's messages by
-unicast only, once it heard that sender by unicast, and drops its
-multicast copies: they may have waited for the next beacon. If no unicast
-comes from that sender for 10 s, its multicast counts again. So a
-grandmaster that is not an Orpheus node, or one that doesn't know this
-node is on Wi-Fi yet, still reaches it. Should a message arrive twice
-anyway, the node takes the first copy, told apart by type, sender and
-sequence number. A node on Wi-Fi sends the unicast copies first and a wired
-node the multicast one, because a message's send time is that of its first
-copy and the other copies leave a few µs later. AES67 and Dante devices get
-multicast only, as before.
-
 RTP and the HTTP API listen on IPv4 and IPv6 regardless of the PTP
 transport.
+
+## Unicast
+
+PTP goes by multicast, as AES67 and Dante expect. Over Wi-Fi that hurts:
+an access point sends multicast at its lowest rate, without acknowledging
+or repeating it, and holds it back until the next beacon while any client
+dozes. Unicast it sends at once and repeats when lost. Wi-Fi anywhere on
+the path matters, not only at the follower: a master on Wi-Fi gets every
+follower's delay requests as multicast from the access point.
+
+So a follower asks its master for Sync and Delay_Resp by unicast, as
+IEEE 1588-2019 (16.1, unicast negotiation) defines, when (`[ptp] unicast
+= "auto"`):
+
+- its PTP interface is on Wi-Fi, or
+- its master is an Orpheus node that announces Wi-Fi, or
+- the measurements spread widely: more than 250 µs (the 90th percentile
+  of how late they come, against the earliest, shown as `path jitter`).
+  That catches Wi-Fi the node can't see, such as a repeater or a mesh
+  link between two wired nodes. Once asked, it stays with unicast for as
+  long as it follows that grandmaster.
+
+The master grants it for 60 s at a time, and the follower renews halfway.
+While it has the grant, the follower takes Sync and Follow_Up from its
+master only by unicast, drops their multicast copies and sends its delay
+requests by unicast; Announce stays multicast, so the election still sees
+every clock. The master keeps sending multicast to everyone else, and
+sends each follower with a grant its own Sync, with its own send time.
+If unicast Sync stops for a few seconds, say because the master
+restarted, the follower takes multicast again and asks anew.
+
+A master that refuses, or doesn't answer within 5 s, such as a PTP device
+without unicast negotiation, leaves the follower on multicast; it asks
+again after a minute and warns (`ptp_multicast`) if Wi-Fi is on the path.
+`"always"` asks every master, `"never"` none.
+
+**Multicast that doesn't arrive.** Some networks drop PTP multicast on the
+way to a node, typically because its firewall drops IGMP and the switch or
+access point stops forwarding the group to it (see
+[troubleshooting](troubleshooting.md#ptp-works-for-a-few-minutes-then-stops)). mDNS
+still arrives, so the node knows the other Orpheus nodes. If it hears no
+multicast Announce from one of them for 10 s, it asks that node for
+Announce by unicast; only a master grants it, the followers send none. The
+election then sees that clock, and a master heard only by unicast is asked
+for Sync and Delay_Resp by unicast as well. PTP devices that aren't
+Orpheus nodes can be listed in `[ptp] unicast_masters`.
 
 ## When PTP can't run
 

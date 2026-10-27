@@ -191,10 +191,10 @@ network delay, and no jitter or loss. Expected problems on real networks:
   saving, hold it back until the next DTIM beacon (100 to 300 ms). PTP may
   never settle, and sync between rooms suffers. The servo's gate keeps held
   messages out of the clock, and nodes warn about their own power saving
-  (`power_save`). PTP messages also go by unicast to the other Orpheus
-  nodes on Wi-Fi, which take them only that way: the access point neither
-  holds unicast back for dozing clients nor sends it at its lowest rate;
-  see [clock](clock.md#ipv4-and-ipv6).
+  (`power_save`). Followers ask their master for PTP by unicast (IEEE 1588
+  unicast negotiation) when Wi-Fi is on the path or the measurements spread
+  widely: the access point neither holds unicast back for dozing clients
+  nor sends it at its lowest rate; see [clock](clock.md#unicast).
   On a home network (2026-10-26) the clock settled within 40 s and stayed
   within 13 µs. Held multicast did not show there; what delayed messages
   by up to 120 ms were the background scans of a node with a weak signal,

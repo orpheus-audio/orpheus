@@ -11,6 +11,15 @@ pub struct PortIdentity {
     pub port_number: u16,
 }
 
+impl PortIdentity {
+    /// Matches every port (IEEE 1588-2019 7.5.2.4), used for a target not
+    /// known yet.
+    pub(crate) const WILDCARD: Self = Self {
+        clock_identity: ClockIdentity([0xff; 8]),
+        port_number: 0xffff,
+    };
+}
+
 impl WireFormat for PortIdentity {
     fn serialize(&self, buffer: &mut [u8]) -> Result<(), WireFormatError> {
         self.clock_identity.serialize(&mut buffer[0..8])?;

@@ -19,6 +19,7 @@ warning-wifi-grandmaster = { $role ->
     }
 warning-ptp-delay = der Weg zum PTP-Grandmaster dauert { $ms } ms, am Kabel deutlich unter { $limit } ms: { $cause }
 warning-ptp-steps = die PTP-Uhr ist in der letzten Minute { $count }-mal gesprungen, statt sich einzupendeln: der Weg zum Grandmaster ist langsam oder unstet; { $cause }
+warning-ptp-multicast = der PTP-Master { $master } lehnt Unicast ab, also läuft PTP per Multicast über WLAN, das der Access Point zurückhält und mit seiner niedrigsten Rate sendet: die Uhr pendelt sich womöglich nicht ein
 
 cause-unknown = WLAN oder eine überlastete Verbindung auf dem Weg
 cause-wifi = dieser Knoten ist im WLAN ({ $interface })
