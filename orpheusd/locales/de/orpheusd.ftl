@@ -14,8 +14,8 @@ warning-ptp-holdover = PTP angehalten ({ $why }). Zeit und Gang der letzten Sync
 warning-ptp-down = PTP läuft nicht ({ $why }). Die Systemuhr ist aktiv. Es besteht keine Synchronisation zu den anderen Knoten. Warte auf PTP-Verbindung.
 warning-ptp-wifi = PTP läuft über WLAN ({ $interface }). Möglicherweise ist keine erfolgreiche Synchronization mit den anderen Knoten möglich.
 warning-wifi-grandmaster = { $role ->
-        [master] Dieser Knoten ist im WLAN ({ $interface }) und PTP-Grandmaster. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Gib einem kabelgebundenem Knoten eine niedrigere ptp.priority1.
-       *[other] Dieser Knoten ist im WLAN ({ $interface }) und kann PTP-Grandmaster werden. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Gib einem kabelgebundenem Knoten eine niedrigere ptp.priority1.
+        [master] Dieser Knoten ist im WLAN ({ $interface }) und PTP-Grandmaster. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Ein kabelgebundener Knoten übernimmt von selbst, sofern ptp.priority1 oder ptp.priority2 nicht diesen Knoten vorziehen.
+       *[other] Dieser Knoten ist im WLAN ({ $interface }) und kann PTP-Grandmaster werden. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Ein kabelgebundener Knoten übernimmt von selbst, sofern ptp.priority1 oder ptp.priority2 nicht diesen Knoten vorziehen.
     }
 warning-ptp-delay = Weg zum PTP-Grandmaster dauert { $ms } ms, am Kabel deutlich unter { $limit } ms: { $cause }
 warning-ptp-steps = PTP-Uhr ist in der vergangenen Minute { $count }-mal gesprungen, statt sich einzupendeln: der Weg zum Grandmaster ist langsam oder unstet; { $cause }
