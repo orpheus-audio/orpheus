@@ -20,8 +20,8 @@ warning-ptp-down = PTP is not running ({ $why }): the node runs on the system cl
 warning-ptp-wifi = PTP runs over Wi-Fi ({ $interface }): the clock may not settle, and rooms drift apart
 # $role: "master" while this node is the grandmaster, else "other".
 warning-wifi-grandmaster = { $role ->
-        [master] this node is the PTP grandmaster over Wi-Fi ({ $interface }): nodes that follow its clock may not settle; give a wired node a lower ptp.priority1
-       *[other] this node may become the PTP grandmaster over Wi-Fi ({ $interface }): nodes that follow its clock may not settle; give a wired node a lower ptp.priority1
+        [master] this node is the PTP grandmaster over Wi-Fi ({ $interface }): nodes that follow its clock may not settle; a wired node takes over by itself, unless ptp.priority1 or ptp.priority2 put this node first
+       *[other] this node may become the PTP grandmaster over Wi-Fi ({ $interface }): nodes that follow its clock may not settle; a wired node takes over by itself, unless ptp.priority1 or ptp.priority2 put this node first
     }
 warning-ptp-delay = the path to the PTP grandmaster takes { $ms } ms, wired it is well below { $limit } ms: { $cause }
 warning-ptp-steps = the PTP clock stepped { $count } times in the last minute instead of settling: the path to the grandmaster is slow or unsteady; { $cause }

@@ -32,6 +32,24 @@ nodes becomes grandmaster: the one with the lowest `priority1`, then
 `priority2`, then clock identity. Set `slave_only = true` on nodes that should
 never lead.
 
+**Wired nodes first.** Every follower measures its path to the grandmaster,
+so a grandmaster on Wi-Fi puts the access point into everyone's path. With
+`priority2 = "auto"`, the default, a node announces `priority2` 127 while
+PTP runs on a wired interface and 129 while it runs on Wi-Fi. A wired node
+then becomes grandmaster before one on Wi-Fi, and takes over from it when
+it joins. The status shows the value in use (`clock.ptp.priority2`). A
+number for `priority2` turns this off for that node, and `priority1`
+decides before either.
+
+A node whose PTP comes back on a wired interface, after its cable, dock or
+switch was gone or after it was on Wi-Fi, counts as on Wi-Fi for one more
+minute. A loose contact then doesn't change the grandmaster each time the
+node returns: it follows the grandmaster that took over, and takes the
+role back only once it has stayed for a minute. If it becomes grandmaster
+all the same, because no wired node is left, it counts as wired after
+15 s. So when a switch restarts and all its nodes return together, they
+elect among themselves as usual, and none takes over a minute later.
+
 **Virtual clock.** A node does not change the system clock, which stays with
 NTP. It keeps a virtual clock on top of the system clock instead.
 statime's Kalman filter estimates the offset to the grandmaster and adjusts

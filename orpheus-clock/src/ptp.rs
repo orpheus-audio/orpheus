@@ -3,8 +3,8 @@
 //! Every node runs a PTP instance with one port on its LAN interface. The
 //! best master clock algorithm elects one grandmaster: a dedicated AES67 or
 //! Dante grandmaster if there is one, otherwise one of the nodes (they
-//! default to a low priority so that real hardware wins). The others follow
-//! it.
+//! default to a low priority so that real hardware wins), a wired one
+//! before one on Wi-Fi ([`Priority2`]). The others follow it.
 //!
 //! The node does not steer the system clock, which stays with NTP. It keeps
 //! a virtual clock instead: an [`OverlayClock`] on top of the system clock
@@ -112,6 +112,21 @@ const RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 /// again.
 const SETTLE_CHANGES: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// `priority2` of a wired node with [`Priority2::Auto`].
+const PRIORITY2_WIRED: u8 = 127;
+/// `priority2` of a node on Wi-Fi with [`Priority2::Auto`].
+const PRIORITY2_WIFI: u8 = 129;
+/// How long a node whose PTP moved to a wired interface still counts as on
+/// Wi-Fi in the election, so that a cable or a dock with a loose contact
+/// does not change the grandmaster each time it comes back.
+const WIRED_HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+/// A node that is grandmaster all the same counts as wired after this long
+/// already. When a switch restarts, all its nodes come back together and
+/// elect among themselves; the grandmaster has to count as wired before
+/// its followers do, or each of them would take over for a moment as its
+/// minute ends. Long enough for that election to end first.
+const WIRED_HOLD_MASTER: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// TAI − UTC announced when this node is the grandmaster.
 const UTC_OFFSET_S: i16 = 37;
 
@@ -148,6 +163,91 @@ pub enum PtpUnicast {
     Always,
     /// Never.
     Never,
+}
+
+/// The tie-breaker of the grandmaster election among clocks with the same
+/// `priority1` and quality, such as Orpheus nodes; lower wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Priority2 {
+    /// 127 on a wired interface, 129 on Wi-Fi: a wired node becomes
+    /// grandmaster before one on Wi-Fi, whose followers would all measure
+    /// across the access point. A node whose PTP moves to a wired interface
+    /// counts as on Wi-Fi for a minute more, or for 15 s as grandmaster.
+    #[default]
+    Auto,
+    /// This value, whatever the interface.
+    Fixed(u8),
+}
+
+impl Priority2 {
+    /// The value to announce on a wireless or a wired interface.
+    fn on(self, wireless: bool) -> u8 {
+        match self {
+            Self::Fixed(n) => n,
+            Self::Auto if wireless => PRIORITY2_WIFI,
+            Self::Auto => PRIORITY2_WIRED,
+        }
+    }
+}
+
+/// `"auto"` or a number.
+#[cfg(feature = "serde")]
+impl serde::Serialize for Priority2 {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Auto => s.serialize_str("auto"),
+            Self::Fixed(n) => s.serialize_u8(*n),
+        }
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for Priority2 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Priority2;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("\"auto\" or a number from 0 to 255")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Priority2, E> {
+                match v {
+                    "auto" => Ok(Priority2::Auto),
+                    _ => Err(E::invalid_value(serde::de::Unexpected::Str(v), &self)),
+                }
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Priority2, E> {
+                u8::try_from(v)
+                    .map(Priority2::Fixed)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(v), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Priority2, E> {
+                u8::try_from(v)
+                    .map(Priority2::Fixed)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(v), &self))
+            }
+        }
+
+        d.deserialize_any(Visitor)
+    }
+}
+
+/// Whether `interface` is a wireless interface. For testing on one machine,
+/// `ORPHEUS_DEBUG_WIRELESS` names interfaces to count as wireless,
+/// separated by commas, or `*` for all.
+pub fn is_wireless(interface: &str) -> bool {
+    if let Ok(list) = std::env::var("ORPHEUS_DEBUG_WIRELESS") {
+        return list
+            .split(',')
+            .any(|i| i.trim() == "*" || i.trim() == interface);
+    }
+    let dir = std::path::Path::new("/sys/class/net").join(interface);
+    dir.join("wireless").exists() || dir.join("phy80211").exists()
 }
 
 /// Where a follower's request for unicast stands.
@@ -190,7 +290,7 @@ pub struct PtpConfig {
     /// Lower wins the grandmaster election. Dedicated grandmasters usually
     /// use 128 or less.
     pub priority1: u8,
-    pub priority2: u8,
+    pub priority2: Priority2,
     /// Never become grandmaster.
     pub slave_only: bool,
     /// Offsets above this are stepped, smaller ones slewed.
@@ -207,7 +307,7 @@ impl Default for PtpConfig {
             transport: PtpTransport::Auto,
             domain: 0,
             priority1: 250,
-            priority2: 128,
+            priority2: Priority2::Auto,
             slave_only: false,
             step_threshold_us: 2000,
             settle_threshold_us: 100,
@@ -270,6 +370,10 @@ pub struct PtpStatus {
     /// `ipv4` or `ipv6`, never `auto`.
     pub transport: PtpTransport,
     pub domain: u8,
+    /// The `priority2` this node takes into the grandmaster election: the
+    /// configured one, or with `auto` 127 on a wired interface and 129 on
+    /// Wi-Fi (and for a minute after PTP moved to a wired interface).
+    pub priority2: u8,
     /// This node's clock identity.
     #[cfg_attr(feature = "openapi", schema(example = "4cb04a.fffe.50a582"))]
     pub identity: String,
@@ -341,7 +445,7 @@ struct Shared {
 
 impl Shared {
     /// The system clock on `timescale`, with PTP not running yet.
-    fn new(timescale: Timescale, domain: u8) -> Self {
+    fn new(timescale: Timescale, cfg: &PtpConfig) -> Self {
         Self {
             clock: Mutex::new(OverlayClock::new(Base(timescale))),
             status: Mutex::new(PtpStatus {
@@ -350,7 +454,8 @@ impl Shared {
                 holdover: false,
                 interface: String::new(),
                 transport: PtpTransport::Ipv4,
-                domain,
+                domain: cfg.domain,
+                priority2: cfg.priority2.on(true),
                 identity: String::new(),
                 state: PtpState::Initializing,
                 grandmaster: String::new(),
@@ -446,7 +551,7 @@ impl PtpClock {
     /// thread keeps trying and the status says why; this fails only if the
     /// thread can't be started.
     pub fn start(cfg: PtpConfig, timescale: Timescale) -> io::Result<Self> {
-        let shared = Arc::new(Shared::new(timescale, cfg.domain));
+        let shared = Arc::new(Shared::new(timescale, &cfg));
         let port = spawn(cfg, &shared, true)?;
         Ok(Self {
             shared,
@@ -1048,12 +1153,19 @@ async fn supervise(mut sv: Supervise) {
         })
         .ok();
     let mut logged: Option<String> = None;
+    // Whether the port ran before, on whatever interface.
+    let mut moved = false;
     loop {
         let ended = match resolve(&sv.cfg) {
-            Ok(link) => match link.transport {
-                PtpTransport::Ipv6 => run::<SocketAddrV6>(&mut sv, &link, &mut changes).await,
-                _ => run::<SocketAddrV4>(&mut sv, &link, &mut changes).await,
-            },
+            Ok(link) => {
+                let hold = std::mem::replace(&mut moved, true);
+                match link.transport {
+                    PtpTransport::Ipv6 => {
+                        run::<SocketAddrV6>(&mut sv, &link, &mut changes, hold).await
+                    }
+                    _ => run::<SocketAddrV4>(&mut sv, &link, &mut changes, hold).await,
+                }
+            }
             Err(e) => Ended::Failed(e),
         };
         let error = match ended {
@@ -1119,6 +1231,7 @@ struct Link {
     identity: ClockIdentity,
     /// Its IPv4 addresses, sorted; a new one restarts the port.
     ipv4: Vec<Ipv4Addr>,
+    wireless: bool,
 }
 
 /// The interface for `cfg`, if it can carry PTP.
@@ -1165,6 +1278,7 @@ fn resolve(cfg: &PtpConfig) -> io::Result<Link> {
         transport,
         identity: eui64(mac),
         ipv4,
+        wireless: is_wireless(&interface.to_string()),
     })
 }
 
@@ -1197,14 +1311,21 @@ fn is_down(interface: InterfaceName) -> bool {
 }
 
 /// Opens the sockets for `link` and runs the port until it is stopped or
-/// the link goes away.
+/// the link goes away. With `hold`, the port ran before, so a wired `link`
+/// counts as Wi-Fi in the election for [`WIRED_HOLD`].
 async fn run<A: Transport>(
     sv: &mut Supervise,
     link: &Link,
     changes: &mut Option<ChangeDetector>,
+    hold: bool,
 ) -> Ended {
     let (cfg, shared) = (&sv.cfg, &sv.shared);
     let (interface, identity) = (link.interface, link.identity);
+    let mut held_until = (hold && !link.wireless).then(|| Instant::now() + WIRED_HOLD);
+    let priority2 = |held_until: Option<Instant>| {
+        cfg.priority2
+            .on(link.wireless || held_until.is_some_and(|until| Instant::now() < until))
+    };
     let mut sockets = match open_sockets::<A>(interface) {
         Ok(s) => s,
         Err(e) => return Ended::Failed(e),
@@ -1217,6 +1338,7 @@ async fn run<A: Transport>(
         status.interface = interface.to_string();
         status.transport = link.transport;
         status.domain = cfg.domain;
+        status.priority2 = priority2(held_until);
         status.identity = format_identity(identity);
         status.state = PtpState::Initializing;
         status.grandmaster = format_identity(identity);
@@ -1231,7 +1353,7 @@ async fn run<A: Transport>(
         InstanceConfig {
             clock_identity: identity,
             priority_1: cfg.priority1,
-            priority_2: cfg.priority2,
+            priority_2: priority2(held_until),
             domain_number: cfg.domain,
             slave_only: cfg.slave_only,
             sdo_id: SdoId::try_from(0).expect("0 is a valid SdoId"),
@@ -1290,7 +1412,18 @@ async fn run<A: Transport>(
     let mut peers = Peers::default();
     let mut want = WantUnicast::default();
     let mut bmca_at = Instant::now();
+    let mut master_since: Option<Instant> = None;
     loop {
+        if port.port_ds().port_state != PortState::Master {
+            master_since = None;
+        } else if master_since.get_or_insert_with(Instant::now).elapsed() >= WIRED_HOLD_MASTER {
+            held_until = None;
+        }
+        let now = priority2(held_until);
+        if now != instance.default_ds().priority_2 {
+            tracing::info!(priority2 = now, "PTP counts as wired from now on");
+            instance.set_priority_2(now);
+        }
         instance.bmca(&mut [&mut port]);
         let grandmaster = instance.parent_ds().grandmaster_identity;
         let known: Vec<PeerId> = if cfg.unicast == PtpUnicast::Never {
@@ -1653,6 +1786,7 @@ fn publish(
         tracing::info!(?unicast, "PTP unicast");
     }
     *status = PtpStatus {
+        priority2: instance.default_ds().priority_2,
         state,
         grandmaster,
         offset_ns,
@@ -1770,6 +1904,14 @@ mod tests {
             d.delay(ms(at + 50), 0.001 - delay);
         }
         assert!((d.value.unwrap() - 0.004).abs() < 1e-12);
+    }
+
+    #[test]
+    fn priority2_puts_wired_nodes_first() {
+        assert!(Priority2::Auto.on(false) < 128);
+        assert!(Priority2::Auto.on(true) > 128);
+        assert_eq!(Priority2::Fixed(128).on(false), 128);
+        assert_eq!(Priority2::Fixed(128).on(true), 128);
     }
 
     #[test]
@@ -1893,7 +2035,7 @@ mod tests {
 
     #[test]
     fn overlay_follows_steps_and_frequency() {
-        let shared = Arc::new(Shared::new(Timescale::tai(), 0));
+        let shared = Arc::new(Shared::new(Timescale::tai(), &PtpConfig::default()));
         let mut clock = PortClock(shared.clone());
         let ptp = PtpClock {
             shared: shared.clone(),

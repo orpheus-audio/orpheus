@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
 
-use orpheus_clock::ptp::{PtpConfig, PtpTransport, PtpUnicast};
+use orpheus_clock::ptp::{Priority2, PtpConfig, PtpTransport, PtpUnicast};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use utoipa::ToSchema;
@@ -45,7 +45,11 @@ pub struct PtpSettings {
     pub domain: u8,
     /// Grandmaster election: lower wins.
     pub priority1: u8,
-    pub priority2: u8,
+    /// The tie-breaker among nodes: `auto` (127 on a wired interface, 129
+    /// on Wi-Fi, so that a wired node becomes grandmaster first) or a
+    /// number.
+    #[schema(value_type = Value, example = "auto")]
+    pub priority2: Priority2,
     /// Never become grandmaster.
     pub slave_only: bool,
     /// Clock offsets above this are stepped, smaller ones slewed.
@@ -450,6 +454,8 @@ mod tests {
         assert!(s.patch(&json!({"clock": {}})).is_err());
         assert!(s.patch(&json!({"ptp": 1})).is_err());
         assert!(s.patch(&json!({"ptp": {"domain": "one"}})).is_err());
+        assert!(s.patch(&json!({"ptp": {"priority2": "wired"}})).is_err());
+        assert!(s.patch(&json!({"ptp": {"priority2": 256}})).is_err());
         assert!(s.patch(&json!({"receiver": {"duck_db": 120}})).is_err());
         assert!(
             s.patch(&json!({"receiver": {"link_offset_ms": 0}}))
@@ -471,6 +477,17 @@ mod tests {
         assert!(s.patch(&json!({"ui": {"language": "auto"}})).is_ok());
         assert!(s.patch(&json!({"wifi": {"power_save": "on"}})).is_err());
         assert!(s.patch(&json!({"wifi": {"power_save": "auto"}})).is_ok());
+    }
+
+    #[test]
+    fn priority2_is_auto_or_a_number() {
+        let mut s = store("");
+        assert_eq!(s.get().ptp.priority2, Priority2::Auto);
+        s.commit(s.patch(&json!({"ptp": {"priority2": 100}})).unwrap());
+        assert_eq!(s.get().ptp.priority2, Priority2::Fixed(100));
+        s.commit(s.patch(&json!({"ptp": {"priority2": "auto"}})).unwrap());
+        assert_eq!(s.get().ptp.priority2, Priority2::Auto);
+        assert_eq!(s.sources()["ptp"]["priority2"], Source::Api);
     }
 
     #[test]

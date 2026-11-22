@@ -14,8 +14,8 @@ warning-ptp-holdover = PTP angehalten ({ $why }): die Uhr behält Zeit und Gang 
 warning-ptp-down = PTP läuft nicht ({ $why }): der Knoten läuft auf der Systemuhr und spielt nicht im Takt mit den anderen Knoten; PTP startet von selbst, sobald es kann
 warning-ptp-wifi = PTP läuft über WLAN ({ $interface }): die Uhr pendelt sich womöglich nicht ein, und die Räume laufen auseinander
 warning-wifi-grandmaster = { $role ->
-        [master] dieser Knoten ist der PTP-Grandmaster über WLAN ({ $interface }): Knoten, die seiner Uhr folgen, pendeln sich womöglich nicht ein; gib einem Knoten am Kabel eine niedrigere ptp.priority1
-       *[other] dieser Knoten kann PTP-Grandmaster über WLAN werden ({ $interface }): Knoten, die seiner Uhr folgen, pendeln sich womöglich nicht ein; gib einem Knoten am Kabel eine niedrigere ptp.priority1
+        [master] dieser Knoten ist der PTP-Grandmaster über WLAN ({ $interface }): Knoten, die seiner Uhr folgen, pendeln sich womöglich nicht ein; ein Knoten am Kabel übernimmt von selbst, sofern ptp.priority1 oder ptp.priority2 nicht diesen Knoten vorziehen
+       *[other] dieser Knoten kann PTP-Grandmaster über WLAN werden ({ $interface }): Knoten, die seiner Uhr folgen, pendeln sich womöglich nicht ein; ein Knoten am Kabel übernimmt von selbst, sofern ptp.priority1 oder ptp.priority2 nicht diesen Knoten vorziehen
     }
 warning-ptp-delay = der Weg zum PTP-Grandmaster dauert { $ms } ms, am Kabel deutlich unter { $limit } ms: { $cause }
 warning-ptp-steps = die PTP-Uhr ist in der letzten Minute { $count }-mal gesprungen, statt sich einzupendeln: der Weg zum Grandmaster ist langsam oder unstet; { $cause }

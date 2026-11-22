@@ -34,8 +34,9 @@ fn main() {
         let s = clock.status();
         let vs_system = (clock.now_ns() as i64 - system.now_ns() as i64) as f64 / 1e6;
         println!(
-            "{:?} settled={} offset_ns={:?} delay_ns={:?} freq_ppm={:.2} steps={} gm={} ptp-system={vs_system:.3}ms",
+            "{:?} priority2={} settled={} offset_ns={:?} delay_ns={:?} freq_ppm={:.2} steps={} gm={} ptp-system={vs_system:.3}ms",
             s.state,
+            s.priority2,
             s.settled,
             s.offset_ns,
             s.mean_delay_ns,

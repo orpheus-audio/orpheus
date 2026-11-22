@@ -7,7 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use orpheus_clock::ptp::{PtpTransport, PtpUnicast};
+use orpheus_clock::ptp::{Priority2, PtpTransport, PtpUnicast};
 use orpheus_core::OutputType;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -327,7 +327,10 @@ pub struct PtpConfig {
     /// Grandmaster election: lower wins. Nodes default to 250 so that
     /// dedicated grandmasters (usually 128 or less) take precedence.
     pub priority1: u8,
-    pub priority2: u8,
+    /// The tie-breaker among nodes: `auto`, or a number. `auto` is 127 on
+    /// a wired interface and 129 on Wi-Fi, so that a wired node becomes
+    /// grandmaster before one on Wi-Fi.
+    pub priority2: Priority2,
     /// Never become grandmaster.
     pub slave_only: bool,
     /// Clock offsets above this are stepped (cold start), smaller ones
@@ -551,6 +554,13 @@ mod tests {
         let c = Config::default();
         assert!(c.ptp.enabled);
         assert_eq!(c.ptp.priority1, 250);
+        assert_eq!(c.ptp.priority2, Priority2::Auto);
+        let c: Config = toml::from_str("[ptp]\npriority2 = 100").unwrap();
+        assert_eq!(c.ptp.priority2, Priority2::Fixed(100));
+        let c: Config = toml::from_str("[ptp]\npriority2 = \"auto\"").unwrap();
+        assert_eq!(c.ptp.priority2, Priority2::Auto);
+        assert!(toml::from_str::<Config>("[ptp]\npriority2 = 256").is_err());
+        assert!(toml::from_str::<Config>("[ptp]\npriority2 = \"wired\"").is_err());
         let c: Config = toml::from_str("[ptp]\ninterface = \"enp3s0\"\ndomain = 1").unwrap();
         assert_eq!(c.ptp.interface.as_deref(), Some("enp3s0"));
         assert_eq!(c.ptp.domain, 1);

@@ -50,17 +50,19 @@ with dropouts.
 
 5. **Wired where you can.** Wi-Fi works, but delays packets by milliseconds
    and now and then by 100 ms. At least the grandmaster should be wired.
-6. **A wired grandmaster.** Give one wired node a lower priority, so that
-   it leads the clock even if a node on Wi-Fi starts first:
+6. **A wired grandmaster.** Nothing to set: a wired node leads the clock
+   before one on Wi-Fi, even if that one starts first
+   ([clock](clock.md#ptp)). To choose which wired node leads, give it a
+   lower priority:
 
    ```toml
    [ptp]
    priority1 = 200
    ```
 
-   A node on Wi-Fi that may become grandmaster warns
-   (`wifi_grandmaster`). A dedicated AES67 or Dante grandmaster wins
-   anyway.
+   A node on Wi-Fi that is or may become grandmaster, because no wired
+   node is there, warns (`wifi_grandmaster`). A dedicated AES67 or Dante
+   grandmaster wins anyway.
 7. **Snooping switches have a querier.** If a managed switch or the router
    snoops IGMP, one of them must also act as IGMP querier (MLD querier for
    IPv6). Unmanaged switches don't snoop.

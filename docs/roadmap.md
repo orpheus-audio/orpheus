@@ -200,6 +200,8 @@ network delay, and no jitter or loss. Expected problems on real networks:
   by up to 120 ms were the background scans of a node with a weak signal,
   every 5 minutes. They also make audio late; see
   [troubleshooting](troubleshooting.md#dropouts-every-few-minutes-on-wi-fi).
+  Wired nodes become grandmaster before nodes on Wi-Fi (`priority2 =
+  "auto"`); see [clock](clock.md#ptp).
   A grandmaster that is not an Orpheus node still reaches Wi-Fi nodes by
   multicast only. Planned: the Wi-Fi profile; maybe a warning when the
   node's Wi-Fi interface scans in the background.

@@ -171,6 +171,14 @@ impl<F, S: PtpInstanceStateMutex> PtpInstance<F, S> {
         }
     }
 
+    /// Changes `priority2` (IEEE 1588-2019 8.2.1.4.2) while the instance
+    /// runs. The next run of the best master clock algorithm elects with
+    /// it, and a grandmaster announces it from then on.
+    pub fn set_priority_2(&self, priority_2: u8) {
+        self.state
+            .with_mut(|s| s.default_ds.priority_2 = priority_2);
+    }
+
     /// Return IEEE-1588 defaultDS for introspection
     pub fn default_ds(&self) -> DefaultDS {
         self.state.with_ref(|s| (&s.default_ds).into())

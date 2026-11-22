@@ -83,7 +83,8 @@ qdisc, so netem on a node's own veth is invisible to PTP. Put a bridge in a
 third namespace between the nodes and add netem to the bridge ports.
 
 `ORPHEUS_DEBUG_WIRELESS=veth-b` (or `*`) makes a node treat those
-interfaces as Wi-Fi, to test the [network warnings](usage.md#warnings);
+interfaces as Wi-Fi, to test the [network warnings](usage.md#warnings)
+and the [grandmaster election](clock.md#ptp);
 `netem delay 6ms 4ms` on a bridge port raises the receiver's `jitter`.
 
 ## NMOS conformance

@@ -846,7 +846,9 @@ websocat 'ws://localhost:7480/x-orpheus/v1/events?topics=settings'
 - `clock.source`: `ptp` while PTP runs, `holdover` while it is stopped
   after following a grandmaster, `system` otherwise. `clock.ptp` is there
   whenever PTP is enabled, also while it isn't running: `running`, and if
-  not, `error` (why) and `holdover`. While following, `master_address` and
+  not, `error` (why) and `holdover`. `priority2` is what the node takes
+  into the [grandmaster election](clock.md#ptp): 127 wired, 129 on Wi-Fi,
+  unless set. While following, `master_address` and
   `path_jitter_us`; `unicast` is `off`, `requested`, `granted` or
   `refused`, and `unicast_followers` counts the nodes a grandmaster sends
   to by unicast.
@@ -896,7 +898,7 @@ appears (`WARN`) and when it is resolved (`INFO`):
 | `kind` | On | Meaning |
 |---|---|---|
 | `wifi` | clock, receiver, sender | The stream leaves this node over Wi-Fi, or the clock follows its grandmaster over Wi-Fi. Wi-Fi delays packets by milliseconds and holds back multicast, so expect dropouts and clocks that don't settle. |
-| `wifi_grandmaster` | clock | PTP runs over Wi-Fi on a node that does not follow another clock, so it is or may become the grandmaster. That does not hurt this node, but nodes that follow its clock may not settle. Give a wired node a lower `ptp.priority1` so that it becomes the grandmaster. |
+| `wifi_grandmaster` | clock | PTP runs over Wi-Fi on a node that does not follow another clock, so it is or may become the grandmaster. That does not hurt this node, but nodes that follow its clock may not settle. A wired node takes over by itself when it joins, unless `ptp.priority1` or a fixed `ptp.priority2` rank this node first. |
 | `multicast_wifi` | receiver, sender | A [multicast](#multicast-interop) stream goes over Wi-Fi, where the access point sends it at its lowest rate to every client. |
 | `peer_wifi` | receiver, sender | The node at the other end is on Wi-Fi, as it announces. |
 | `power_save` | interface | Power saving is on for a Wi-Fi interface the node uses (PTP's or the default route's), and the node may not turn it off (no `CAP_NET_ADMIN`) or the driver can't; or something turned it on again within the last 10 minutes and the node had to turn it off again; or `[wifi] power_save` leaves it on (`leave`, or `auto` on battery). The access point holds a dozing node's packets until it wakes, 100 ms and more, which no buffer or clock filter makes up for. See [troubleshooting](troubleshooting.md#wi-fi-power-saving). The warning names the interface in `interface`. |

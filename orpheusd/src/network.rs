@@ -6,25 +6,12 @@
 //! announces its own link, so that its peers can warn too.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::Path;
 
 use orpheus_clock::ptp::PtpTransport;
+pub use orpheus_clock::ptp::is_wireless;
 use orpheus_discovery::Link;
 
 use crate::nmos;
-
-/// Whether `interface` is a wireless interface. For testing on one machine,
-/// `ORPHEUS_DEBUG_WIRELESS` names interfaces to count as wireless,
-/// separated by commas, or `*` for all.
-pub fn is_wireless(interface: &str) -> bool {
-    if let Ok(list) = std::env::var("ORPHEUS_DEBUG_WIRELESS") {
-        return list
-            .split(',')
-            .any(|i| i.trim() == "*" || i.trim() == interface);
-    }
-    let dir = Path::new("/sys/class/net").join(interface);
-    dir.join("wireless").exists() || dir.join("phy80211").exists()
-}
 
 /// Where the other Orpheus nodes are for PTP: one address each, of
 /// `transport`, a global IPv6 address before a link-local one. PTP asks

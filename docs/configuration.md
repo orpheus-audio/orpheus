@@ -82,7 +82,7 @@ enabled = true
 transport = "auto"
 domain = 0
 priority1 = 250
-priority2 = 128
+priority2 = "auto"
 slave_only = false
 step_threshold_us = 2000
 settle_threshold_us = 100
@@ -243,7 +243,7 @@ Clock synchronization with the other nodes and with AES67 devices. See
 | `transport` | `"auto"` | `"ipv4"`, `"ipv6"` or `"auto"`. Auto uses IPv4 if the interface has an IPv4 address, IPv6 otherwise. Nodes on different transports don't see each other. AES67 and Dante devices only speak IPv4. |
 | `domain` | `0` | PTP domain. Only nodes in the same domain synchronize. |
 | `priority1` | `250` | Grandmaster election; lower wins. The default lets dedicated grandmasters (usually 128 or less) take precedence over nodes. |
-| `priority2` | `128` | Tie-breaker in the election. |
+| `priority2` | `"auto"` | Tie-breaker in the election among nodes with the same `priority1`; lower wins. `"auto"` is 127 on a wired interface and 129 on Wi-Fi, so that a [wired node leads](clock.md#ptp) before one on Wi-Fi. A number (0 to 255) applies whatever the interface. |
 | `slave_only` | `false` | Never become the grandmaster. |
 | `step_threshold_us` | `2000` | Offsets above this are corrected in one step, smaller ones gradually. |
 | `settle_threshold_us` | `100` | The clock counts as settled once its offset from the grandmaster stays below this. |
