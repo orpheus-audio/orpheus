@@ -12,7 +12,7 @@ wire = Orpheus-Verbindung { $from } → { $to }
 ptp-not-started = nicht gestartet
 warning-ptp-holdover = PTP angehalten ({ $why }). Zeit und Gang der letzten Synchronisation werden beibehalten. Warte auf PTP-Verbindung zur erneuten Synchronisation.
 warning-ptp-down = PTP läuft nicht ({ $why }). Die Systemuhr ist aktiv. Es besteht keine Synchronisation zu den anderen Knoten. Warte auf PTP-Verbindung.
-warning-ptp-wifi = PTP läuft über WLAN ({ $interface }). Möglicherweise ist keine erfolgreiche Synchronization mit den anderen Knoten möglich.
+warning-ptp-wifi = PTP läuft über WLAN ({ $interface }). Möglicherweise ist keine erfolgreiche Synchronisation mit den anderen Knoten möglich.
 warning-wifi-grandmaster = { $role ->
         [master] Dieser Knoten ist im WLAN ({ $interface }) und PTP-Grandmaster. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Ein kabelgebundener Knoten übernimmt von selbst, sofern ptp.priority1 oder ptp.priority2 nicht diesen Knoten vorziehen.
        *[other] Dieser Knoten ist im WLAN ({ $interface }) und kann PTP-Grandmaster werden. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Ein kabelgebundener Knoten übernimmt von selbst, sofern ptp.priority1 oder ptp.priority2 nicht diesen Knoten vorziehen.
