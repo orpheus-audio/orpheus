@@ -10,15 +10,15 @@ wire = Orpheus-Verbindung { $from } → { $to }
 ## Warnungen, die `orpheusctl status` und das Status-JSON zeigen.
 
 ptp-not-started = nicht gestartet
-warning-ptp-holdover = PTP angehalten ({ $why }): die Uhr behält Zeit und Gang des Grandmasters bei und läuft langsam von den anderen Knoten weg; PTP startet von selbst wieder
-warning-ptp-down = PTP läuft nicht ({ $why }): der Knoten läuft auf der Systemuhr und spielt nicht im Takt mit den anderen Knoten; PTP startet von selbst, sobald es kann
-warning-ptp-wifi = PTP läuft über WLAN ({ $interface }): die Uhr pendelt sich womöglich nicht ein, und die Räume laufen auseinander
+warning-ptp-holdover = PTP angehalten ({ $why }). Zeit und Gang der letzten Synchronisation werden beibehalten. Warte auf PTP-Verbindung zur erneuten Synchronisation.
+warning-ptp-down = PTP läuft nicht ({ $why }). Die Systemuhr ist aktiv. Es besteht keine Synchronisation zu den anderen Knoten. Warte auf PTP-Verbindung.
+warning-ptp-wifi = PTP läuft über WLAN ({ $interface }). Möglicherweise ist keine erfolgreiche Synchronization mit den anderen Knoten möglich.
 warning-wifi-grandmaster = { $role ->
-        [master] dieser Knoten ist der PTP-Grandmaster über WLAN ({ $interface }): Knoten, die seiner Uhr folgen, pendeln sich womöglich nicht ein; gib einem Knoten am Kabel eine niedrigere ptp.priority1
-       *[other] dieser Knoten kann PTP-Grandmaster über WLAN werden ({ $interface }): Knoten, die seiner Uhr folgen, pendeln sich womöglich nicht ein; gib einem Knoten am Kabel eine niedrigere ptp.priority1
+        [master] Dieser Knoten ist im WLAN ({ $interface }) und PTP-Grandmaster. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Gib einem kabelgebundenem Knoten eine niedrigere ptp.priority1.
+       *[other] Dieser Knoten ist im WLAN ({ $interface }) und kann PTP-Grandmaster werden. Möglicherweise pendeln sich Knoten, die seiner Uhr folgen, nicht ein. Gib einem kabelgebundenem Knoten eine niedrigere ptp.priority1.
     }
-warning-ptp-delay = der Weg zum PTP-Grandmaster dauert { $ms } ms, am Kabel deutlich unter { $limit } ms: { $cause }
-warning-ptp-steps = die PTP-Uhr ist in der letzten Minute { $count }-mal gesprungen, statt sich einzupendeln: der Weg zum Grandmaster ist langsam oder unstet; { $cause }
+warning-ptp-delay = Weg zum PTP-Grandmaster dauert { $ms } ms, am Kabel deutlich unter { $limit } ms: { $cause }
+warning-ptp-steps = PTP-Uhr ist in der vergangenen Minute { $count }-mal gesprungen, statt sich einzupendeln: der Weg zum Grandmaster ist langsam oder unstet; { $cause }
 warning-ptp-multicast = der PTP-Master { $master } lehnt Unicast ab, also läuft PTP per Multicast über WLAN, das der Access Point zurückhält und mit seiner niedrigsten Rate sendet: die Uhr pendelt sich womöglich nicht ein
 
 cause-unknown = WLAN oder eine überlastete Verbindung auf dem Weg
