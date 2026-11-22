@@ -65,7 +65,7 @@ impl<'a> TlvSet<'a> {
             let _tlv_type = TlvType::from_primitive(u16::from_be_bytes([buffer[0], buffer[1]]));
             let length = u16::from_be_bytes([buffer[2], buffer[3]]) as usize;
 
-            if length % 2 != 0 {
+            if !length.is_multiple_of(2) {
                 log::trace!("tlv list has trailing bytes");
                 return Err(WireFormatError::Invalid);
             }
